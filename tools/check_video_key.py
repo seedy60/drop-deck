@@ -135,6 +135,13 @@ KEYS = {
     # into AltGr.
     "sourcectl": ("Alt+Ctrl+Shift+S", "source control", "_on_source_control",
                   (wx.WXK_ALT, wx.WXK_CONTROL, wx.WXK_SHIFT), "S"),
+    # 3.8.3. Mashal's report was that Ctrl+M did nothing at all, so the key
+    # itself is pressed, and so is the second one added for it. If both
+    # land here and not on his machine, something on his machine has Ctrl+M.
+    "mic": ("Ctrl+M", "the microphone", "toggle_mic",
+            (wx.WXK_CONTROL,), "M"),
+    "micalt": ("Alt+Shift+M", "the microphone", "toggle_mic",
+               (wx.WXK_ALT, wx.WXK_SHIFT), "M"),
 }
 
 

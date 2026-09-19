@@ -21,11 +21,13 @@ from . import appicon
 from . import constants as C
 from . import dsp
 from . import endpoints
+from . import errorlog
 from . import feedback
 from . import framing
 from . import health
 from . import overlay
 from . import picture
+from . import proccapture
 from . import secrets
 from . import sources
 from . import preflight
@@ -40,7 +42,8 @@ from . import streamout
 from . import vst
 from . import globalhotkeys
 from . import m3u
-from .board import Board, default_board_path, demo_board_path
+from .board import (Board, default_board_path, demo_board_path,
+                    remember_board_path, remembered_board_path, same_path)
 from . import updatedialog
 from .dialogs import (ColoursDialog, CueSheetDialog, GoLiveDialog,
                       ScreenTextDialog,
@@ -54,6 +57,8 @@ from .dialogs import (ColoursDialog, CueSheetDialog, GoLiveDialog,
                       TrackCrossfadeDialog, TrimDialog, ask_text,
                       audio_file_dialog, key_label)
 from .engine import probe
+from . import micdiag
+from . import micinput
 from .micinput import MicInput, describe_input, resolve_input
 from .playlist import PlaylistPlayer
 from .plids import (ID_PL_ROW_ADD, ID_PL_ROW_DOWN, ID_PL_ROW_DROP,
@@ -277,6 +282,99 @@ def _is_text_entry(window):
             return True
         window = window.GetParent()
     return False
+
+
+def _error_codes(text):
+    """The numbers out of a PortAudio failure, and nothing else from it.
+
+    For a feedback report: the codes are what diagnose it, and the rest of
+    the text can carry a device's name, which a report never sends.
+    """
+    import re as _re
+    found = []
+    for code in _re.findall(r"PaErrorCode -?\d+|[A-Za-z-]+ error -?\d+",
+                            str(text or "")):
+        if code not in found:
+            found.append(code)
+    return found
+
+
+def _short_reason(exc):
+    """Why a board file would not load, in a few words for the startup line.
+
+    Never an exception's class name: "ValueError" is noise read aloud, and the
+    error log already has it for whoever needs it.
+    """
+    import json as _json
+    if isinstance(exc, _json.JSONDecodeError):
+        return "there is a mistake in it on line %d" % exc.lineno
+    if isinstance(exc, UnicodeDecodeError):
+        return "it is not saved as text Drop Deck can read"
+    if isinstance(exc, PermissionError):
+        return "Windows would not let Drop Deck open it"
+    return "Drop Deck does not recognise what is in it"
+
+
+def _input_name(device):
+    """A microphone's name alone, without the way Windows reaches it."""
+    try:
+        import sounddevice as _sd
+        return _sd.query_devices(device)["name"]
+    except Exception:
+        return describe_input(device)
+
+
+def _program_words(source):
+    """A program source's program said aloud, and whether its name says it.
+
+    "chrome" rather than "chrome dot exe". The second half is True when the
+    source is simply named after its program, so the sentence need not say
+    the same word twice.
+    """
+    program = os.path.splitext(getattr(source, "program", "") or "")[0]
+    program = program or "The program"
+    name = (getattr(source, "name", "") or "").strip().lower()
+    return program, name in (program.lower(), (source.program or "").lower())
+
+
+#: Stands in for "a version of the board's file that could not be read", so
+#: one unreadable file is reported once rather than every time the window
+#: comes back.
+UNREADABLE_VERSION = "unreadable"
+
+
+def _exists_quickly(path, timeout=None):
+    """Does this file exist. True, False, or None if nothing answered in time.
+
+    A path on a network share that has gone away blocks for as long as
+    Windows takes to give up on it: measured 43.8 seconds, before the window
+    exists. So it is asked on a thread and waited for briefly.
+    """
+    timeout = C.BOARD_REACH_SECONDS if timeout is None else timeout
+    answer = {}
+
+    def ask():
+        try:
+            answer["there"] = os.path.exists(path)
+        except Exception:
+            answer["there"] = False
+
+    worker = threading.Thread(target=ask, daemon=True,
+                              name="dropdeck-board-reach")
+    worker.start()
+    worker.join(timeout)
+    return answer.get("there")
+
+
+def _board_words(path):
+    """A board file said aloud: its name without the .json on the end."""
+    return os.path.splitext(os.path.basename(path or ""))[0] or "The board"
+
+
+def _folder_words(path):
+    """The folder a file is in, by its own name only."""
+    folder = os.path.basename(os.path.dirname(os.path.abspath(path or "")))
+    return folder or "its folder"
 
 
 def _is_typed_key(code):
@@ -704,6 +802,11 @@ class DropDeckFrame(wx.Frame):
                         for entry in (self.board.sources or [])]
         self.source_group = sources.SourceGroup(self.mic, self.sources)
         self.mixer.monitor_source = self.source_group
+        #: Not before start_sources has had its turn, a moment after the
+        #: window is up, or the watcher would announce every program source
+        #: that opened normally at startup as having "come back". It sets
+        #: this when it runs.
+        self._next_source_watch = float("inf")
 
         #: This show, out of a sound card, so another program on this machine
         #: can take it. None until the board asks for one. Unlike the stream
@@ -762,6 +865,7 @@ class DropDeckFrame(wx.Frame):
         self.global_item.Check(self.hotkeys.enabled)
 
         self.Bind(wx.EVT_CLOSE, self._on_close)
+        self.Bind(wx.EVT_ACTIVATE, self._on_frame_activate)
         # Focus moving anywhere in the window decides which keyboard map is
         # installed: the full one, or the one that keeps its hands off a text
         # box. See _apply_accelerators.
@@ -910,28 +1014,108 @@ class DropDeckFrame(wx.Frame):
 
     # ------------------------------------------------------------- start up --
     def _load_startup_board(self):
-        """Your board if you have one, otherwise the demo pack.
+        """The board you had open last time, otherwise yours, otherwise the demo.
 
         A first run should make a noise, not present eighty empty buttons. The
         demo board is loaded but its path is not kept, so the first save writes
         to your own config and never back over the shipped pack.
+
+        **The board that was open last is the one that opens.** Until 3.8.3
+        it was always board.json in the settings folder, so a board opened
+        with Ctrl+O or kept somewhere with Save board as was used all session
+        and forgotten at the next start. fb40, 19 September 2026: "if I
+        rename, move or copy the json file, it acts as if it was never set
+        up." One that is missing or out of reach today is still the one to
+        try next time, so it stays remembered for the session: a memory stick
+        left out for one start must not cost it for good.
+
+        **And a board that will not load is never replaced in silence.** It
+        used to fall straight through to the demo, which then took the
+        board's own path, so the next autosave wrote the demo over a file
+        that might only have needed a comma fixing. It is copied aside first
+        now, and if even that fails, it is never written over at all.
+        `self._startup_board_note` is what the startup line says about it.
         """
-        path = default_board_path()
-        if os.path.exists(path):
+        self._startup_board_note = ""
+        self._pinned_board = None
+        default = default_board_path()
+        remembered = remembered_board_path()
+        candidates = []
+        if remembered and not same_path(remembered, default):
+            candidates.append((remembered, True))
+        candidates.append((default, False))
+        notes = []
+        untouchable = set()
+        for path, was_remembered in candidates:
+            # Asked with a time limit for a remembered board, which may be on
+            # a network share that is not answering: Windows can take most of
+            # a minute to say so, and this is before the window exists.
+            there = (_exists_quickly(path) if was_remembered
+                     else os.path.exists(path))
+            if not there:
+                if was_remembered:
+                    # The folder's own name, never the whole path: a screen
+                    # reader drops the backslashes and reads C colon Users
+                    # and the rest as one long run of words.
+                    notes.append(
+                        "The board you had open last time, %s, %s. File, "
+                        "Open board finds it"
+                        % (_board_words(path),
+                           "could not be reached" if there is None else
+                           "is not in %s any more" % _folder_words(path)))
+                    self._pinned_board = path
+                continue
             try:
-                return Board.load(path)
-            except Exception:
-                pass
+                board = Board.load(path)
+            except Exception as exc:
+                kept = self._keep_unreadable(path)
+                if not kept:
+                    untouchable.add(path)
+                # Said without the copy's file name, which is all brackets
+                # and a date and reads as noise. The guide says what it is
+                # called.
+                notes.append(
+                    "%s could not be read, %s. %s"
+                    % (_board_words(path), _short_reason(exc),
+                       "A copy is kept in the same folder, so nothing is lost"
+                       if kept else
+                       "It has been left alone, and will not be saved over"))
+                continue
+            if notes:
+                notes.append("%s opened instead" % _board_words(path))
+            self._startup_board_note = ". ".join(notes)
+            return board
+        self._startup_board_note = ". ".join(notes)
         demo = demo_board_path()
+        board = None
         if os.path.exists(demo):
             try:
                 board = Board.load(demo)
-                board.path = path
                 self._loaded_demo = True
-                return board
             except Exception:
-                pass
-        return Board()
+                board = None
+        board = board or Board()
+        # The demo's own file is not this board's file, and nothing at
+        # `default` was read, so what is there now is written down rather than
+        # owned. A board copied into the settings folder later is somebody
+        # else's and is never saved over; one that could not be read or
+        # copied aside is never touched at all.
+        board.claim_path(default, unreadable=default in untouchable)
+        return board
+
+    @staticmethod
+    def _keep_unreadable(path):
+        """Copy a board that will not load out of harm's way. Its new path."""
+        try:
+            import shutil
+            stem, ext = os.path.splitext(path)
+            kept = "%s (could not be read %s)%s" % (
+                stem, datetime.datetime.now().strftime("%Y-%m-%d %H%M"),
+                ext or ".json")
+            shutil.copy2(path, kept)
+            return kept
+        except Exception:
+            return None
 
     def _resolve_device(self):
         """Turn the remembered device name back into an index, if it is still
@@ -968,11 +1152,34 @@ class DropDeckFrame(wx.Frame):
 
     def _startup_line(self):
         bits = [f"{C.APP_NAME} ready"]
+        # What went wrong with the board comes BEFORE the count, so it is
+        # heard first rather than at the end of a long line. And the hint
+        # about starting from scratch is dropped when there is a problem to
+        # hear, because it is the one sentence that would bury it.
+        board_note = getattr(self, "_startup_board_note", "")
+        if board_note:
+            bits.append(board_note)
         if self._loaded_demo:
             bits.append(f"demo pack loaded, {self.board.assigned_count} sounds "
-                        "and beds. File, new board starts you from scratch")
+                        "and beds"
+                        + ("" if board_note else
+                           ". File, new board starts you from scratch"))
         else:
-            bits.append(f"{self.board.assigned_count} sounds loaded")
+            # The board's name when it is not the usual one, because the
+            # board that opens is now whichever was open last, and somebody
+            # with two boards should hear which one this is.
+            name = self._board_name()
+            bits.append("%s%d sounds loaded"
+                        % (name + ", " if name else "",
+                           self.board.assigned_count))
+        # Keys another program has taken for the whole machine. Windows gives
+        # them to that program and never says so to this one, so a key that
+        # simply does nothing is the only symptom. Mashal, 19 September 2026.
+        taken = self._keys_taken_elsewhere()
+        if taken:
+            bits.append(micdiag.keys_sentence(taken))
+        clashes = self._own_key_clashes()
+        bits.extend(clashes)
         missing = len(self.board.missing_slots)
         if missing:
             bits.append(f"{missing} files missing. Use File, relink missing sounds")
@@ -1002,8 +1209,115 @@ class DropDeckFrame(wx.Frame):
         # could not start" are not, so the same line changes channel when it
         # is carrying one of them.
         wrong = (bool(missing) or not self.mixer.is_running or send_failed
-                 or bool(self._routing_conflicts()))
+                 or bool(self._routing_conflicts()) or bool(board_note)
+                 or bool(taken) or bool(clashes))
         (self.announce if wrong else self.announce_help)(". ".join(bits))
+
+    def _board_name(self):
+        """The open board's file name, or nothing when it is the usual one."""
+        path = getattr(self.board, "path", None)
+        if not path or same_path(path, default_board_path()):
+            return ""
+        return os.path.splitext(os.path.basename(path))[0]
+
+    # ------------------------------------------------ keys that never arrive --
+    def _app_keys(self):
+        """Every key this window answers to that has a modifier.
+
+        As (label, mods, vk), from the accelerator table and the menu bar's
+        own labels, which are the two places a key can be bound. Derived,
+        never listed, so a key added next month is checked too.
+        """
+        found = []
+        seen = set()
+
+        def add(label):
+            parsed = globalhotkeys.parse(label)
+            if parsed is None:
+                return
+            mods, vk = parsed
+            key = (mods & 0x000F, vk)
+            if key not in seen:
+                seen.add(key)
+                found.append((label, mods, vk))
+
+        for entry in getattr(self, "_accelerators", None) or []:
+            if entry.GetFlags() != wx.ACCEL_NORMAL:
+                add(key_label(entry.GetKeyCode(), entry.GetFlags()))
+
+        def walk(menu):
+            for item in menu.GetMenuItems():
+                if item.IsSeparator():
+                    continue
+                if item.GetSubMenu() is not None:
+                    walk(item.GetSubMenu())
+                label = item.GetItemLabel()
+                if chr(9) in label:
+                    add(label.split(chr(9), 1)[1].strip())
+
+        bar = self.GetMenuBar()
+        if bar is not None:
+            for position in range(bar.GetMenuCount()):
+                walk(bar.GetMenu(position))
+        return found
+
+    def _own_global_keys(self):
+        """{(mods, vk): slot} for every global hotkey this app REALLY holds.
+
+        One Windows would not register is not ours: somebody else got there
+        first. Counting it as ours would hide the true sentence, that another
+        program has the key, and say a false one, that our pad plays instead.
+        """
+        hotkeys = getattr(self, "hotkeys", None)
+        if hotkeys is None or not getattr(hotkeys, "enabled", False):
+            return {}
+        try:
+            refused = set(getattr(hotkeys, "failures", {}) or {})
+        except Exception:
+            refused = set()
+        own = {}
+        for slot in self.board.slots:
+            if slot.index in refused:
+                continue
+            parsed = (globalhotkeys.parse(slot.global_hotkey)
+                      if slot.global_hotkey else None)
+            if parsed is not None:
+                own[(parsed[0] & 0x000F, parsed[1])] = slot
+        return own
+
+    def _keys_taken_elsewhere(self):
+        """Labels of this window's keys that another program has taken."""
+        try:
+            return micdiag.taken_elsewhere(self._app_keys(),
+                                           own=list(self._own_global_keys()))
+        except Exception:
+            errorlog.record_current()
+            return []
+
+    def _own_key_clashes(self):
+        """A pad's global hotkey on one of this window's own keys.
+
+        While global hotkeys are on, Windows hands that combination to the
+        pad from everywhere, this window included, so the key's usual job
+        here never happens. The hotkey dialog warns at the time; this says
+        it again at every start, because by then nobody remembers.
+        """
+        try:
+            own = self._own_global_keys()
+            if not own:
+                return []
+            lines = []
+            for label, mods, vk in self._app_keys():
+                slot = own.get((mods & 0x000F, vk))
+                if slot is not None:
+                    lines.append(
+                        "%s is also the global hotkey for %s, so while global "
+                        "hotkeys are on it plays that sound instead. Ctrl+G "
+                        "turns global hotkeys off" % (label, slot.display_name))
+            return lines
+        except Exception:
+            errorlog.record_current()
+            return []
 
     # ------------------------------------------------------------------ ui ---
     def _tab_title(self, bank):
@@ -1549,6 +1863,15 @@ class DropDeckFrame(wx.Frame):
             # Ctrl+M opens and closes the microphone, Ctrl+Shift+M sets it up.
             # Both new; nothing on the frozen digit map moved for them.
             wx.AcceleratorEntry(wx.ACCEL_CTRL, ord("M"), ID_MIC_TOGGLE),
+            # And Alt+Shift+M does the same, because Ctrl+M is a mute key in
+            # a lot of other programs and any of them can take it for the
+            # whole machine, after which Windows never delivers it here at
+            # all. Mashal, 19 September 2026: Ctrl+M did nothing, installed
+            # or portable. A second way in is the only fix that does not
+            # depend on finding the other program. A new key; the digit map
+            # is untouched.
+            wx.AcceleratorEntry(wx.ACCEL_ALT | wx.ACCEL_SHIFT, ord("M"),
+                                ID_MIC_TOGGLE),
             # Ctrl+B goes live, Ctrl+Shift+B says what the stream is
             # doing, the same shape as the microphone pair above.
             wx.AcceleratorEntry(wx.ACCEL_CTRL, ord("B"), ID_STREAM_TOGGLE),
@@ -2027,16 +2350,28 @@ class DropDeckFrame(wx.Frame):
     def _speech_level(self):
         return getattr(self.board, "speech_level", C.DEFAULT_SPEECH_LEVEL)
 
-    def announce_help(self, text):
+    def announce_help(self, text, interrupt=True):
         """A confirmation, or a hint. Off for anyone who has done their homework.
 
         Brian Hartgen's point, and it is a fair one: pressing Escape and being
         told everything stopped is the app talking over a screen reader that
         was about to say something useful.
+
+        `interrupt=False` queues it behind whatever is being said, for a line
+        that follows another or arrives from a timer while somebody is
+        working in a window.
         """
         if self._speech_level() == C.SPEECH_ALL:
-            self.speaker.say(text)
+            self._say(text, interrupt)
         self.status.SetStatusText(text, 1)
+
+    def _say(self, text, interrupt=True):
+        # Only passed on when it is False, so a stand-in speaker that takes
+        # one argument, as the older tests' do, still works.
+        if interrupt:
+            self.speaker.say(text)
+        else:
+            self.speaker.say(text, interrupt=False)
 
     def announce_playback(self, text):
         """A confirmation for something the user can already hear.
@@ -2053,9 +2388,9 @@ class DropDeckFrame(wx.Frame):
             self.speaker.say(text)
         self.status.SetStatusText(text, 1)
 
-    def announce(self, text):
+    def announce(self, text, interrupt=True):
         if self._speech_level() != C.SPEECH_NONE:
-            self.speaker.say(text)
+            self._say(text, interrupt)
         # A status bar cannot show a sentence and these are sentences, so the
         # field was reweighted to take most of the bar. No tooltip is set here:
         # wxSTB_SHOW_TIPS is on by default and shows the full text on hover
@@ -3475,28 +3810,172 @@ class DropDeckFrame(wx.Frame):
                                "hostapi": self.board.mic_output_hostapi})
 
     def toggle_mic(self, _event=None):
-        """Ctrl+M. Open or close the microphone, and say which it now is.
+        """Ctrl+M or Alt+Shift+M. Open or close the microphone, and say which.
 
         Announced on the essential channel, never the confirmation one. "Am I
         live" is not a pleasantry, and somebody who has turned the app's
         chattiness down has not asked to stop being told that.
+
+        **This key must never do nothing.** Mashal, 19 September 2026: Ctrl+M
+        did nothing at all, on or off, installed or portable, after a
+        restart. Anything raised in here escaped into wx, and a released
+        copy has no console, so a fault on one machine was a dead key with
+        no explanation anywhere. Every failure is now said in words, and the
+        fault is written to the error log for the feedback window.
         """
+        try:
+            return self._toggle_mic()
+        except Exception as exc:
+            errorlog.record_current()
+            # Back to something true: whatever half opened is closed, so the
+            # next press starts clean rather than tripping over the same half.
+            for step in (self.mic.stop,
+                         lambda: self.mic_item.Check(self._mic_open()),
+                         self._update_status):
+                try:
+                    step()
+                except Exception:
+                    pass
+            # The kind of fault goes in the log, not in the sentence: a
+            # class name read aloud is noise to the person it happens to.
+            self.announce("The microphone hit a fault inside Drop Deck and it "
+                          "is off. Help, Submit feedback sends the details")
+            return False
+
+    def _toggle_mic(self):
         if self._mic_open():
             self.mic.stop()
             self.mic_item.Check(False)
             self.announce("Microphone off. Music back up")
+            self._update_status()
+            return False
+
+        spec = self._mic_spec()
+        device = resolve_input(spec)
+        # A chosen microphone Windows does not have today. start() used to be
+        # handed None for it, which meant "keep whatever was open last", an
+        # index left over from before. It is the system default now, and it
+        # is SAID, because somebody talking into the microphone on the desk
+        # needs to know it is the one in the laptop lid that is live.
+        missing = spec.get("name") if spec.get("name") and device is None \
+            else None
+        self.mic.device = device
+        if not self.mic.start():
+            self.mic_item.Check(False)
+            self.announce(self._mic_failure_line(missing))
+            self._update_status()
+            return False
+
+        self.mic_item.Check(True)
+        fell_back = self.mic.fell_back_from
+        if fell_back is not None and fell_back != micinput.SYSTEM_DEFAULT:
+            # Named as the one that was CHOSEN, by its full name: the route it
+            # came in by may be MME, which cuts every name to 31 characters.
+            line = "Microphone on, %s. Music ducked" % _input_name(fell_back)
         else:
-            if not self.mic.start(device=resolve_input(self._mic_spec())):
-                self.mic_item.Check(False)
-                self.announce("The microphone would not open. %s"
-                              % (self.mic.last_error or ""))
-                self._update_status()
-                return False
-            self.mic_item.Check(True)
-            self.announce("Microphone on, %s. Music ducked"
-                          % describe_input(self.mic.device))
+            line = ("Microphone on, %s. Music ducked"
+                    % describe_input(self.mic.device))
+        if missing:
+            line += (". Your chosen microphone, %s, is not plugged in, so this "
+                     "is the system default" % missing)
+        self.announce(line)
+        if fell_back is not None and not getattr(self, "_told_route", False):
+            # Once a session, on the chattier channel, and queued behind the
+            # line above rather than cutting it off. Worth knowing once; not
+            # worth hearing on every Ctrl+M of a show.
+            self._told_route = True
+            self.announce_help("It came in through %s, because %s would not "
+                               "open it" % (self.mic.opened_via or "another way",
+                                           self._route(fell_back)),
+                               interrupt=False)
         self._update_status()
-        return self._mic_open()
+        # A microphone that opens is not yet a microphone that works. See
+        # _check_mic_signal.
+        wx.CallLater(C.MIC_SIGNAL_CHECK_MS, self._check_mic_signal,
+                     self.mic.openings)
+        return True
+
+    @staticmethod
+    def _route(device):
+        if device == micinput.SYSTEM_DEFAULT:
+            return "the system default"
+        return micinput.host_api_of(device) or "the way you chose"
+
+    def _mic_failure_line(self, missing=None):
+        """Why the microphone would not open, as one thing to say.
+
+        Privacy first when Windows says it is blocking: that answer is
+        certain, where a PortAudio code is only a clue. Then the plain words
+        for whatever code came back. The raw text stays on the Microphone
+        page and goes with a feedback report; it is no use read aloud.
+        """
+        state, blocked = micdiag.privacy()
+        reason = (blocked if state == micdiag.BLOCKED
+                  else micdiag.explain(self.mic.last_error))
+        if missing:
+            return ("Your chosen microphone, %s, is not plugged in, and the "
+                    "system default would not open either. %s"
+                    % (missing, reason))
+        return "The microphone would not open. %s" % reason
+
+    def _check_mic_signal(self, opening):
+        """A few seconds after opening: is Windows sending anything at all?
+
+        A microphone can open perfectly and deliver nothing, and that is how
+        a privacy block looks from here on some of Windows' audio paths, and
+        how a muted input looks on all of them. Silence is not an error
+        anywhere in this app, so without this nobody is ever told. A real
+        microphone is never digitally silent, so exact zeros mean something
+        is in the way. Said once per opening, and only when it is true.
+        """
+        try:
+            mic = self.mic
+            if not mic.is_open or mic.openings != opening or mic.signal_seen:
+                return
+            state, blocked = micdiag.privacy()
+            if mic.blocks_seen == 0:
+                line = ("The microphone is on, but Windows has not sent Drop "
+                        "Deck any sound from it. ")
+            else:
+                line = ("The microphone is on, but nothing is coming from it, "
+                        "not even background noise. ")
+            line += (blocked if state == micdiag.BLOCKED else
+                     "If you are talking into it, check it is not muted in "
+                     "Windows Sound settings, and that Windows privacy "
+                     "settings let desktop apps use the microphone")
+            self.announce(line)
+        except Exception:
+            errorlog.record_current()
+
+    def mic_diagnostics(self):
+        """What a feedback report says about the microphone and the keys.
+
+        Settings and plain words only: never a device's name, never a path.
+        Enough to tell a dead key from a blocked microphone from a muted one,
+        which is the question Mashal's report could not answer.
+        """
+        info = {}
+        board = self.board
+        info["mic_chosen"] = bool(board.mic_device_name)
+        if board.mic_device_name:
+            info["mic_found"] = resolve_input(self._mic_spec()) is not None
+        info["mic_route"] = self.mic.opened_via if self._mic_open() else ""
+        fell_back = getattr(self.mic, "fell_back_from", None)
+        if self._mic_open() and fell_back is not None:
+            info["mic_opened_another_way"] = (
+                "the system default would not open"
+                if fell_back == micinput.SYSTEM_DEFAULT else
+                "%s would not open" % (self._route(fell_back)))
+        if self.mic.last_error:
+            info["mic_problem"] = micdiag.explain(self.mic.last_error)
+            info["mic_error_codes"] = ", ".join(_error_codes(self.mic.last_error))
+        if self._mic_open():
+            info["mic_sound_arriving"] = bool(self.mic.signal_seen)
+        info["mic_privacy"] = micdiag.privacy()[0]
+        info["keys_taken_elsewhere"] = ", ".join(
+            self._keys_taken_elsewhere()) or "none"
+        info["recent_errors"] = "; ".join(errorlog.recent()) or "none"
+        return info
 
     def _on_mic_settings(self, _event=None):
         """Ctrl+Shift+M. The same window as Ctrl+P, opened on its tab.
@@ -3725,14 +4204,188 @@ class DropDeckFrame(wx.Frame):
         self._save_timer.Start(2000, oneShot=True)
 
     def _save(self, quiet=False, path=None):
+        """Write the board. The path written, or None if nothing was.
+
+        Never over a board file somebody changed outside the app while it was
+        open: see `_changed_elsewhere`. A path chosen in Save board as is a
+        decision somebody made, and that one is honoured.
+        """
+        if path is None and self.board.changed_on_disk():
+            return self._changed_elsewhere(quiet=quiet)
         try:
             saved = self.board.save(path)
         except Exception as exc:
             wx.MessageBox(f"The board could not be saved.\n\n{exc}",
                           "Save failed", wx.OK | wx.ICON_ERROR, self)
-            return
+            return None
+        if path is not None:
+            # A place somebody chose. It is the board from now on.
+            self._pinned_board = None
+        self._remember(saved)
         if not quiet:
             self.announce_help(f"Saved to {os.path.basename(saved)}")
+        return saved
+
+    def _remember(self, saved):
+        """Write down which board opens next time.
+
+        Normally the one just saved. After a clash with a board copied in
+        from outside, the copy that came in is the one that opens next time,
+        not the file beside it holding what was on screen: that is the whole
+        point of copying a board in, and remembering the file beside it put
+        fb40 straight back, with the old settings, at the next start.
+        """
+        remember_board_path(getattr(self, "_pinned_board", None) or saved)
+
+    def _changed_elsewhere(self, quiet=False):
+        """The board's own file was changed outside the app. Keep both.
+
+        fb40, 19 September 2026: a board copied into place while Drop Deck
+        was open was saved over the moment Drop Deck closed, so the streaming
+        set up in the copy was gone before it was ever read.
+
+        Nothing changed here since the file was read: the file on disk is
+        the newer one and it wins. Nothing is written, and it opens next
+        time. Changed here as well: what is on screen goes beside it under a
+        new name, so neither is lost, and the one that came in still opens
+        next time.
+        """
+        board = self.board
+        original = board.path or default_board_path()
+        name = _board_words(original)
+        if not board.dirty:
+            if not quiet:
+                self.announce("%s was changed outside Drop Deck, so it has "
+                              "not been saved over. File, Open board opens "
+                              "the new one" % name)
+            return None
+        try:
+            saved = board.save(board.sidecar_path())
+        except Exception as exc:
+            wx.MessageBox(f"The board could not be saved.\n\n{exc}",
+                          "Save failed", wx.OK | wx.ICON_ERROR, self)
+            return None
+        self._pinned_board = original
+        self._remember(saved)
+        self.announce("%s was changed outside Drop Deck, so it was not saved "
+                      "over. Your changes are in a copy beside it, and the new "
+                      "%s opens next time" % (name, name))
+        return saved
+
+    def _save_for_close(self):
+        """The save on the way out. The path written, or None. May raise.
+
+        Raises rather than showing anything, because the close handler asks
+        whether to close anyway when this fails. It used to save
+        unconditionally, which is the half of fb40 a restart could not fix:
+        a board copied into place while the app was open was written over by
+        the very act of closing it to pick the copy up.
+        """
+        if self.board.changed_on_disk():
+            # Somebody else's copy is on disk now. It is kept, and anything
+            # changed here goes beside it. See _changed_elsewhere.
+            if not self.board.dirty:
+                return None
+            original = self.board.path
+            saved = self.board.save(self.board.sidecar_path())
+            self._pinned_board = original
+        else:
+            saved = self.board.save()
+        self._remember(saved)
+        return saved
+
+    def _on_frame_activate(self, event):
+        """Coming back to the window: has the board's file changed meanwhile.
+
+        Somebody who copies a board into place in Explorer comes straight
+        back here to use it. When nothing is playing, nothing is live and
+        nothing has changed on screen, the new file is simply loaded, which
+        is what they expect. Otherwise it is said once and nothing moves:
+        a file dropping in must never cut a show off mid sound.
+
+        Half a second later rather than at once, because the screen reader
+        is announcing the window coming back at exactly this moment, and
+        whichever speaks second cuts the other off.
+        """
+        event.Skip()
+        if not event.GetActive():
+            return
+        wx.CallLater(C.BOARD_CHECK_DELAY_MS, self._check_board_file)
+
+    def _check_board_file(self, wait=False):
+        """Has the board's file changed outside the app, and if so, act.
+
+        The looking is done off the window's thread. A board on a network
+        share that has gone away can take Windows most of a minute to answer
+        about, and this runs every time the window comes back. `wait` does it
+        inline, for the tests.
+        """
+        if getattr(self, "_board_check_busy", False):
+            return
+        board = self.board
+        path = board.path
+        if not path:
+            return
+        self._board_check_busy = True
+
+        def look():
+            try:
+                changed = board.changed_on_disk()
+                now = board.disk_now() if changed else None
+            except Exception:
+                changed, now = False, None
+            if wait:
+                self._board_file_checked(board, path, changed, now)
+                return
+            try:
+                wx.CallAfter(self._board_file_checked, board, path, changed,
+                             now)
+            except Exception:
+                pass                     # the app is closing
+
+        if wait:
+            look()
+        else:
+            threading.Thread(target=look, daemon=True,
+                             name="dropdeck-board-check").start()
+
+    def _board_file_checked(self, board, path, changed, now):
+        """The answer, back on the window's thread.
+
+        Each version of the file is acted on ONCE. Loading it here used to go
+        through the Open board path, which shows a box when the file will not
+        load; closing that box brings the window back, which asked again, and
+        the box came back for ever. Mark, 19 September 2026: a board with a
+        stray comma in it made the app impossible to use or close. Nothing
+        here shows a box, and a version already dealt with is left alone.
+        """
+        self._board_check_busy = False
+        try:
+            if not changed or board is not self.board or board.path != path:
+                return
+            version = now or (UNREADABLE_VERSION, path)
+            if version == getattr(self, "_seen_board_version", None):
+                return
+            self._seen_board_version = version
+            quiet = (not board.dirty and not self.going_anywhere()
+                     and not self.streaming() and not self._mic_open()
+                     and not self.player.playing
+                     and not self.mixer.playing_slots())
+            if not quiet:
+                self.announce("%s has been changed outside Drop Deck. It will "
+                              "not be saved over. File, Open board loads the "
+                              "new one when you are ready" % _board_words(path))
+                return
+            try:
+                fresh = Board.load(path)
+            except Exception as exc:
+                self.announce("%s was changed outside Drop Deck, and the new "
+                              "one cannot be read, %s. It will not be saved "
+                              "over" % (_board_words(path), _short_reason(exc)))
+                return
+            self._load_into(path, board=fresh)
+        except Exception:
+            errorlog.record_current()
 
     def _on_save_as(self, _event):
         with wx.FileDialog(self, "Save board as", wildcard="Boards (*.json)|*.json",
@@ -3749,7 +4402,9 @@ class DropDeckFrame(wx.Frame):
             return
         self.mixer.stop_all(fade_out=0.05)
         fresh = Board()
-        fresh.path = self.board.path
+        # Takes the path without reading it, so what is there now is
+        # written down: see Board.claim_path.
+        fresh.claim_path(self.board.path)
         fresh.device_name = self.board.device_name
         fresh.device_hostapi = self.board.device_hostapi
         self._adopt(fresh)
@@ -3769,7 +4424,7 @@ class DropDeckFrame(wx.Frame):
             return
         keep = self.board.path
         self._load_into(demo, keep_path=False)
-        self.board.path = keep
+        self.board.claim_path(keep)
         self._touch()
 
     def _on_open(self, _event):
@@ -3896,6 +4551,10 @@ class DropDeckFrame(wx.Frame):
             if not source.start(self.mixer.samplerate):
                 if source.wanted_on_air or source.wanted_monitor:
                     missing.append(source.name)
+            # What the program watcher compares against, so a source that
+            # opened here is not announced as having come back.
+            source.was_open = source.is_open
+        self._next_source_watch = time.monotonic() + C.SOURCE_WATCH_SECONDS
         if missing:
             self.announce_help("These sources would not open: %s"
                                % ", ".join(missing))
@@ -4024,17 +4683,25 @@ class DropDeckFrame(wx.Frame):
         self.announce_help("The plugin %s could not be loaded: %s"
                            % (os.path.basename(path), exc))
 
-    def _load_into(self, path, keep_path=True):
-        try:
-            board = Board.load(path)
-        except Exception as exc:
-            wx.MessageBox(f"That board could not be opened.\n\n{exc}",
-                          "Open failed", wx.OK | wx.ICON_ERROR, self)
-            return
+    def _load_into(self, path, keep_path=True, board=None):
+        """Make the board at `path` the live one. `board` if already read."""
+        if board is None:
+            try:
+                board = Board.load(path)
+            except Exception as exc:
+                wx.MessageBox(f"That board could not be opened.\n\n{exc}",
+                              "Open failed", wx.OK | wx.ICON_ERROR, self)
+                return
         self.mixer.stop_all(fade_out=0.05)
         if not keep_path:
             board.path = None
         self._adopt(board)
+        if keep_path:
+            # So the next start opens this board, not board.json. fb40. A
+            # board somebody opened is their choice, so nothing pinned
+            # earlier in the session outranks it.
+            self._pinned_board = None
+            remember_board_path(path)
 
         missing = len(board.missing_slots)
         tail = f", {missing} files missing" if missing else ""
@@ -5593,8 +6260,16 @@ class DropDeckFrame(wx.Frame):
             # Preferences pages, where the two above only choose between them.
             saved = wx.Menu()
             for offset, name in enumerate(names):
+                # Never an empty label. wx reads one as a request for a stock
+                # label, has none for this id and ASSERTS, and this runs while
+                # the window is being built: a board whose server was set up
+                # without a station name could not be opened at all. A board
+                # from before saved setups gets exactly that, a setup made
+                # from its server with whatever name it had, which may be
+                # none. Found 19 September 2026 by the 3.8.3 tests.
+                label = name or "Station %d, no name" % (offset + 1)
                 item = saved.AppendRadioItem(
-                    ID_STATION_BASE + offset, _escaped(name),
+                    ID_STATION_BASE + offset, _escaped(label),
                     "Load this saved setup, and send the show wherever it "
                     "was saved to go")
                 if name == self.board.stream_name:
@@ -6580,6 +7255,7 @@ class DropDeckFrame(wx.Frame):
         # board[80] raised IndexError on the first playlist handover and went
         # on raising it, from inside a timer, every quarter of a second. From
         # then on no pad was ever relabelled again.
+        self._watch_program_sources()
         now = {index for index in self.mixer.playing_slots()
                if 0 <= index < C.TOTAL_SLOTS}
         if now == self._playing:
@@ -6588,6 +7264,78 @@ class DropDeckFrame(wx.Frame):
             slot = self.board[index]
             self._button_for(slot).refresh(index in now)
         self._playing = now
+
+    def _watch_program_sources(self):
+        """Put a program source back on when its program starts again.
+
+        Every couple of seconds, from the refresh tick. A program source whose
+        program closed says so once; when the program is running again, by
+        its executable, whatever its windows are called now, it is captured
+        again and that is said too. See Source.find_again.
+
+        Nothing here may hold the window's thread. One process snapshot is
+        taken for every waiting source together, and a capture is started
+        without waiting for Windows to answer: it is seen coming up on a
+        later look, and that is when it is announced. Mute and solo are
+        handed to it before it starts, so a muted program is never on air for
+        a moment first. Wrapped, because a fault in a timer repeats four
+        times a second and is never seen.
+        """
+        clock = time.monotonic()
+        if clock < getattr(self, "_next_source_watch", 0.0):
+            return
+        self._next_source_watch = clock + C.SOURCE_WATCH_SECONDS
+        try:
+            programs = [source for source in getattr(self, "sources", [])
+                        if source.is_program]
+            if not programs:
+                return
+            back, gone = [], []
+            for source in programs:
+                now_open = source.is_open
+                if source.was_open and not now_open:
+                    if source.wanted_on_air or source.wanted_monitor:
+                        gone.append(source)
+                    source.lost_program(clock)
+                elif now_open and not source.was_open:
+                    back.append(source)
+                    # Whatever went wrong last time is over.
+                    source.last_error = None
+                source.was_open = now_open
+            waiting = [source for source in programs
+                       if source.waiting_for_program()]
+            if waiting:
+                running = proccapture.running_names()
+                soloed = self.anything_soloed()
+                for source in waiting:
+                    source.find_again(self.mixer.samplerate, clock,
+                                      running=running, soloed=soloed)
+            # Said first, so a fault in the wiring below can never cost the
+            # sentence that tells somebody their source went or came back.
+            # Queued rather than interrupting, because these arrive from a
+            # timer while somebody may be reading something else, and said
+            # on the essential channel when the source was going out live.
+            for source in gone:
+                program, own = _program_words(source)
+                text = ("%s closed, so %s silent until it opens again"
+                        % (program, "it is" if own else "%s is" % source.name))
+                if source.wanted_on_air and self.going_anywhere():
+                    self.announce(text, interrupt=False)
+                else:
+                    self.announce_help(text, interrupt=False)
+            for source in back:
+                program, own = _program_words(source)
+                self.announce_help(
+                    "%s is back" % program if own else
+                    "%s is back, so %s is on again" % (program, source.name),
+                    interrupt=False)
+            if back:
+                self.apply_source_mixing()
+                self._sync_air_taps()
+            if back or gone:
+                self._update_status()
+        except Exception:
+            errorlog.record_current()
 
     def stop_background_work(self):
         """Bring the worker threads to a halt and wait for them.
@@ -6669,7 +7417,7 @@ class DropDeckFrame(wx.Frame):
         if self.recording():
             self.stop_recording(quiet=True)
         try:
-            self.board.save()
+            self._save_for_close()
         except Exception as exc:
             answer = wx.MessageBox(
                 "The board could not be saved, so anything you have changed "

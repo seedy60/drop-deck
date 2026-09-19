@@ -1,5 +1,67 @@
 # Changelog
 
+## 3.8.3 for Windows, 19 September 2026
+
+**The microphone key can no longer do nothing, your board is never lost, and
+program sources come back by themselves.**
+
+### Ctrl+M
+
+A listener pressed Ctrl+M and nothing happened at all, on the installed copy
+and the portable one, after a restart, with the Windows privacy settings
+checked. Drop Deck had no way to say why, because nothing was looking. Now:
+
+- **If another program has taken a key for the whole computer**, Drop Deck
+  says so when it starts, by name. Windows hands a key like that to the other
+  program and never tells the window it was taken from.
+- **Alt+Shift+M turns the microphone on and off as well**, for when something
+  else has Ctrl+M. Microphone on, in the Playlist menu, still works too.
+- **If the microphone will not open, you hear why in plain words**: Windows
+  privacy settings, another program holding it for itself, unplugged, or no
+  driver, with where to go to fix it. The raw error is still on the
+  Microphone page and goes with a feedback report.
+- **The same microphone is tried the other ways Windows offers it** before
+  Drop Deck gives up, and it tells you when that is how it opened.
+- **If it opens and nothing arrives**, not even background noise, it says so
+  after a couple of seconds. That is what a privacy block or a muted input
+  looks like from inside a program.
+- **A fault inside the key is said out loud** and written to an error log,
+  instead of vanishing. Help, Submit feedback now includes what went wrong,
+  whether any keys are taken, and whether the microphone was blocked, never
+  the name of your microphone.
+- A chosen microphone that is not plugged in now opens the system default
+  and says so, rather than whatever was open last.
+
+With NVDA, press NVDA+1, then Ctrl+M, then NVDA+1 again to turn input help
+off. If NVDA describes a command, an add-on or one of your own input gestures
+has the key.
+
+### Your board
+
+"If I rename, move or copy the json file, it acts as if it was never set up."
+Three separate faults, all fixed:
+
+- **Drop Deck reopens the board you last had open.** It used to open
+  board.json every time, so a board opened with Ctrl+O or kept somewhere with
+  Save board as was forgotten at the next start, and its streaming with it.
+- **A board copied in while Drop Deck was open is not saved over.** Closing
+  the app used to write over it, which is the very thing you would do to pick
+  the new one up. When you come back to the window with nothing playing, the
+  new board simply loads. If you had changed things on screen as well, those
+  are kept beside it under a new name.
+- **A board that will not load is kept, and you are told.** It used to be
+  replaced by the demo, silently, and the demo was then saved over it. It is
+  copied aside first now, and a board saved by Notepad with a byte order mark
+  loads as it should.
+- A board with a streaming server and no station name no longer stops Drop
+  Deck opening at all.
+
+### Program sources
+
+A program source, such as Chrome, comes back by itself when you open the
+program again, found by its executable rather than by the window it was
+first chosen from. You are told when it goes and when it comes back.
+
 ## 3.8.2 for Windows, 12 September 2026
 
 **One key per destination, and your radio station stops being printed as the

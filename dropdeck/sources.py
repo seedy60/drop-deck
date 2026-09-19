@@ -28,10 +28,13 @@ the microphone already solved.
 """
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 from . import constants as C
 from . import proccapture
+from . import micinput
 from .micinput import (CHANNELS, MicInput, describe_input,
                        input_devices, resolve_input)
 
@@ -73,6 +76,16 @@ class Source:
             self.input.channel = (channel if channel in ("mix", "left", "right")
                                   else "mix")
         self.last_error = None
+        #: For a program source: not before this moment is the program looked
+        #: for again, and whether it was capturing when last looked at. See
+        #: find_again.
+        self._next_look = 0.0
+        self.was_open = False
+        #: When the program was first seen running this time round. Some
+        #: programs start with a launcher process that hands over and exits a
+        #: moment later, Firefox among them, and catching the launcher means
+        #: saying "back" and then "closed". So a program is given a moment.
+        self._running_since = None
 
         #: How far this source is held back, in milliseconds. Darrell's
         #: request: a capture card arrives whenever its own hardware gets
@@ -189,29 +202,46 @@ class Source:
         return ", ".join(parts)
 
     # ------------------------------------------------------------ lifetime --
-    def start(self, samplerate=None):
-        """Open it, if this source is wanted at all. True if it is running."""
+    def start(self, samplerate=None, wait=True, soloed=None):
+        """Open it, if this source is wanted at all. True if it is running.
+
+        `soloed` is whether anything at all is soloed, when the caller knows.
+        Given, mute and solo are in force from the first block the capture
+        takes; not given, the frame puts them on straight afterwards, which
+        is what start_sources has always done inside the same call.
+        """
         if samplerate:
             self.input.set_output_rate(samplerate)
         if not (self.wanted_on_air or self.wanted_monitor):
             self.stop()
             return False
-        self.input.monitor = self.wanted_monitor
-        self.input.on_air = self.wanted_on_air
+        if soloed is None:
+            air, monitor = self.wanted_on_air, self.wanted_monitor
+        else:
+            air, monitor = self.wants_air(soloed), self.wants_monitor(soloed)
+        self.input.monitor = monitor
+        self.input.on_air = air
         if self.is_program:
-            return self._start_program()
+            return self._start_program(wait=wait, air=air, monitor=monitor)
         device = resolve_input(self.spec())
         if device is None and self.device_name:
             self.last_error = "%s is not plugged in" % self.device_name
             self.stop()
             return False
-        if self.input.is_open and self.input.device == device:
+        asked = micinput.SYSTEM_DEFAULT if device is None else device
+        if self.input.is_open and (self.input.device == device
+                                   or getattr(self.input, "fell_back_from",
+                                              None) == asked):
+            # Open, whether as asked or by another route to the same device.
+            # Comparing only the index closed a source that had come in
+            # another way every time the sources were started again, and
+            # retried the route that had already refused.
             return True
         started = self.input.start(device=device)
         self.last_error = None if started else self.input.last_error
         return started
 
-    def _start_program(self):
+    def _start_program(self, wait=True, air=None, monitor=None):
         """Find the program by name, then capture it.
 
         By name every time, even when it is already running: a program that
@@ -229,11 +259,68 @@ class Source:
         if self.input.is_open and self.input.pid == pid:
             return True
         self.stop()
-        self.input.monitor = self.wanted_monitor
-        self.input.on_air = self.wanted_on_air
-        started = self.input.start(pid=pid)
+        self.input.monitor = self.wanted_monitor if monitor is None else monitor
+        self.input.on_air = self.wanted_on_air if air is None else air
+        started = self.input.start(pid=pid, wait=wait)
         self.last_error = None if started else self.input.last_error
         return started
+
+    def waiting_for_program(self):
+        """A program source that is wanted and is not capturing right now."""
+        return (self.is_program and bool(self.program)
+                and (self.wanted_on_air or self.wanted_monitor)
+                and not self.is_open)
+
+    def find_again(self, samplerate=None, now=None, running=None,
+                   soloed=None):
+        """Capture the program again if it is running. True if it now is.
+
+        Tony, 19 September 2026: "if the exact window isn't found for a
+        source, still load the executable if it's running. the sourced
+        executable. i noticed it wouldn't once i opened chrome again."
+
+        A capture belongs to one process, and that process is gone the moment
+        the program closes. Chrome opened again is a new process with a new
+        number, and nothing ever went looking for it: the source stayed
+        silent until somebody opened the Sources window and pressed OK. The
+        frame asks this every couple of seconds instead, and it costs one
+        process snapshot while the program is not running: `running` is that
+        snapshot, taken once for every source the frame is asking about.
+
+        The capture is started WITHOUT waiting for it. This runs on the
+        window's thread, and Windows may take seconds to answer; the frame
+        sees it come up on a later look. So this returns whether it was
+        started, not whether it is running.
+        """
+        now = time.monotonic() if now is None else now
+        if not self.waiting_for_program() or now < self._next_look:
+            return False
+        present = (self.program.lower() in running if running is not None
+                   else proccapture.is_running(self.program))
+        if not present:
+            self._running_since = None
+            self.last_error = "%s is not running" % self.program
+            return False
+        if self._running_since is None:
+            self._running_since = now
+        if now - self._running_since < C.SOURCE_SETTLE_SECONDS:
+            return False
+        # Whatever happens, not asked again for a while: either it is coming
+        # up, or it is running and refusing, which will not change in two
+        # seconds.
+        self._next_look = now + C.SOURCE_RETRY_SECONDS
+        self.start(samplerate, wait=False, soloed=soloed)
+        return True
+
+    def lost_program(self, now=None):
+        """It was capturing and its program has closed. Look again shortly.
+
+        Not at once: a program shutting down leaves processes behind for a
+        moment, and catching one of those as it goes would say "back" and
+        then "closed" again a second later.
+        """
+        now = time.monotonic() if now is None else now
+        self._next_look = now + C.SOURCE_SETTLE_SECONDS
 
     def stop(self):
         self.input.on_air = False

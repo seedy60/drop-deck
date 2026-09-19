@@ -7,9 +7,11 @@ keeps working.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import os
+import time
 
 from . import constants as C
 from .playlist import DropLibrary, Playlist
@@ -157,6 +159,106 @@ def config_dir():
 
 def default_board_path():
     return os.path.join(config_dir(), "board.json")
+
+
+#: Which board was open last, so the next start opens that one again.
+#:
+#: fb40, 19 September 2026, on 3.8.2: "if I rename, move or copy the json
+#: file, it acts as if it was never set up." Every start opened board.json in
+#: the settings folder and nothing else, whichever board had been in use. A
+#: board opened with Ctrl+O, or saved somewhere with Save board as, was
+#: autosaved where it lived all session and then forgotten at the next start,
+#: so the streaming set up in it seemed to have vanished.
+LAST_BOARD_FILE = "last_board.json"
+
+
+def remembered_board_path():
+    """The board that was open last time, or None if none was remembered."""
+    try:
+        with open(os.path.join(config_dir(), LAST_BOARD_FILE), "r",
+                  encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return None
+    path = data.get("path") if isinstance(data, dict) else None
+    return path if isinstance(path, str) and path.strip() else None
+
+
+def same_path(a, b):
+    """Two paths naming the same file, as Windows compares them."""
+    if not a or not b:
+        return False
+    return (os.path.normcase(os.path.abspath(a))
+            == os.path.normcase(os.path.abspath(b)))
+
+
+def remember_board_path(path):
+    """Write down which board is open. True if it is now remembered.
+
+    Called on every save, so it writes only when the answer changes.
+    """
+    if not path:
+        return False
+    path = os.path.abspath(path)
+    if same_path(remembered_board_path(), path):
+        return True
+    target = os.path.join(config_dir(), LAST_BOARD_FILE)
+    temp = target + ".tmp"
+    try:
+        with open(temp, "w", encoding="utf-8") as handle:
+            json.dump({"path": path}, handle)
+        _replace(temp, target)
+        return True
+    except Exception:
+        return False
+
+
+def _replace(source, target, attempts=5):
+    """os.replace, retried. Dropbox and virus scanners hold new files open.
+
+    Not retried when the target is marked read only: that is a setting, not
+    a moment, and waiting a second for it froze the window on every save.
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            read_only = (os.path.exists(target)
+                         and not os.access(target, os.W_OK))
+            if read_only or attempt == attempts - 1:
+                raise
+            time.sleep(0.1 * (attempt + 1))
+
+
+#: What a board remembers about a file it did not read. See claim_path.
+#: NOTHING_THERE: there was no file, so one appearing is somebody else's.
+#: UNREADABLE: there was one it could not read, so it is never written over.
+NOTHING_THERE = "nothing there"
+UNREADABLE = "could not be read"
+
+
+def _stamp_of(handle, raw):
+    info = os.fstat(handle.fileno())
+    return (info.st_size, info.st_mtime_ns, hashlib.sha1(raw).hexdigest())
+
+
+def _disk_stamp(path):
+    """(size, modified, content hash) of a file, or None if it cannot be read.
+
+    Size and time are the quick question. The hash is the real one, asked
+    only when those two differ, so something that touched the file without
+    changing it does not count as somebody else's edit. Size and time come
+    from the OPEN handle, so they describe exactly the bytes that were read:
+    a separate stat could see a write that landed in between, and that write
+    would then never be noticed and would be saved over.
+    """
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+            return _stamp_of(handle, raw)
+    except OSError:
+        return None
 
 
 def app_dir():
@@ -434,8 +536,25 @@ class Board:
         #: this answers, and Enter is still the next keystroke. Somebody
         #: who goes live every day turns it off inside the dialog.
         self.ask_before_live = True
+        #: What the file at `path` looked like when this board last read or
+        #: wrote it. See changed_on_disk.
+        self._disk = None
         self.path = None
         self.dirty = False
+
+    @property
+    def path(self):
+        return self._path
+
+    @path.setter
+    def path(self, value):
+        # A board pointed at a different file knows nothing about that file,
+        # so what it remembered about the old one must not be compared with
+        # the new one. The demo loaded over a board used to be exactly that:
+        # the demo's fingerprint held against somebody's own board.json.
+        if not same_path(value, getattr(self, "_path", None)):
+            self._disk = None
+        self._path = value
 
     # ------------------------------------------------------------ accessors --
     def _adopt_slots(self):
@@ -738,17 +857,106 @@ class Board:
         temp = path + ".tmp"
         with open(temp, "w", encoding="utf-8") as handle:
             handle.write(payload)
-        os.replace(temp, path)
+        try:
+            _replace(temp, path)
+        except Exception:
+            # Never leave the half of a save that did not land lying beside
+            # somebody's board.
+            try:
+                os.remove(temp)
+            except OSError:
+                pass
+            raise
         self.path = path
         self.dirty = False
+        self._disk = _disk_stamp(path)
         return path
+
+    def claim_path(self, path, unreadable=False):
+        """Point this board at a file it did NOT load, remembering what is there.
+
+        The demo at first run, a new board, the demo loaded over a board: each
+        takes a path without reading it. Knowing nothing about that file is
+        not the same as owning it. Mark found the first run case on 19
+        September 2026: with nothing remembered, a board copied into the
+        settings folder while the demo was open was written over on close,
+        which is fb40 exactly. So what is there NOW is written down, and
+        anything different later is somebody else's.
+
+        `unreadable` is a file that could not be read or even copied aside.
+        That one is never written over at all.
+        """
+        self.path = path
+        if not path:
+            return
+        if unreadable:
+            self._disk = UNREADABLE
+        elif os.path.exists(path):
+            self._disk = _disk_stamp(path) or UNREADABLE
+        else:
+            self._disk = NOTHING_THERE
+
+    def changed_on_disk(self):
+        """Has something other than this app changed the board's file?
+
+        Closing the app saved the board over its file unconditionally, so a
+        board somebody copied into place while Drop Deck was open was
+        overwritten the moment they closed it to pick the new one up, and
+        the streaming set up in that copy was gone before it was ever read.
+        fb40 again: "copy the json file, it acts as if it was never set up."
+
+        A file that is not there is not a change: saving puts it back, which
+        is what always happened.
+        """
+        if not self.path or self._disk is None:
+            return False
+        if self._disk in (NOTHING_THERE, UNREADABLE):
+            # Nothing was there and something is now, or what was there was
+            # never ours to write over in the first place.
+            return os.path.exists(self.path)
+        try:
+            info = os.stat(self.path)
+        except OSError:
+            return False
+        if (info.st_size, info.st_mtime_ns) == self._disk[:2]:
+            return False
+        now = _disk_stamp(self.path)
+        return now is not None and now[2] != self._disk[2]
+
+    def disk_now(self):
+        """What the board's file holds at this moment, for telling apart one
+        change from the next. None when there is nothing readable there."""
+        return _disk_stamp(self.path) if self.path else None
+
+    def sidecar_path(self):
+        """Where to keep this board when its own file belongs to somebody else.
+
+        Beside the original, with the time in the name, so both are found in
+        the same place and neither is ever written over.
+        """
+        path = self.path or default_board_path()
+        stem, ext = os.path.splitext(path)
+        stamp = time.strftime("%Y-%m-%d %H%M")
+        candidate = "%s (Drop Deck copy %s)%s" % (stem, stamp, ext or ".json")
+        count = 2
+        while os.path.exists(candidate):
+            candidate = "%s (Drop Deck copy %s, %d)%s" % (stem, stamp, count,
+                                                          ext or ".json")
+            count += 1
+        return candidate
 
     @classmethod
     def load(cls, path):
-        with open(path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
+        with open(path, "rb") as handle:
+            raw = handle.read()
+            try:
+                stamp = _stamp_of(handle, raw)
+            except OSError:
+                stamp = None
+        data = json.loads(raw.decode("utf-8-sig"))
         board = cls()
         board.path = path
+        board._disk = stamp
         board.sfx_volume = float(data.get("sfx_volume", C.DEFAULT_SFX_VOLUME))
         board.bed_volume = float(data.get("bed_volume", C.DEFAULT_BED_VOLUME))
         board.ducking = bool(data.get("ducking", True))

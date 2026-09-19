@@ -212,12 +212,22 @@ class ProcessCapture:
         return True
 
     # ----------------------------------------------------------- lifetime --
-    def start(self, pid=None):
-        """Begin capturing. True if it is running afterwards."""
+    def start(self, pid=None, wait=True):
+        """Begin capturing. True if it is running afterwards.
+
+        `wait=False` returns at once and the capture comes up on its own
+        thread: `is_open` says when. That is for the frame's watcher, which
+        runs on the window's thread and must never hold it for the four
+        seconds Windows is allowed to take to answer.
+        """
         if pid is not None:
             self.pid = int(pid)
         if self._running:
             return True
+        if self._thread is not None and self._thread.is_alive():
+            # Still coming up from the last call. A second thread on the same
+            # capture would be two readers of one program.
+            return False
         if not supported():
             self.last_error = ("This version of Windows cannot capture one "
                                "program's audio. It needs Windows 10 build "
@@ -241,7 +251,8 @@ class ProcessCapture:
         self._thread.start()
         # Waited for, so a source that cannot open says so now rather than
         # looking fine and being silent.
-        started.wait(4.0)
+        if wait:
+            started.wait(4.0)
         return self._running
 
     def stop(self):
@@ -632,6 +643,11 @@ def audio_sessions():
 
 def _all_processes():
     """(name, pid) for everything running. Used to find the windowless."""
+    return [(name, pid) for name, pid, _parent in _process_table()]
+
+
+def _process_table():
+    """(name, pid, parent pid) for everything running. Never raises."""
     TH32CS_SNAPPROCESS = 0x2
 
     class PROCESSENTRY32W(ctypes.Structure):
@@ -647,7 +663,10 @@ def _all_processes():
                     ("szExeFile", ctypes.c_wchar * 260)]
 
     out = []
-    snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    try:
+        snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    except Exception:
+        return out
     if snapshot == -1:
         return out
     try:
@@ -656,11 +675,38 @@ def _all_processes():
         if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
             return out
         while True:
-            out.append((entry.szExeFile, int(entry.th32ProcessID)))
+            out.append((entry.szExeFile, int(entry.th32ProcessID),
+                        int(entry.th32ParentProcessID)))
             if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
                 return out
+    except Exception:
+        return out
     finally:
         kernel32.CloseHandle(snapshot)
+
+
+def running_names():
+    """The executable names of everything running, lower case. One snapshot.
+
+    For the watcher, which asks about every waiting program source at once
+    and so takes the snapshot once rather than once per source.
+    """
+    return {name.lower() for name, _pid, _parent in _process_table()}
+
+
+def is_running(executable):
+    """Is any process of that name running. Cheap: one process snapshot.
+
+    Asked every couple of seconds for a program source whose program has
+    closed, so it must not enumerate windows or audio sessions to answer.
+    """
+    if not executable:
+        return False
+    wanted = executable.lower()
+    return any(name.lower() == wanted for name, _pid, _parent
+               in _process_table())
+
+
 
 
 def running_programs():
@@ -752,10 +798,27 @@ def find_pid(executable):
     if not executable:
         return None
     wanted = executable.lower()
+    # The one a person would recognise, a window or something making a noise,
+    # found by the EXECUTABLE whatever its windows are called now. Tony, 19
+    # September 2026: "if the exact window isn't found for a source, still
+    # load the executable if it's running".
+    #
+    # NOT walked up to the top of the program's process tree, which was
+    # tried and measured the same day: a capture given a grandparent heard
+    # nothing from the grandchild that was playing. The process with the
+    # window or the sound is the one to give it.
     for entry in running_programs():
         if entry["name"].lower() == wanted:
             return entry["pid"]
-    return _search_all(wanted)
+    # Nothing with a window or a sound yet. The first process of that name
+    # whose parent is not one too, so the capture takes the whole program
+    # rather than one of its helpers.
+    family = {pid: parent for name, pid, parent in _process_table()
+              if name.lower() == wanted}
+    if not family:
+        return _search_all(wanted)
+    roots = [pid for pid, parent in family.items() if parent not in family]
+    return roots[0] if roots else next(iter(family))
 
 
 def _search_all(wanted):

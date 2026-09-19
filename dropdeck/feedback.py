@@ -149,6 +149,14 @@ def diagnostics(frame=None):
         info["speech_available"] = bool(frame.speaker.available)
     except Exception:
         pass
+    # Whether the microphone key can arrive, whether the microphone opens and
+    # whether sound comes out of it, and what went wrong inside the app this
+    # session. Plain words and error numbers: never a device's name. Mashal's
+    # report could not be answered without these.
+    try:
+        info.update(frame.mic_diagnostics())
+    except Exception:
+        pass
     return info
 
 

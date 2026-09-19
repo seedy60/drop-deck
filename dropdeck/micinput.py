@@ -34,10 +34,25 @@ import soxr
 
 from . import constants as C
 from .engine import CHANNELS, db_to_gain
+from .mixer import all_devices, host_api_names
 
 #: The key the microphone publishes under on the shared DuckBus. Anything but
 #: a mixer's own key, which is what the mixers publish their own drops under.
 DUCK_KEY = "microphone"
+
+#: The ways Windows offers one microphone, in the order a failed one is
+#: retried. WDM-KS is not on the list: it takes the device away from every
+#: other program while it is open, which is not something to fall back into.
+FALLBACK_APIS = ("Windows WASAPI", "Windows DirectSound", "MME")
+
+#: MME cuts every device name to 31 characters, so the same microphone is
+#: "Microphone (Yeti Stereo Microph" there and the full name everywhere else.
+MME_NAME_LENGTH = 31
+
+#: What `fell_back_from` says when the microphone asked for was the system
+#: default. It cannot be None, because None is "it opened as asked", and a
+#: default that would not open was then never mentioned anywhere.
+SYSTEM_DEFAULT = "system default"
 
 
 def input_devices():
@@ -45,10 +60,15 @@ def input_devices():
 
     Same shape and the same ordering as ``mixer.output_devices``: WASAPI at the
     top because that is where the low latency and the virtual cables are.
+
+    Never raises. This runs inside the Ctrl+M handler, and a device list that
+    raised there made the key do nothing at all, with nothing said.
     """
-    hostapis = [h["name"] for h in sd.query_hostapis()]
+    hostapis = host_api_names()
     found = []
-    for index, dev in enumerate(sd.query_devices()):
+    for index, dev in all_devices():
+        if dev["hostapi"] >= len(hostapis):
+            continue
         if dev["max_input_channels"] < 1:
             continue
         found.append({
@@ -96,6 +116,97 @@ def resolve_input(spec):
         if device["name"] == name:
             return device["index"]
     return None
+
+
+def _same_microphone(a, b):
+    """Are two device names the same microphone under two host APIs.
+
+    Equal, or one is the other cut short the way MME cuts every name.
+    """
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    short, full = sorted((a, b), key=len)
+    return len(short) == MME_NAME_LENGTH and full.startswith(short)
+
+
+def alternatives(device):
+    """The same microphone reached another way, best first.
+
+    One physical microphone appears several times over, once per host API,
+    and they fail independently: a device another program has taken for
+    itself under WASAPI can still be shared under DirectSound or MME, and a
+    driver that refuses one format on one path takes it on another. So when
+    the chosen one will not open, these are tried before giving up.
+
+    For the system default it is each host API's own default input, since
+    PortAudio's default is only ever MME's.
+    """
+    try:
+        hostapis = sd.query_hostapis()
+    except Exception:
+        return []
+    names = [h["name"] for h in hostapis]
+    order = {api: rank for rank, api in enumerate(FALLBACK_APIS)}
+    devices = input_devices()
+    if device is None:
+        found = []
+        for api in FALLBACK_APIS:
+            if api not in names:
+                continue
+            index = hostapis[names.index(api)].get("default_input_device", -1)
+            if isinstance(index, int) and index >= 0:
+                found.append(index)
+        return found
+    here = next((d for d in devices if d["index"] == device), None)
+    if here is None:
+        return []
+    if _ambiguous(here["name"], devices):
+        return []
+    found = [d for d in devices
+             if d["index"] != device and d["hostapi"] in order
+             and _same_microphone(d["name"], here["name"])
+             and not _ambiguous(d["name"], devices)]
+    found.sort(key=lambda d: order[d["hostapi"]])
+    return [d["index"] for d in found]
+
+
+def _default_input_index():
+    """The index PortAudio opens for "the system default", or None."""
+    try:
+        return int(sd.query_devices(kind="input")["index"])
+    except Exception:
+        return None
+
+
+def _ambiguous(name, devices):
+    """Could this name be more than one microphone.
+
+    MME cuts names to 31 characters, so "Headset Microphone (Plantronics" is
+    a BT600 and a Blackwire at once. Mark, 19 September 2026: with the BT600
+    refusing, the other headset opened and was announced as the one chosen.
+    A cut name counts as a microphone only when exactly one full name starts
+    with it and no other MME device carries it.
+    """
+    if len(name) != MME_NAME_LENGTH:
+        return False
+    longer = {d["name"] for d in devices
+              if len(d["name"]) > MME_NAME_LENGTH
+              and d["name"].startswith(name)}
+    same_cut = sum(1 for d in devices
+                   if d["hostapi"] == "MME" and d["name"] == name)
+    return len(longer) > 1 or same_cut > 1
+
+
+def host_api_of(device):
+    """The host API a device index belongs to, for saying how it opened."""
+    try:
+        info = sd.query_devices(device, kind="input") if device is None \
+            else sd.query_devices(device)
+        return sd.query_hostapis(info["hostapi"])["name"]
+    except Exception:
+        return ""
 
 
 def input_rate(device):
@@ -206,6 +317,19 @@ class MicInput:
         self.monitor = bool(monitor)
         self.stream = None
         self.last_error = None
+        #: The device that was asked for, when a different way of reaching the
+        #: same microphone is what actually opened. None when it opened as
+        #: asked. Said out loud, because a microphone that opened by another
+        #: route is still worth knowing about.
+        self.fell_back_from = None
+        #: Counted by the capture callback since the last open, so the app can
+        #: tell "nothing arrived" from "silence arrived" from "a voice
+        #: arrived". A real microphone is never digitally silent.
+        self.blocks_seen = 0
+        self.signal_seen = False
+        #: Goes up by one every time the microphone opens, so a check
+        #: scheduled for one opening can tell it is not looking at a later one.
+        self.openings = 0
         #: How many channels the device was actually opened with.
         self.channels_open = 1
         #: Peak of the most recent block, 0 to 1, for a level readout. This
@@ -302,6 +426,8 @@ class MicInput:
 
     def _try_open(self, channels, rate, failures):
         """One attempt at one shape. True if the microphone is now running."""
+        stream = None
+        before = (self.samplerate, self.channels_open)
         try:
             stream = sd.InputStream(
                 device=self.device,
@@ -312,30 +438,40 @@ class MicInput:
                 latency="low",
                 callback=self._callback,
             )
+            # The rate and the resampler are settled BEFORE the stream starts,
+            # so its first callback already resamples from the right rate.
+            # And all of it is inside the guard, which matters: this used to
+            # run after it, so anything it raised left a RUNNING stream behind
+            # with the state half set, escaped the key handler, and every
+            # later Ctrl+M raised again on its way through: a key that did
+            # nothing, on or off, with nothing said anywhere.
+            self.samplerate = rate
+            self.channels_open = channels
+            self._reset_ring()
+            # Counted from here, before the callback can run, so the first
+            # blocks of this opening are never credited to the last one.
+            self.blocks_seen = 0
+            self.signal_seen = False
             stream.start()
+            self.stream = stream
+            self._publish(True)
         except Exception as exc:  # no microphone, in use, rate or shape refused
             failures.append("%d Hz, %d channel: %s" % (rate, channels, exc))
+            if stream is not None:
+                try:
+                    stream.abort()
+                    stream.close()
+                except Exception:
+                    pass
+            self.stream = None
+            self.samplerate, self.channels_open = before
             return False
-        self.stream = stream
-        self.samplerate = rate
-        self.channels_open = channels
         self.last_error = None
-        self._reset_ring()
-        self._publish(True)
+        self.openings += 1
         return True
 
-    def start(self, device=None):
-        """Open the microphone. Returns True if it is actually running.
-
-        Nothing opens a microphone on its own: this is only ever called
-        because somebody pressed the key. An app that quietly turned a
-        microphone on at startup would be a different kind of program.
-        """
-        if device is not None:
-            self.device = device
-        self.stop()
-
-        failures = []
+    def _open_any_shape(self, failures):
+        """Every channel count and rate, on whatever self.device is."""
         # Two channels where the device has them, so a mixer feeding a stereo
         # pair can have either side or both, and one where it does not. Two is
         # tried first and one is the fallback, because a working microphone on
@@ -344,6 +480,45 @@ class MicInput:
             for rate in self.candidate_rates():
                 if self._try_open(wanted, rate, failures):
                     return True
+        return False
+
+    def start(self, device=None, other_routes=True):
+        """Open the microphone. Returns True if it is actually running.
+
+        Nothing opens a microphone on its own: this is only ever called
+        because somebody pressed the key. An app that quietly turned a
+        microphone on at startup would be a different kind of program.
+
+        If the device will not open at all, the SAME microphone is tried
+        through the other ways Windows offers it (see `alternatives`) before
+        this gives up, and `fell_back_from` says so. It is never a different
+        microphone: somebody who chose the one on their desk does not want
+        the one in their laptop lid switched on behind their back.
+        """
+        if device is not None:
+            self.device = device
+        self.stop()
+        self.fell_back_from = None
+
+        failures = []
+        if self._open_any_shape(failures):
+            return True
+
+        asked = self.device
+        if other_routes:
+            # The system default IS a device, MME's default input, and it has
+            # just been tried under its own index as well as under None.
+            tried = {asked, _default_input_index() if asked is None else asked}
+            for index in alternatives(asked):
+                if index in tried:
+                    continue
+                tried.add(index)
+                self.device = index
+                if self._open_any_shape(failures):
+                    self.fell_back_from = (SYSTEM_DEFAULT if asked is None
+                                           else asked)
+                    return True
+            self.device = asked
 
         self.stream = None
         # Every rate, not just the last one. "Invalid sample rate" on its own
@@ -351,6 +526,11 @@ class MicInput:
         self.last_error = "; ".join(failures) or "no microphone available"
         self._publish(False)
         return False
+
+    @property
+    def opened_via(self):
+        """Which of Windows' ways in the open microphone is using."""
+        return host_api_of(self.device) if self.is_open else ""
 
     def stop(self):
         """Close the microphone and put the music back up."""
@@ -364,7 +544,12 @@ class MicInput:
             self.stream = None
         self.peak = 0.0
         self._publish(False)
-        self._reset_ring()
+        try:
+            self._reset_ring()
+        except Exception:
+            # Closing has to work whatever state the last opening left behind,
+            # or the key that turns the microphone off stops working too.
+            self._resampler = None
         return was_open
 
     def toggle(self, device=None):
@@ -433,6 +618,9 @@ class MicInput:
         block = block * self.gain
         peak = float(np.abs(block).max()) if frames else 0.0
         self.peak = peak
+        self.blocks_seen += 1
+        if peak > 0.0:
+            self.signal_seen = True
         if not self.monitor and not self.on_air:
             return
         # One channel up the middle of both. Written into the rings under the

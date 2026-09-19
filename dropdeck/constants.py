@@ -8,7 +8,7 @@ They are muscle memory and they are not up for redesign.
 from . import audiofile as _audiofile
 
 APP_NAME = "TG Drop Deck"
-APP_VERSION = "3.8.2"
+APP_VERSION = "3.8.3"
 VENDOR = "TG Studios"
 TAGLINE = "An accessible soundboard for podcasts, radio and live shows."
 
@@ -373,6 +373,40 @@ MAX_MIC_GAIN_DB = 24.0
 #: two streams will ever drift apart in and small enough to be inaudible.
 MIC_RING_FRAMES = 12000
 
+#: How long an open microphone has to send something before the app says it
+#: has not. A real microphone is never digitally silent: even in a quiet room
+#: it carries a little hiss, so two and a half seconds of exact zeros means
+#: Windows is handing over silence, which is what a privacy block or a muted
+#: input looks like from in here. Long enough for a slow driver to start.
+MIC_SIGNAL_CHECK_MS = 2500
+
+#: How long after the window comes back before checking whether the board's
+#: file changed meanwhile. The screen reader announces the window at that
+#: moment, and whichever speaks second cuts the other one off.
+BOARD_CHECK_DELAY_MS = 500
+
+#: How long to wait at startup for the board that was open last time to be
+#: found, when it is somewhere a network share may not answer. Windows can
+#: take most of a minute to give up on one, measured 43.8 seconds, and this
+#: happens before the window exists.
+BOARD_REACH_SECONDS = 2.0
+
+#: How many device slots to walk when PortAudio cannot hand the whole list
+#: over in one go. Far more than any machine has; the walk stops at the first
+#: index past the end.
+MAX_DEVICE_SCAN = 256
+
+#: How often a program source whose program has closed looks for it again.
+#: One process snapshot each time, so cheap, and quick enough that a program
+#: opened again is back on the air before anybody wonders where it went.
+SOURCE_WATCH_SECONDS = 2.0
+#: A program that is running and still will not capture is asked again this
+#: much later, rather than every two seconds.
+SOURCE_RETRY_SECONDS = 10.0
+#: After a program closes, how long before looking for it again. Programs
+#: leave processes behind for a moment while they shut down.
+SOURCE_SETTLE_SECONDS = 4.0
+
 # ------------------------------------------------------------------- keys ---
 KEYBOARD_HELP = f"""{APP_NAME}: keyboard shortcuts
 
@@ -625,6 +659,8 @@ YOUR DROPS LIBRARY
 
 THE MICROPHONE
   Ctrl+M                    Microphone on or off
+  Alt+Shift+M               The same, for when another program has taken
+                            Ctrl+M for itself
   Ctrl+Shift+M              Which microphone, how much gain, which output
                             you hear yourself on, and whether you do
 
@@ -644,7 +680,20 @@ THE MICROPHONE
   Preferences, Microphone.
 
   Nothing here ever opens the microphone on its own. It opens when you press
-  Ctrl+M and at no other time, and whether it was on is never saved.
+  Ctrl+M or Alt+Shift+M and at no other time, and whether it was on is never
+  saved.
+
+  IF CTRL+M DOES NOTHING AT ALL, another program has probably taken the key
+  before Drop Deck can hear it. Drop Deck says so when it starts if it can
+  tell. Alt+Shift+M still works, and so does Microphone on in the Playlist
+  menu. With NVDA, press NVDA+1, then Ctrl+M, then NVDA+1 again to turn input
+  help off. If NVDA describes a command, an add-on or one of your own input
+  gestures has the key.
+
+  If the microphone will not open, Drop Deck says why, and it tries the same
+  microphone through the other ways Windows offers before giving up. If it
+  opens but nothing arrives, not even background noise, it says that too:
+  that is what Windows privacy settings or a muted input look like from here.
 
 PROCESSING YOUR VOICE
   Preferences, Voice. A noise gate, a high pass filter, a three band

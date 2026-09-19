@@ -431,6 +431,34 @@ def selftest():  # noqa: C901
     except Exception as exc:
         problems.append("the sources list raised: %r" % exc)
 
+    # 3.8.3. The three answers to "Ctrl+M does nothing", proved to WORK in
+    # this build rather than to import. Each is ctypes or winreg underneath,
+    # and each would fail by answering "unknown" for ever, which says nothing.
+    try:
+        from dropdeck import micdiag, errorlog
+        free = micdiag.held_elsewhere(
+            micdiag.MOD_CONTROL | micdiag.MOD_ALT | micdiag.MOD_SHIFT, 0x7A)
+        if free is None:
+            problems.append("the key check cannot ask Windows in this build, "
+                            "so a taken Ctrl+M would never be named")
+        state = micdiag.privacy()[0]
+        keys = frame._app_keys()
+        taken = frame._keys_taken_elsewhere()
+        notes.append("microphone checks: key probe working, %d keys, taken "
+                     "elsewhere: %s; privacy %s"
+                     % (len(keys), ", ".join(taken) or "none", state))
+        if not any(label == "Alt+Shift+M" for label, _m, _v in keys):
+            problems.append("Alt+Shift+M is not bound, so there is no second "
+                            "way to the microphone")
+        if micdiag.explain("[Windows WASAPI error -2004287478]") != \
+                micdiag.IN_USE:
+            problems.append("the microphone's error codes are not being read")
+        log = errorlog.log_path()
+        if not log or not os.path.isdir(os.path.dirname(log)):
+            problems.append("there is nowhere to write the error log")
+    except Exception as exc:
+        problems.append("the microphone checks raised: %r" % exc)
+
     try:
         frame.mixer.close()
     except Exception:
@@ -528,6 +556,10 @@ def main():
         # into exit 139. Closing the app normally is clean (verified); this
         # path is the one that is not, and it has nothing left to do.
         os._exit(code)
+    # A windowed build has no console, so anything a key handler raises would
+    # otherwise vanish, and the key would simply do nothing. See errorlog.py.
+    from dropdeck import errorlog
+    errorlog.install()
     # One copy at a time. Two soundboards open at once is not just clutter -
     # they fight over the same board file and both hold the audio device, so
     # the second one can silently fail to make any sound at all.

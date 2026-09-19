@@ -35,6 +35,42 @@ _CACHE_BUDGET_BYTES = 256 * 1024 * 1024
 DEFAULT_DEVICE_KEY = "the system default output"
 
 
+def all_devices():
+    """Every device PortAudio knows, as (index, info) pairs. Never raises.
+
+    `sd.query_devices()` builds the whole list in one go, so ONE device it
+    cannot describe takes every other device down with it. That is not
+    hypothetical: sounddevice decodes a WASAPI or WDM-KS name as UTF-8 and
+    re-raises anything that is not, and a Bluetooth headset is named after
+    the phone it belongs to, apostrophes and all. On a machine like that
+    every Ctrl+M raised inside the key handler and did nothing whatsoever.
+
+    So each device is asked about on its own, and one that cannot answer is
+    left out while the counting carries on past it.
+    """
+    try:
+        return list(enumerate(sd.query_devices()))
+    except Exception:
+        pass
+    found = []
+    for index in range(C.MAX_DEVICE_SCAN):
+        try:
+            found.append((index, sd.query_devices(index)))
+        except UnicodeDecodeError:
+            continue                    # there, but its name is unreadable
+        except Exception:
+            break                       # past the end of the list
+    return found
+
+
+def host_api_names():
+    """Host API names by index, or an empty list if PortAudio cannot say."""
+    try:
+        return [h["name"] for h in sd.query_hostapis()]
+    except Exception:
+        return []
+
+
 def output_devices():
     """Every output the machine offers, newest APIs first.
 
@@ -42,9 +78,11 @@ def output_devices():
     and ``samplerate``. WASAPI is listed first because it is the one with the
     low latency and the virtual cables people actually want.
     """
-    hostapis = [h["name"] for h in sd.query_hostapis()]
+    hostapis = host_api_names()
     found = []
-    for index, dev in enumerate(sd.query_devices()):
+    for index, dev in all_devices():
+        if dev["hostapi"] >= len(hostapis):
+            continue
         if dev["max_output_channels"] < 1:
             continue
         found.append({

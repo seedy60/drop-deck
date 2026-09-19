@@ -687,6 +687,87 @@ And specific to this one:
   every time was two announcements for one keystroke. `_hinted_banks` on the
   frame is what makes it once.
 
+- **The microphone key must never do nothing.** Mashal, 19 September 2026:
+  Ctrl+M did nothing at all, installed or portable, after a restart, privacy
+  checked. Three different things produce that silence and each now has an
+  answer. **A key another program registers for the whole machine never
+  arrives**, and Windows tells nobody: `micdiag.held_elsewhere` asks by
+  registering the key itself and letting go at once, and the startup line
+  names any of our keys that are held, derived from the accelerator table AND
+  the menu labels (`_app_keys`), never from a list. Two keys report as taken
+  on every machine, Ctrl+Alt+Tab and Alt+F4, and are `micdiag.WINDOWS_OWN`;
+  our own global hotkeys look exactly like somebody else's and are excluded.
+  A screen reader add-on's keyboard hook cannot be seen at all, which is why
+  **Alt+Shift+M** exists as a second key. **A fault in the handler vanished**,
+  because a windowed build has no console: `toggle_mic` catches, closes what
+  half opened, and SAYS it, and `errorlog.py` catches everything else into
+  `errors.log`, silently, with only "where: Kind" going to feedback. **And a
+  microphone can open and send nothing**, which is what a privacy block looks
+  like on some of Windows' paths: `_check_mic_signal` says so after
+  `C.MIC_SIGNAL_CHECK_MS`, using exact zeros, because a real microphone is
+  never digitally silent. `tools/check_video_key.py mic` and `micalt` press
+  both keys for real. **A failed microphone is retried as the SAME
+  microphone by another route** (`micinput.alternatives`), never a different
+  one, and MME's 31 character names make that easy to get wrong: two
+  headsets that share their first 31 characters are one name to MME, so a
+  cut name counts only when exactly one full name starts with it
+  (`_ambiguous`). A system default that would not open says
+  `SYSTEM_DEFAULT`, never None, or it is never mentioned.
+
+- **A board file is the user's, and the app must never write over one it did
+  not write.** fb40, 19 September 2026: "if I rename, move or copy the json
+  file, it acts as if it was never set up." Three faults. Every start opened
+  board.json whatever board was in use: `last_board.json` remembers the one
+  that was open. Closing saved over a board copied in while the app was open,
+  the very act of picking the copy up: `Board.changed_on_disk` compares size
+  and time, then a SHA-1, and nothing saves over a changed file; a dirty board
+  goes to `sidecar_path()` instead. And a board that would not load was
+  replaced by the demo, which then took its path and was autosaved over it:
+  `_keep_unreadable` copies it aside first. **`Board.path` is a property whose
+  setter clears the fingerprint**, because the demo loaded over a board used
+  to carry the demo's fingerprint against somebody's own file.
+  **A path taken without reading it is CLAIMED, never assumed.**
+  `Board.claim_path` writes down what is there: `NOTHING_THERE` means a file
+  appearing later is somebody else's, which is the first run half of fb40
+  (the demo used to be saved over a board copied into the settings folder),
+  and `UNREADABLE` means never written over at all, for a board that could
+  not be read or even copied aside. The demo at startup, File New and Load
+  demo all claim. **Nothing that acts on a changed file may show a box**:
+  loading it through the Open board path popped "Open failed", closing the
+  box re-activated the window, which checked again, for ever. Each version
+  of the file is acted on once (`_seen_board_version`), the look happens off
+  the window's thread because a dead network share takes most of a minute
+  to answer, and a remembered board out of reach is waited for
+  `C.BOARD_REACH_SECONDS` and stays remembered for next time
+  (`_pinned_board`). All of this came from Mark's audit, with repros.
+
+- **A menu item's label must never be empty.** wx reads an empty label as a
+  request for a stock label, has none for our ids, and asserts. The saved
+  setups submenu built one from a station with no name, while the window was
+  being built, so such a board could not be opened at all.
+
+- **A program source is found by its EXECUTABLE, whenever it is running.**
+  Tony, 19 September 2026: Chrome opened again was a new process and nothing
+  went looking for it. `_watch_program_sources` rides the refresh tick every
+  `C.SOURCE_WATCH_SECONDS`, one process snapshot while the program is away,
+  and `Source.find_again` waits `C.SOURCE_SETTLE_SECONDS` after a close so a
+  program shutting down cannot say "back" and then "closed". `find_pid`
+  returns the process with the WINDOW or the SOUND, found by executable.
+  **Do not walk it up to the top of the program's process tree.** Tried and
+  measured 19 September 2026: a capture handed a grandparent heard nothing
+  from the grandchild that was playing (`test_proccapture` "and hears it",
+  run under a Python parent). Only with no window and no sound yet is the
+  topmost same-name process taken. **The watcher never holds the window's
+  thread**: one `running_names()` snapshot for every waiting source, and the
+  capture started with `wait=False`, announced when a LATER look finds it
+  open, because Windows may take four seconds to answer and that is four
+  seconds of a frozen soundboard mid show. A program is given
+  `C.SOURCE_SETTLE_SECONDS` after it first appears, for launchers like
+  Firefox's that hand over and exit. Mute and solo go to `start(soloed=)`
+  BEFORE the capture starts, or a muted program is live for a moment. And a
+  timer's `NameError` is invisible: the watcher shipped to test without
+  `proccapture` imported in ui.py, and only the error log said so.
+
 ## The Mac copy
 
 `mac/` is the same product on macOS: native Swift and AppKit for VoiceOver,
@@ -729,6 +810,8 @@ dropdeck/
   colours.py     the brand, by name, and whether a pair can actually be read
   health.py      noticing the picture has gone black or frozen, and saying so
   send.py        the on air mix out of a sound card, for another program here
+  micdiag.py     why the microphone is not working: keys, privacy, error codes
+  errorlog.py    the faults a windowed build would otherwise lose, to errors.log
 tools/
   audiopost.py       levels and seamless loops for generated audio
   make_demo_pack.py  the forty-piece demo pack, via ElevenLabs
@@ -740,7 +823,11 @@ tools/
                      other end and counted for gaps. The only check that can
                      prove the thing 3.6.0 was built to fix
   check_video_key.py real Alt+Shift+V into the real window, with a known good
-                     key first as a control. Run it by hand
+                     key first as a control. Run it by hand. `mic` and
+                     `micalt` press Ctrl+M and Alt+Shift+M
+  check_reattach.py  a real program captured, closed and started again as a
+                     new process with a new tone: the source must say so and
+                     carry the new tone. Makes two quiet tones on the speakers
   shot_golive.py     pictures of the two 3.4.1 windows, and a layout audit
 ```
 
@@ -962,8 +1049,10 @@ out of the generator.
 
 ## Boards
 
-`%APPDATA%\TG Studios\TG Drop Deck\board.json`. Saved on change (two second
-debounce) and on exit, atomically.
+`%APPDATA%\TG Studios\TG Drop Deck\board.json`, or whichever board was open
+last, which `last_board.json` beside it remembers. Saved on change (two second
+debounce) and on exit, atomically, and never over a file that changed outside
+the app since it was read.
 
 A board may store paths relative to itself, that is how the shipped demo
 resolves wherever the app lands. Absolute paths are used for everything the
