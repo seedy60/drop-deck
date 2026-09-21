@@ -42,6 +42,7 @@ from . import streamout
 from . import vst
 from . import globalhotkeys
 from . import m3u
+from . import board as board_module
 from .board import (Board, default_board_path, demo_board_path,
                     remember_board_path, remembered_board_path, same_path)
 from . import updatedialog
@@ -1205,12 +1206,21 @@ class DropDeckFrame(wx.Frame):
             # A saved board can restore a routing that collides. It used to
             # be checked only when somebody opened the send window.
             bits.append(line)
+        # Where the settings went, said once ever, the first time a portable
+        # copy brings them over from AppData. **Last**, because everything
+        # above it is about this session and somebody is half listening: put
+        # ahead of the counts it pushed "files missing" and "audio could not
+        # start" further down a long sentence. The folder itself holds the
+        # long version. See board._settle_in.
+        data_note = getattr(board_module, "data_note", "")
+        if data_note:
+            bits.append(data_note)
         # "40 sounds loaded" is a pleasantry. "3 files missing" and "audio
         # could not start" are not, so the same line changes channel when it
         # is carrying one of them.
         wrong = (bool(missing) or not self.mixer.is_running or send_failed
                  or bool(self._routing_conflicts()) or bool(board_note)
-                 or bool(taken) or bool(clashes))
+                 or bool(taken) or bool(clashes) or bool(data_note))
         (self.announce if wrong else self.announce_help)(". ".join(bits))
 
     def _board_name(self):
@@ -2288,8 +2298,8 @@ class DropDeckFrame(wx.Frame):
         message = ("This folder cannot be written to, so version %s has been "
                    "unpacked next to it instead, in %s. Close this copy and "
                    "run TG Drop Deck from that folder. Your board and "
-                   "settings are shared, so everything is where you left it."
-                   % (version or "the new one", folder))
+                   "settings have gone with it, so everything is where you "
+                   "left it." % (version or "the new one", folder))
         self.announce(message)
         answer = wx.MessageBox(
             message + "\n\nOpen that folder now?", "Update ready",
@@ -3974,6 +3984,12 @@ class DropDeckFrame(wx.Frame):
         info["mic_privacy"] = micdiag.privacy()[0]
         info["keys_taken_elsewhere"] = ", ".join(
             self._keys_taken_elsewhere()) or "none"
+        # WHICH settings folder, never which path. Where a copy keeps its
+        # board decides which board it opened, and "beside the program" or
+        # "in AppData" is the whole of what support needs to know. The path
+        # itself carries the user's name and their folder layout, which the
+        # feedback promise says is never sent.
+        info["settings_folder"] = board_module.data_kind()
         info["recent_errors"] = "; ".join(errorlog.recent()) or "none"
         return info
 
@@ -4818,6 +4834,16 @@ class DropDeckFrame(wx.Frame):
             self._touch()
             self._rebuild_station_menu()
         if not self._cleared_to_go():
+            # **The destination is NOT put back, and that is deliberate.**
+            # Mark's audit called it a fault that Ctrl+B then Stay off air
+            # leaves a radio board pointed at video, and it was tried: it
+            # breaks `tests/test_3_8_2.py`, which asserts the opposite on
+            # purpose. 3.8.2 gave each destination its own key precisely so
+            # that pressing one IS choosing where the show goes, and that
+            # choice has to outlive the question or the On air menu and
+            # Ctrl+Shift+B would disagree with the key just pressed. A
+            # mis-press is undone by pressing the other key, which is the
+            # same gesture. Changing this is Tony's call, not an audit's.
             return False
         return self.start_stream()
 
@@ -5963,7 +5989,18 @@ class DropDeckFrame(wx.Frame):
         """
         if not picturefeed.wanted_for(settings):
             return None
-        return self.feed().acquire(picturefeed.FOR_STREAM)
+        handle = self.feed().acquire(picturefeed.FOR_STREAM)
+        # A feed that could not build a source at all hands back frames of
+        # None for ever, and a destination with no video track is one
+        # YouTube refuses outright: the connection succeeds, the app says
+        # ON AIR, and the channel stays empty. Said out loud, because it is
+        # the difference between a broadcast and a silence nobody can see.
+        feed = self.feed()
+        if getattr(feed, "_source", True) is None:
+            self.announce(getattr(feed, "reason", "")
+                          or "The picture could not be started, so there "
+                             "would be nothing on the screen")
+        return handle
 
     def preview_picture(self, timeout=None):
         """One frame of what WOULD go out, whether or not we are live.
@@ -6486,10 +6523,14 @@ class DropDeckFrame(wx.Frame):
         if not self:
             return
         if state == streamout.ON_AIR:
-            self.announce("On air, %s" % detail if detail else "On air")
+            # ONE announcement, not two. `announce` interrupts by default,
+            # so the second of these cut off the first and "On air, 2500k
+            # video, 128k audio to a.rtmps.youtube.com" was never heard by
+            # anybody. The same lesson is already written down twenty lines
+            # from here and was not applied on this path.
+            said = "On air, %s" % detail if detail else "On air"
             warning = self._going_live_warning()
-            if warning:
-                self.announce(warning)
+            self.announce("%s. %s" % (said, warning) if warning else said)
         elif state == streamout.CONNECTING:
             self.announce_help("Connecting to the server")
         elif state == streamout.RECONNECTING:
@@ -6974,6 +7015,23 @@ class DropDeckFrame(wx.Frame):
                 streamout.FORMATS.get(self.board.stream_format,
                                       streamout.FORMATS["mp3"])["label"]))
             parts.append("to %s" % self.board.stream_host)
+        # **Whether anything has actually left the machine.** Ctrl+Shift+B
+        # reported a duration, a bitrate and a host, all of which a stream
+        # sending absolutely nothing reports just as happily, so the one
+        # question Joshua had ("it says it is going live and nothing shows")
+        # was the one this key could not answer. A connection is open and
+        # the encoder is running long before any of that means a viewer is
+        # seeing something.
+        # **Not in the first two seconds.** `bytes_sent` starts at zero and
+        # the state is ON_AIR before the first packet is muxed, so pressing
+        # the key straight after Ctrl+B reported nothing going out on a
+        # perfectly healthy stream. And the cause is not "play something":
+        # the bus carries silence blocks when nothing is playing, so a zero
+        # here means the mixer or the bus delivered nothing at all.
+        if streamer.on_air_for > 2 and not getattr(streamer, "bytes_sent", 0):
+            parts.append("but nothing has left this machine yet. Give it a "
+                         "moment, and if it does not change, check your "
+                         "sound card in Preferences, Audio")
         dropped = self.air_bus.dropped if self.air_bus is not None else 0
         if dropped:
             parts.append("%d blocks lost, so listeners have heard gaps"
@@ -7050,6 +7108,10 @@ class DropDeckFrame(wx.Frame):
             self.board.stop_fade = dialog.stop_fade.GetValue()
             self.board.playlist.crossfade = dialog.crossfade
             stream = dialog.stream_settings
+            #: What the station was called BEFORE this, because the stream
+            #: key is filed under that name and is about to be filed under
+            #: the new one. Read before anything is assigned.
+            was_called = self.board.stream_name or ""
             self.board.stream_server = stream["server"]
             self.board.stream_host = stream["host"]
             self.board.stream_port = stream["port"]
@@ -7059,6 +7121,12 @@ class DropDeckFrame(wx.Frame):
             self.board.stream_format = stream["format"]
             self.board.stream_bitrate = stream["bitrate"]
             self.board.stream_name = stream["name"]
+            # Typed, read back by the dialog's own property, and then thrown
+            # away: nothing in the app ever assigned it, so Where listeners
+            # connect could not be set at all. `tests/test_3_1.py` asserted
+            # only that the control gave back what was typed into it, which
+            # is the box answering about itself.
+            self.board.stream_stats_url = stream["stats_url"]
             self.board.stream_public = stream["public"]
             video = dialog.video_settings
             self.board.video_server = video["server"]
@@ -7073,14 +7141,7 @@ class DropDeckFrame(wx.Frame):
             # stream_password. That is the Icecast source password, and
             # borrowing it meant that merely looking at the video page and
             # pressing OK wiped a user's radio station password.
-            key = video.get("key", "")
-            if not key:
-                self.board.video_key = ""
-                secrets.forget(stream["name"] or "")
-            elif secrets.store(stream["name"] or "", key):
-                self.board.video_key = ""
-            else:
-                self.board.video_key = key
+            self._apply_stream_key(video, was_called, stream["name"] or "")
             picture_settings = dialog.picture_settings
             self.board.picture = picture_settings["picture"]
             self.board.picture_file = picture_settings["picture_file"]
@@ -7225,6 +7286,71 @@ class DropDeckFrame(wx.Frame):
         text.SetFocus()
         dialog.ShowModal()
         dialog.Destroy()
+
+    def _apply_stream_key(self, video, was_called, now_called):
+        """Where the stream key goes when Preferences is closed with OK.
+
+        Three separate ways to lose a key have gone through here, so the
+        rules are written out rather than implied.
+
+        **An untouched box changes nothing at all.** The box is filled from
+        `_loaded_key`, which answers with a key in the board file as well as
+        one in the credential store, and a board file is a thing people send
+        each other. Without this rule, merely opening Preferences and
+        pressing OK promoted a stranger's stream key out of their board and
+        into this user's Windows Credential Manager, where the next Ctrl+B
+        would have broadcast to the board author's channel.
+
+        **An emptied box means forget it**, which is the only way to remove
+        a key, and is why "leave it alone" cannot simply be "empty means
+        no change" the way the vision key does it.
+
+        **A renamed station takes its key with it**, because the key is
+        filed by station name. But only when the old name is no longer a
+        station: renaming through the Station name box while the old name is
+        still on the shelf used to delete a saved station's key, measured
+        with two stations and one rename.
+        """
+        key = video.get("key", "")
+        changed = video.get("key_changed", True)
+        renamed = bool(was_called) and was_called != now_called
+
+        if not key:
+            self.board.video_key = ""
+            secrets.forget(now_called)
+        elif changed:
+            if secrets.store(now_called, key):
+                self.board.video_key = ""
+            else:
+                self.board.video_key = key
+                # The old comment here said the dialog had already told the
+                # user this. It had not: that sentence lives in
+                # `dialogs._keep_key`, which only the Save station button
+                # reaches, so the ordinary path put a broadcast credential
+                # into a file people send each other and said nothing.
+                self.announce(
+                    "Windows would not store your stream key safely, so it "
+                    "is in your board file. Do not send that file to "
+                    "anybody.")
+        elif renamed and not self.board.video_key:
+            # Untouched, but the name it is filed under has moved. A key
+            # already on the board travels with the board and needs nothing;
+            # one in the credential store has to be filed again, because the
+            # store is keyed by the name.
+            secrets.store(now_called, key)
+
+        if renamed and not self._is_saved_station(was_called):
+            secrets.forget(was_called)
+
+    def _is_saved_station(self, name):
+        """Is that name still one of the saved setups on the shelf."""
+        if not name:
+            return False
+        try:
+            return any(entry.get("stream_name") == name
+                       for entry in self.board.stream_stations)
+        except Exception:
+            return False
 
     def _on_about(self, _event):
         from wx.adv import AboutBox, AboutDialogInfo

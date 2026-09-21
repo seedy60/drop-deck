@@ -8,8 +8,6 @@ from __future__ import annotations
 
 import ctypes
 import os
-import socket
-import ssl
 import threading
 import time
 import urllib.parse
@@ -29,6 +27,7 @@ from . import colours
 from . import cuesheet
 from . import overlay
 from . import preflight
+from . import rtmpcheck
 from . import proccapture
 from . import screen
 from . import secrets
@@ -1564,11 +1563,26 @@ class SettingsDialog(wx.Dialog):
         return C.STREAM_SERVER_ORDER[max(0, self.stream_server.GetSelection())]
 
     def _loaded_key(self):
-        """The saved stream key for the current station, if there is one."""
+        """The saved stream key for the current station, if there is one.
+
+        **`board.video_key` is part of the answer and leaving it out deleted
+        keys.** It is the documented fallback for a machine whose credential
+        store refused the write, and this read only the credential store,
+        while `ui._stream_settings` reads `secrets.fetch(...) or
+        board.video_key`. So on such a machine the box came up empty over a
+        key that was really there, and the OK handler, seeing an empty box,
+        did as it was told and forgot it. Opening Preferences to change
+        anything at all, and pressing OK, destroyed the stream key.
+
+        Both places read the same two things in the same order now, so the
+        box always shows the key that is actually in force, and an empty box
+        means what it says.
+        """
         try:
-            return secrets.fetch(self.board.stream_name or "")
+            return (secrets.fetch(self.board.stream_name or "")
+                    or getattr(self.board, "video_key", "") or "")
         except Exception:
-            return ""
+            return getattr(self.board, "video_key", "") or ""
 
     # ------------------------------------------------------ the video side --
     def _current_platform(self):
@@ -1599,10 +1613,18 @@ class SettingsDialog(wx.Dialog):
         warning = getattr(self, "live_warning", None)
         if warning is not None:
             if C.RTMP_GOES_LIVE_AT_ONCE.get(kind):
+                # Careful, and honest about the part the app cannot see.
+                # Auto start is a YouTube setting nothing here can read, and
+                # a flat promise either way is wrong for half the users:
+                # with it on there is no preview at all, and with it off the
+                # stream sits waiting and the channel shows nothing, which
+                # is the report that started all this.
                 warning.SetLabel(
-                    "Careful: pressing Ctrl+B puts you live on YouTube "
-                    "straight away. There is no preview. Your subscribers "
-                    "are notified and the stream is saved to your channel.")
+                    "Careful: with auto start on, pressing Ctrl+B puts you "
+                    "live on YouTube straight away, with no preview, your "
+                    "subscribers notified and the stream saved to your "
+                    "channel. With auto start off, YouTube waits for you to "
+                    "press Go live in your live control room.")
             elif kind == "facebook":
                 warning.SetLabel(
                     "Facebook shows you a preview first. Nothing is posted "
@@ -1735,7 +1757,11 @@ class SettingsDialog(wx.Dialog):
             return
         self._fill_stream_fields()
         # The key does not live in the station, so it is fetched by name.
-        self.video_key.SetValue(secrets.fetch(name))
+        # `_loaded_key` rather than `secrets.fetch` alone, for the reason
+        # written there: a key the credential store refused lives on the
+        # board, and a box that does not show it is a box that deletes it.
+        self._key_at_open = "".join(self._loaded_key().split())
+        self.video_key.SetValue(self._key_at_open)
         self.video_server.SetSelection(
             C.VIDEO_SERVER_ORDER.index(self.board.video_server)
             if self.board.video_server in C.VIDEO_SERVER_ORDER else 0)
@@ -1854,30 +1880,24 @@ class SettingsDialog(wx.Dialog):
         self._test_rtmp(self.video_settings)
 
     def _test_rtmp(self, settings):
-        """Check a YouTube or Facebook station WITHOUT going live.
+        """Check a YouTube or Facebook stream key, WITHOUT broadcasting.
 
-        **This deliberately does not complete an RTMP handshake**, and that is
-        the whole point of it being separate from the Icecast test above.
+        This used to check the address and say plainly that it "cannot tell
+        you whether the key itself is right", which left the one fact a
+        presenter needs before a show as the one fact the button could not
+        give. Joshua, 20 September 2026: Ctrl+B said it was going live to
+        YouTube and nothing appeared on his channel, and there was nothing he
+        could press to find out why.
 
-        An Icecast source connection is inert: you connect, the server waits
-        for audio, you hang up, and nothing has happened. RTMP to YouTube or
-        Facebook is not inert. A publish is what STARTS a broadcast, and a
-        presenter who cannot see their channel has no way to notice that a
-        connection test put them on the air, however briefly. Getting that
-        wrong once, on somebody's real channel, is worse than every problem
-        this button was meant to catch.
+        It asks the platform now. `rtmpcheck.verify` completes the RTMP
+        publish handshake and stops at the answer, sending no sound, no
+        picture and not one byte of FLV, which is what makes it safe: a
+        platform starts a broadcast when it begins RECEIVING a stream, and
+        nothing is ever sent. See the long note at the top of rtmpcheck.py.
 
-        So it checks everything that can be checked from outside:
-
-            the address is one we recognise and is shaped like a URL
-            the name really resolves
-            the port really accepts a connection
-            TLS really completes, which is most of what goes wrong on 443
-            a key is present and looks like a key
-
-        What it cannot tell you is whether the KEY is right. Nothing can,
-        short of going live, so it says so plainly rather than implying a
-        pass it has not earned.
+        **The address checks stay and run first.** They are instant and they
+        catch the mistakes that need no network at all, and going out to a
+        platform to be told an address is misspelt is a slow way to hear it.
         """
         host = settings["host"].strip()
         key = settings.get("key", "").strip()
@@ -1894,51 +1914,170 @@ class SettingsDialog(wx.Dialog):
             self.video_key.SetFocus()
             return
 
-        port = parsed.port or (443 if parsed.scheme == "rtmps" else 1935)
-        self._say_video("Checking...")
-        wx.BeginBusyCursor()
-        try:
-            try:
-                socket.getaddrinfo(parsed.hostname, port,
-                                   proto=socket.IPPROTO_TCP)
-            except OSError:
-                self._say_video(
-                    "Could not find %s. Check the address, and that you are "
-                    "online." % parsed.hostname)
-                return
-            try:
-                sock = socket.create_connection((parsed.hostname, port),
-                                                C.STREAM_TIMEOUT)
-            except OSError as exc:
-                self._say_video(
-                    "Could not reach %s on port %d: %s. Something may be "
-                    "blocking it."
-                    % (parsed.hostname, port, exc.strerror or exc))
-                return
-            try:
-                if parsed.scheme == "rtmps":
-                    context = ssl.create_default_context()
-                    with context.wrap_socket(
-                            sock, server_hostname=parsed.hostname) as secure:
-                        secure.version()
-            except Exception as exc:
-                self._say_video(
-                    "Reached %s but the secure connection failed: %s"
-                    % (parsed.hostname, exc))
-                return
-            finally:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-        finally:
-            wx.EndBusyCursor()
+        if getattr(self, "_checking", False):
+            self._say_video("Still checking your stream key. The answer will "
+                            "be read out.")
+            return
 
-        self._say_video(
-            "%s is reachable and your stream key is %s. The key itself cannot "
-            "be checked without going live, so this does not prove it is "
-            "right. Nothing was broadcast."
-            % (parsed.hostname, secrets.redact(key)))
+        platform = settings.get("server", "")
+        label = streamout.server_label(platform) or parsed.hostname
+        if not self._agree_to_check(platform, label):
+            self._say_video("Nothing was checked and nothing was sent.")
+            return
+
+        # On a thread. The measured answer is under a second, and the
+        # timeout is ten, and ten seconds of a frozen window with only a
+        # busy cursor for company is the same fault the update download
+        # already had.
+        #
+        # **The button is NOT disabled while it runs**, and that is the
+        # whole of this guard. Disabling a focused button does not strand
+        # focus, it hands it to the next control, silently: measured with a
+        # real Space press, focus moved to "Look through the camera now",
+        # stayed there for the flight, and became the dialog's default
+        # button, so Space then Enter opened the camera. A flag and a
+        # spoken line refuse a second press without touching focus at all.
+        self._say_video("Checking your stream key with %s. Nothing is being "
+                        "broadcast." % label)
+        self._checking = True
+
+        def work():
+            answer = rtmpcheck.verify(host, key)
+            wx.CallAfter(self._video_checked, answer, platform, label,
+                         parsed.hostname, key)
+
+        threading.Thread(target=work, daemon=True,
+                         name="dropdeck-keycheck").start()
+
+    def _agree_to_check(self, platform, label):
+        """Ask first, where connecting at all is the thing people fear.
+
+        Only for a platform that puts you live the moment it receives a
+        stream, which is `C.RTMP_GOES_LIVE_AT_ONCE` and, until now, a fact
+        the app held and never read. Somebody who has been told in capital
+        letters that Ctrl+B puts them straight on the air is right to want
+        to know what a button next to their stream key is about to do.
+        """
+        # **Asked unless it is KNOWN to be safe, not only when it is known
+        # to be dangerous.** `False` means somebody established that this
+        # platform posts nothing, which is true of Facebook. `None` means
+        # nobody knows, which is the honest answer for a custom server, and
+        # the app's own help already tells such a user to "ask them whether
+        # connecting puts you on the air". Proceeding silently there would
+        # have been the app making a promise it has no way to keep.
+        known_safe = C.RTMP_GOES_LIVE_AT_ONCE.get(platform)
+        if known_safe is False:
+            return True
+        # Short. A message box cannot be read back at your own pace, which
+        # is why every long explanation in this app is in a read only box
+        # instead; the whole version is in Help, Setting up streaming.
+        if known_safe:
+            question = ("Checking connects to %s for about a second and "
+                        "sends no sound and no picture, so it cannot put you "
+                        "on the air, tell your subscribers, or leave "
+                        "anything on your channel.\n\nCheck the key now?"
+                        % label)
+        else:
+            question = ("%s is not a service Drop Deck knows, so it cannot "
+                        "promise what connecting does. Nothing is sent but "
+                        "the key itself: no sound and no picture."
+                        "\n\nCheck the key now?" % label)
+        answer = wx.MessageBox(question, "Check my stream key",
+                               wx.YES_NO | wx.ICON_QUESTION, self)
+        return answer == wx.YES
+
+    def _video_checked(self, answer, platform, label, hostname, key):
+        """Say what the platform said. Back on the UI thread.
+
+        **The window may be gone.** A check takes up to ten seconds and the
+        dialog is closeable throughout, so this lands on a dead C++ object
+        about as often as anybody is impatient. `if not self` is the wx idiom
+        for it and costs nothing.
+        """
+        if not self:
+            self._checking = False
+            return
+        self._checking = False
+        try:
+            self._say_video(self._key_verdict(answer, platform, label,
+                                              hostname, key))
+        except RuntimeError:
+            pass
+
+    def _key_verdict(self, answer, platform, label, hostname, key):
+        """One outcome, as a sentence. Separated so a test can read them all.
+
+        Every one of these is spoken. No URLs, no error numbers, no jargon,
+        and the platform's OWN words repeated verbatim when it gave any:
+        "Publish Rejected: Invalid URL" is YouTube's way of saying a key is
+        wrong, and paraphrasing it would take away the one phrase somebody
+        could search for.
+        """
+        goes_live = C.RTMP_GOES_LIVE_AT_ONCE.get(platform)
+        if answer.outcome == rtmpcheck.ACCEPTED:
+            # "Broadcast" and "posted" are different promises and the two
+            # platforms make different ones. Facebook's whole reassurance is
+            # that nothing is POSTED, which is the word its own help uses.
+            said = "%s accepted your stream key, and nothing was %s." % (
+                label, "posted" if platform == "facebook" else "broadcast")
+            if goes_live:
+                # "its own page" was "press Go live", which is also the name
+                # of the button in Drop Deck's own Ctrl+B window, so the one
+                # instruction that matters was ambiguous at the one moment
+                # it matters. Name the place.
+                return said + (" If you go live and nothing appears on your "
+                               "channel, the usual reason is that auto start "
+                               "is switched off for that stream, so %s is "
+                               "waiting for you to press Go live in your live "
+                               "control room." % label)
+            if goes_live is False and platform == "facebook":
+                return said + (" Remember that Facebook only posts the video "
+                               "when you press Go Live Now on its own page.")
+            return said
+        if answer.outcome == rtmpcheck.REFUSED:
+            # **A refusal has to say nothing was broadcast too.** It is the
+            # answer most likely to worry somebody: they pressed a button
+            # next to their stream key and were told the platform said no,
+            # and the one thing they cannot check for themselves is whether
+            # anything went out while that happened.
+            if answer.server_said:
+                return ("%s would not take that stream key, and nothing was "
+                        "broadcast. It said: %s. Check the key is pasted in "
+                        "full, that you took it from the page Get my stream "
+                        "key opens, and that it has not expired."
+                        % (label, answer.server_said))
+            return ("%s would not take that stream key, and nothing was "
+                    "broadcast. It closed the connection without saying why, "
+                    "which is what it does when a key is wrong or has "
+                    "expired. Check the key is pasted in full and comes from "
+                    "the page Get my stream key opens. Yours is %s."
+                    % (label, secrets.redact(key)))
+        # **The platform's NAME, never its address, and never the Windows
+        # error.** A screen reader reads "a.rtmps.youtube.com" as a run of
+        # letter clusters, and `answer.detail` is `str(exc)`, which carries
+        # a WinError number. Neither is something the person hearing it can
+        # act on. The address is on the page above, in a box they can read
+        # at their own pace, if they want it.
+        if answer.outcome == rtmpcheck.NO_SERVER:
+            return ("Could not find %s. Check that you are online, and that "
+                    "the address on this page is the one they gave you."
+                    % label)
+        if answer.outcome == rtmpcheck.NO_ROUTE:
+            return ("Could not reach %s. Something on your network may be "
+                    "blocking it. On a work or school network, that is the "
+                    "usual reason." % label)
+        if answer.outcome == rtmpcheck.NO_TLS:
+            return ("Reached %s but the secure connection failed. Something "
+                    "on your network may be blocking it." % label)
+        if answer.outcome == rtmpcheck.NO_KEY:
+            return ("There is no stream key. Get my stream key opens the "
+                    "page where yours is.")
+        if answer.outcome == rtmpcheck.BAD_ADDRESS:
+            return ("That does not look like a server address. It should "
+                    "start with rtmp or rtmps.")
+        return ("%s took the connection but did not answer. Nothing was "
+                "broadcast. Try again, and if it keeps happening something "
+                "on your network may be blocking it." % label)
 
     def _say_test(self, text):
         self.stream_result.SetValue(text)
@@ -2056,14 +2195,21 @@ class SettingsDialog(wx.Dialog):
             "the Audio streaming page. Leave it empty and Drop Deck just "
             "says the platform.")
 
+        #: What was in the box when this window opened, so the OK handler
+        #: can tell an untouched box from an edited one. See the
+        #: `key_changed` note in `video_settings`.
+        self._key_at_open = "".join(self._loaded_key().split())
         self.video_key = field(
             "Stream &key",
-            lambda: wx.TextCtrl(panel, value=self._loaded_key(),
+            lambda: wx.TextCtrl(panel, value=self._key_at_open,
                                 style=wx.TE_PASSWORD),
             "Stream key",
             "The key from YouTube or Facebook. It is kept in Windows "
             "Credential Manager rather than in your board file, because "
             "anybody who has it can broadcast to your channel.")
+        #: Whether a stream key check is in flight. Read by `_test_rtmp` as
+        #: the re-entry guard, because the button stays enabled and focused.
+        self._checking = False
 
         #: One remembered address per platform, for this window's lifetime.
         self._hosts = {}
@@ -2182,12 +2328,17 @@ class SettingsDialog(wx.Dialog):
         self.video_key_page.Bind(wx.EVT_BUTTON, self._on_open_key_page)
         row.Add(self.video_key_page, 0, wx.RIGHT, 8)
 
-        video_test = wx.Button(panel, label="T&est the connection")
-        video_test.SetToolTip(
-            "Checks the address is reachable without going live. It cannot "
-            "check the key itself, and nothing is broadcast.")
-        video_test.Bind(wx.EVT_BUTTON, self._on_test_video)
-        row.Add(video_test, 0, wx.RIGHT, 8)
+        # Kept as an attribute so it can be switched off while a check is
+        # running, and kept on the same mnemonic so nobody has to relearn
+        # the button. The LABEL changed because what it does changed: it
+        # used to be unable to check the key and now that is its whole job.
+        self.video_test = wx.Button(panel, label="Check my stream k&ey")
+        self.video_test.SetToolTip(
+            "Asks the platform whether your stream key is right. It sends no "
+            "sound and no picture, so nothing is broadcast and nothing is "
+            "posted.")
+        self.video_test.Bind(wx.EVT_BUTTON, self._on_test_video)
+        row.Add(self.video_test, 0, wx.RIGHT, 8)
 
         look = wx.Button(panel, label="&Look through the camera now")
         look.SetToolTip(
@@ -2201,9 +2352,17 @@ class SettingsDialog(wx.Dialog):
         sizer.Add(row, 0, wx.ALL, 10)
 
         self._label(panel, sizer, "What happened")
+        # The reassurance goes HERE, not only in the button's tooltip. wx
+        # does not put a tooltip into the accessible description and a
+        # screen reader reads tooltips on hover, so a keyboard user never
+        # meets it: measured on the real button, description None, help
+        # None. This box is read out with its label the moment somebody
+        # tabs to it.
         self.picture_result = wx.TextCtrl(
             panel, style=wx.TE_READONLY | wx.TE_MULTILINE, size=(-1, 60),
-            value="Nothing tried yet.")
+            value="Nothing tried yet. Check my stream key asks the platform "
+                  "whether your key is right. It sends no sound and no "
+                  "picture.")
         self.picture_result.SetName("What happened")
         sizer.Add(self.picture_result, 0,
                   wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
@@ -2380,6 +2539,16 @@ class SettingsDialog(wx.Dialog):
             # trailing newline or a space, and that is one of the commonest
             # reasons a key that LOOKS right is refused.
             "key": "".join(self.video_key.GetValue().split()),
+            # **Whether the user TOUCHED it.** The box is filled from
+            # `_loaded_key`, which now also answers with a key sitting in
+            # the board file, and a board file is a thing people send each
+            # other. Without this, merely opening Preferences and pressing
+            # OK promoted somebody else's stream key into this user's
+            # Windows Credential Manager, where the next Ctrl+B would
+            # broadcast to the board author's channel. An untouched box
+            # means leave everything exactly as it is.
+            "key_changed": ("".join(self.video_key.GetValue().split())
+                            != self._key_at_open),
             "live": bool(self.live_to_video.GetValue()),
         }
 
@@ -2393,7 +2562,17 @@ class SettingsDialog(wx.Dialog):
             "picture": kind,
             "picture_file": self.picture_file.GetValue().strip(),
             "picture_clock": bool(self.picture_clock.GetValue()),
-            "camera": chosen if chosen in self._cameras else "",
+            # **An unknown camera is only "no camera" once we KNOW.**
+            # Cameras are enumerated on a background thread, so for the
+            # first moment of this dialog's life `_cameras` is empty, and
+            # Ctrl+Shift+P then Enter is comfortably faster than Windows
+            # answering. This line then read "the chosen camera is not in
+            # the list" and cleared the user's camera for good. The same
+            # went for a camera merely unplugged, or held by Teams, while
+            # Preferences happened to be open. A list we have not got is
+            # not evidence about anything.
+            "camera": (chosen if chosen in self._cameras
+                       else ("" if self._cameras else self.board.camera)),
             "screen": (self._screens[self.screen_choice.GetSelection()][0]
                        if 0 <= self.screen_choice.GetSelection()
                        < len(self._screens) else C.SCREEN_ALL),
@@ -4669,8 +4848,12 @@ class GoLiveDialog(wx.Dialog):
         # reader the static text preceding a control in CREATION order.
         outer.Add(wx.StaticText(self, label="&What will go out"), 0,
                   wx.LEFT | wx.RIGHT | wx.TOP, 10)
-        summary = "\r\n".join("%s: %s" % (label, value)
-                              for label, value in report.lines)
+        lines = ["%s: %s" % (label, value) for label, value in report.lines]
+        if report.blocked:
+            lines.insert(0, "Not going out: %s"
+                         % (report.stops[0].text[0].lower()
+                            + report.stops[0].text[1:]))
+        summary = "\r\n".join(lines)
         self.what = wx.TextCtrl(self, style=wx.TE_READONLY | wx.TE_MULTILINE,
                                 size=(560, 96), value=summary)
         self.what.SetName("What will go out")
@@ -4720,6 +4903,7 @@ class GoLiveDialog(wx.Dialog):
 
         self.SetSizerAndFit(outer)
         self.SetEscapeId(wx.ID_CANCEL)
+        self.Bind(wx.EVT_CHAR_HOOK, self._on_char_hook)
         if report.blocked:
             self.go.Enable(False)
             self.go.SetToolTip("Something below has to be put right first.")
@@ -4730,8 +4914,39 @@ class GoLiveDialog(wx.Dialog):
         # window exists to say, and a screen reader reads a read only edit box
         # when focus arrives on it. Landing on Go live would announce the
         # button and leave the answer unread.
+        #
+        # **The stop goes into THIS box, at the top, rather than focus
+        # moving to the other one.** Getting this wrong is how a user can be
+        # told the show is going to YouTube and then find nothing there:
+        # focus landed here whatever had gone wrong, so the window read
+        # "Going to: YouTube Live; Sound: 128 kbps AAC; Picture: a card;
+        # Microphone: on the air", Go live was greyed out for a reason in a
+        # box nothing ever read, and Ctrl+B then Enter, which is the gesture
+        # the manual teaches, answered "Staying off air" with no explanation
+        # anywhere. Joshua, 20 September 2026, reported exactly that shape.
+        #
+        # Landing on the other box was tried and is worse: a screen reader
+        # reads the line at the caret of an edit control, not the whole
+        # value, so it would have read one warning and left the summary
+        # unread. One window, one place it always reads from, and the
+        # reason first.
         self.what.SetFocus()
         self.what.SetInsertionPoint(0)
+
+    #: Enter presses the default button, which a multiline read only box
+    #: otherwise eats: wxMSW gives it ES_WANTRETURN, so Ctrl+B then Enter
+    #: did nothing at all, on a gesture the docstring above and the
+    #: published manual both teach. The same four lines are already in
+    #: `updatedialog.py`, for the same reason, on the same kind of box.
+    def _on_char_hook(self, event):
+        # `self.go`, never FindWindowById: that one resolves to the GLOBAL
+        # lookup and will happily hand back a different dialog's OK button.
+        # CLAUDE.md has the story; it already cost a false test failure once.
+        if event.GetKeyCode() in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            if self.go.IsEnabled():
+                self.EndModal(wx.ID_OK)
+                return
+        event.Skip()
 
     def _on_fix(self, page):
         self.fix = page

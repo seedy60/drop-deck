@@ -840,7 +840,12 @@ with open(boardmod.default_board_path(), "w", encoding="utf-8") as handle:
 real_keep = uimod.DropDeckFrame._keep_unreadable
 uimod.DropDeckFrame._keep_unreadable = staticmethod(lambda path: None)
 locked = uimod.DropDeckFrame(None)
-uimod.DropDeckFrame._keep_unreadable = real_keep
+# Put it back as a STATIC method. Reading it off the class hands back the
+# plain function, so assigning that back made it an instance method, and the
+# next frame to meet an unreadable board raised TypeError inside its own
+# constructor. Nothing hit that path afterwards until 3.8.4 moved the
+# settings folder, which is the only reason it was ever seen.
+uimod.DropDeckFrame._keep_unreadable = staticmethod(real_keep)
 check("a board that could not be read or copied says it is left alone",
       "will not be saved over" in locked._startup_board_note,
       locked._startup_board_note)

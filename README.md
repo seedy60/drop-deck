@@ -152,6 +152,20 @@ like a bed starting or a fader moving.
 Your board lives in `%APPDATA%\TG Studios\TG Drop Deck\board.json` and saves
 itself as you change it and when you quit.
 
+**The portable copy keeps everything beside itself instead**, in a folder
+called `userdata` next to the executable, so the whole program is one folder
+you can move, copy to a stick or delete. The first time a portable copy starts
+it copies whatever was in AppData into that folder and tells you the old one
+can be deleted. Nothing there is removed for you.
+
+An installed copy can do the same: make a folder called `userdata` beside
+`TG Drop Deck.exe` and it is used from the next start. Setting
+`TGDROPDECK_DATA` to a folder overrides both.
+
+Stream keys are in neither folder. Windows Credential Manager keeps those, for
+one user on one machine, so a copy of the folder taken somewhere else asks for
+the stream key again.
+
 ## Tests
 
 Each file is a script, so run them individually or all at once:

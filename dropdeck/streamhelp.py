@@ -37,9 +37,9 @@ AFTER = [
     "take sound on its own, so something has to be on the screen.",
     "Tick Go live here when I press Control B, so Control B sends the show "
     "to this platform rather than to your radio station.",
-    "Press Test the connection. It checks the address is reachable and that "
-    "you have a key. It never broadcasts anything and it cannot tell you "
-    "whether the key itself is right.",
+    "Press Check my stream key. It asks the platform whether your key is "
+    "right and tells you what the platform said. It sends no sound and no "
+    "picture, so nothing is broadcast and nothing is posted.",
     "Press OK, then Control B to go live. Control Shift B tells you what the "
     "stream is doing at any time.",
 ]
@@ -68,9 +68,11 @@ PLATFORMS = {
             "subscribers, and saves the video to your channel afterwards. "
             "There is no preview and nothing to confirm."),
         "testing": (
-            "Set the stream to Private in YouTube Studio before your first "
-            "try. A private stream does not notify anybody, and you can "
-            "delete the recording afterwards."),
+            "Press Check my stream key. It asks YouTube whether your key is "
+            "right and sends no sound and no picture, so it cannot put you "
+            "on the air. For a full rehearsal, set the stream to Private in "
+            "YouTube Studio first: a private stream does not notify anybody "
+            "and you can delete the recording afterwards."),
         "bitrate": (
             "YouTube suggests about 4000 kbps at 720p. Anything from 2500 up "
             "is fine and lower still works, though YouTube may call it low "
@@ -156,8 +158,10 @@ PLATFORMS = {
             "What happens when you connect is up to whoever runs the server. "
             "Ask them whether connecting puts you on the air."),
         "testing": (
-            "Test the connection checks the address is reachable. Whether a "
-            "test broadcast is safe is a question for whoever runs it."),
+            "Press Check my stream key. It asks the server whether your key "
+            "is right and sends no sound and no picture. Whether connecting "
+            "at all is safe is a question for whoever runs the server, so "
+            "Drop Deck asks you first."),
         "bitrate": (
             "Ask whoever runs the server. 2500 kbps at 720p suits most "
             "things."),
@@ -212,10 +216,28 @@ TROUBLE = [
      "Another program almost certainly has it. Close OBS, Teams or Zoom and "
      "try again. If Windows is refusing, turn the camera on for desktop apps "
      "in Windows privacy settings."),
-    ("Nothing appears on the platform",
-     "Check you ticked Go live here when I press Control B on the Video "
-     "streaming page. Without it Control B goes to your radio station "
-     "instead."),
+    ("It says I am on air and nothing appears on my channel",
+     "Press Check my stream key first. If the platform accepts it, the "
+     "stream is arriving and something at their end is holding it back. On "
+     "YouTube the usual reason is that auto start is switched off for that "
+     "stream, so YouTube is waiting for you to press Go live in your live "
+     "control room. After that, check the broadcast is not set to private, "
+     "and that you are looking at the same channel the key came from: one "
+     "Google account can have several, and a key belongs to one of them. "
+     "The first time you ever enable live streaming YouTube can take up to "
+     "twenty four hours. On Facebook nothing is posted at all until you "
+     "press Go Live Now, so a preview and no post is Facebook working "
+     "normally."),
+    ("Control B goes to the wrong place",
+     "Control B goes to your video platform and Alt Shift B goes to your "
+     "radio station. On air, Streaming location shows both, with a dot "
+     "beside the one Control B will use, and the Go live here when I press "
+     "Control B box on the Video streaming page is the same setting."),
+    ("It says I am on air and I am not sure anything is going out",
+     "Press Control Shift B. It says how long you have been on air and, if "
+     "nothing has left the machine yet, it says that too. Nothing going out "
+     "usually means no sound is reaching the stream: check something is "
+     "playing and that your microphone is on the air."),
 ]
 
 

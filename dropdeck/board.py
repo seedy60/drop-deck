@@ -85,6 +85,44 @@ def _video_number(value, fallback, low, high):
     return max(low, min(high, number))
 
 
+def _rtmp_address(value):
+    """An RTMP address out of a board file, or "" so the default is used.
+
+    Everything else on this page is whitelisted and this was free text
+    handed straight to FFmpeg, which writes to a file, an HTTP endpoint or a
+    UDP socket as cheerfully as to an ingest. A board file is plain JSON,
+    people send each other boards, and fb40 is a whole report about people
+    opening ones they were given. One press of Ctrl+B on such a board would
+    have sent a live microphone wherever its author chose, while the
+    pre-flight read the address out as "Custom RTMP server".
+
+    `RtmpDestination.url` refuses it too. This one keeps it out of the
+    settings in the first place, so nothing downstream ever sees it and the
+    address box does not show somebody a path they did not type.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        import urllib.parse
+        scheme = urllib.parse.urlparse(text).scheme.lower()
+    except Exception:
+        return ""
+    if scheme in ("rtmp", "rtmps"):
+        return text
+    # **An address with NO scheme is kept, and that is on purpose.** It is
+    # what somebody typed who left the rtmp off, and erasing it means they
+    # open the app to an empty box with nothing to correct. It cannot reach
+    # the encoder either way: `RtmpDestination.url` is the hard gate and
+    # refuses anything that is not rtmp or rtmps. What must never survive is
+    # a scheme that names another kind of output, or a Windows path, because
+    # those are the shapes that would have worked.
+    if scheme or text.startswith("\\\\") or text[1:3] == ":\\" or \
+            text.startswith("/"):
+        return ""
+    return text
+
+
 def _stations(value):
     """Whatever was in the file, as a list of usable stations.
 
@@ -149,12 +187,346 @@ def _fade(value, fallback):
     return max(0.0, min(C.MAX_BED_FADE, seconds))
 
 
-def config_dir():
-    """Where settings live. Alongside the other TG Studios apps."""
+#: The folder a portable copy keeps its settings in, beside the program.
+#:
+#: HarmonicaPlayer, 20 September 2026, running the zip: "since I am running
+#: the portable copy of TG Drop Deck, why don't it make a folder called
+#: userdata inside of application directory instead of writing the data in a
+#: folder called TG Studios in %appdata% on hard drive?"
+#:
+#: He is right, and it is not only tidiness. A portable copy is a folder you
+#: can move, copy to a stick or keep on a second drive, and a portable copy
+#: that leaves its board behind in AppData is portable in name only: take the
+#: folder somewhere else and the program is empty. His own use is the plain
+#: one - he wants the whole program in one place he can delete.
+PORTABLE_DATA_DIR = "userdata"
+
+#: Set this to a folder and everything goes there instead. It exists so the
+#: portable path can be tested without a frozen build, and it is the escape
+#: hatch for anybody who wants their settings on a different drive.
+DATA_ENV = "TGDROPDECK_DATA"
+
+#: What happened to the settings folder at startup, for the frame to say once
+#: it has a window to say it in. `config_dir` runs before wx exists - it runs
+#: before the error log is installed - so it cannot speak for itself.
+data_note = ""
+
+_resolved = None
+_resolved_why = ""
+_resolved_for = None
+
+#: How each answer reads in a diagnostic, in plain words rather than a path.
+#: A path carries the user's name and the shape of their disk, and the
+#: feedback promise is that neither is ever sent. Which KIND of folder it is
+#: answers every support question the path would have.
+DATA_KINDS = {
+    "beside": "beside the program",
+    "portable": "beside the program",
+    "named": "a folder of your own",
+    "named-refused": "in AppData, because the folder you named refused",
+    "portable-refused": "in AppData, because this folder is read only",
+    "appdata": "in AppData",
+}
+
+
+def data_kind():
+    """Which settings folder this copy is using, in words. Never a path."""
+    config_dir()
+    return DATA_KINDS.get(_resolved_why, "in AppData")
+
+
+def legacy_config_dir():
+    """Where settings lived before there was anywhere else: %APPDATA%.
+
+    Still the answer for an installed copy, which is most people. An installed
+    program's folder is not the user's to write in as a rule, it is replaced
+    wholesale by the installer, and the uninstaller would carry the board away
+    with it.
+    """
     base = os.environ.get("APPDATA") or os.path.expanduser("~")
-    path = os.path.join(base, C.VENDOR, C.APP_NAME)
-    os.makedirs(path, exist_ok=True)
-    return path
+    return os.path.join(base, C.VENDOR, C.APP_NAME)
+
+
+def _is_portable_copy():
+    """Is this the zip, unpacked wherever somebody put it.
+
+    Asked of `appupdate`, which already had to answer it for a different
+    reason and answers it the way that cannot be fooled by a path: Inno Setup
+    leaves an uninstaller beside what it installed and nothing puts one in a
+    zip. Imported here rather than at the top because this module is imported
+    by almost everything and that one is not.
+    """
+    try:
+        from . import appupdate
+        return bool(appupdate.is_portable())
+    except Exception:
+        return False
+
+
+def _usable(path):
+    """Can we really write there. Asked by writing, not by reading rights."""
+    probe = os.path.join(path, ".dropdeck-write-test")
+    try:
+        os.makedirs(path, exist_ok=True)
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write("x")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def _choose_config_dir():
+    """Work out where settings go, once, in order of who asked loudest.
+
+    1. `TGDROPDECK_DATA`, when somebody has named a folder outright.
+    2. A `userdata` folder that is ALREADY beside the program. Making that
+       folder by hand is how an installed copy opts in, and it is the one
+       instruction that fits in a sentence.
+    3. A portable copy makes that folder for itself, because that is what
+       portable is supposed to mean.
+    4. Otherwise %APPDATA%, which is where it has always been.
+
+    Any of the first three that cannot be written to falls through to the
+    next, so a zip unpacked into Program Files, or run from a read only
+    stick, still starts and still keeps its settings. Falling over because
+    a folder is read only is not an option: this runs before the app has a
+    window to apologise in.
+    """
+    named = (os.environ.get(DATA_ENV) or "").strip()
+    if named:
+        if _usable(named):
+            return os.path.abspath(named), "named"
+        # Said out loud later. Silently ignoring a folder somebody asked for
+        # by name is how settings end up in two places.
+        return legacy_config_dir(), "named-refused"
+    beside = os.path.join(app_dir(), PORTABLE_DATA_DIR)
+    if os.path.isdir(beside) and _usable(beside):
+        return os.path.abspath(beside), "beside"
+    if _is_portable_copy():
+        if _usable(beside):
+            return os.path.abspath(beside), "portable"
+        return legacy_config_dir(), "portable-refused"
+    return legacy_config_dir(), "appdata"
+
+
+def _cache_key():
+    """Everything the answer depends on that could conceivably change.
+
+    In a running app, none of it does. In the tests several of them do:
+    `test_3_8_3` moves `APPDATA` mid-run and expects the board to follow it.
+    Keying the cache on the inputs rather than caching outright keeps that
+    true and still costs one probe per distinct answer, which matters
+    because a portable copy proves the folder is writable BY WRITING and
+    `config_dir` is called on every save and every logged fault.
+    """
+    try:
+        here = app_dir()
+    except Exception:
+        here = ""
+    return (os.environ.get("APPDATA"), os.environ.get(DATA_ENV), here)
+
+
+def config_dir():
+    """Where settings live. Beside a portable copy, or in %APPDATA%.
+
+    Worked out once and remembered, because it must not change underneath a
+    running app: the board is autosaved to `default_board_path()` and the
+    last-board note is written beside it, and two different answers in one
+    session would leave them in two different folders.
+    """
+    global _resolved, _resolved_why, _resolved_for, data_note
+    key = _cache_key()
+    if _resolved is None or key != _resolved_for:
+        _resolved_for = key
+        try:
+            path, why = _choose_config_dir()
+        except Exception:
+            # Wrapped as a whole rather than step by step, because the rule
+            # is about the outcome and not about any one step: this runs
+            # before wx exists and before the error log is installed, so
+            # anything raised here is a program that does not start. There
+            # is always an answer, and it is the one it has always been.
+            path, why = legacy_config_dir(), "appdata"
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError:
+            path = legacy_config_dir()
+            os.makedirs(path, exist_ok=True)
+            why = "appdata"
+        _resolved = path
+        _resolved_why = why
+        try:
+            data_note = _settle_in(path, why)
+        except Exception:
+            data_note = ""
+    return _resolved
+
+
+def _forget_config_dir():
+    """Testing only. There is no way to change this from inside the app."""
+    global _resolved, _resolved_why, _resolved_for, data_note
+    _resolved = None
+    _resolved_why = ""
+    _resolved_for = None
+    data_note = ""
+
+
+#: Written into the new folder when settings are brought over, so a second
+#: run does not do it again and support can see it happened and when.
+MOVED_NOTE = "moved-from-appdata.txt"
+
+
+def _settle_in(path, why):
+    """Bring the old settings over the first time, and say what happened.
+
+    Copied, never moved. The old folder is left exactly as it was, so a
+    portable copy that turns out to be a bad idea is undone by deleting one
+    folder, and nobody loses a board to a feature they did not ask for. The
+    user is told they may now delete it, which is the part HarmonicaPlayer
+    actually wanted: "then I can delete the TG studios folder on HD to free
+    space".
+    """
+    if why == "named-refused":
+        # No environment variable name and no path: both are read out
+        # character by character by a screen reader and neither is something
+        # the person hearing it can act on in the moment.
+        return ("The folder you set Drop Deck to keep its settings in could "
+                "not be written to, so they are in the usual place instead")
+    if why == "portable-refused":
+        return ("Drop Deck cannot write to its own folder, so settings are "
+                "in AppData rather than beside the program")
+    if why in ("appdata",):
+        return ""
+    old = legacy_config_dir()
+    if same_path(old, path):
+        return ""
+    if os.path.exists(os.path.join(path, MOVED_NOTE)):
+        return ""
+    if os.path.exists(os.path.join(path, "board.json")):
+        # Already somebody's settings folder. Copying over the top of it is
+        # the one thing that could lose work here.
+        return ""
+    brought = _copy_settings(old, path)
+    if not brought:
+        return ""
+    try:
+        with open(os.path.join(path, MOVED_NOTE), "w",
+                  encoding="utf-8") as handle:
+            handle.write(
+                "TG Drop Deck copied these settings out of\n"
+                "    %s\non %s, and changed nothing there.\n\n"
+                "That folder can now be deleted.\n\n"
+                "Stream keys are in neither folder. Windows Credential "
+                "Manager keeps those, for this user on this machine, so a "
+                "copy of this folder taken to another machine or another "
+                "sign-in will ask for the stream key again.\n\n"
+                "What was brought over:\n%s\n"
+                % (old, time.strftime("%Y-%m-%d %H:%M"),
+                   "\n".join("    " + name for name in sorted(brought))))
+    except OSError:
+        pass
+    # Short on purpose. It is spoken at startup, once ever, at the end of a
+    # line that already has several things in it, and the whole explanation
+    # is in the file above for anybody who wants it. No trailing full stop:
+    # the startup line joins with ". " and two in a row is heard.
+    #
+    # **And it must not say "beside the program" when it is not.** Measured
+    # with TGDROPDECK_DATA pointed elsewhere: the app said the settings were
+    # in the userdata folder beside the program, which was untrue, in the
+    # one sentence that tells somebody it is safe to delete the old folder.
+    where = ("the %s folder beside the program" % PORTABLE_DATA_DIR
+             if why in ("beside", "portable") else "the folder you asked for")
+    # **The permission to delete is conditional on the board arriving.**
+    # `_copy_settings` skips a file it cannot read, which is a real state on
+    # this machine: a board.json held open by Dropbox mid sync, or by a
+    # virus scanner. Saying "can be deleted" over a board that did not come
+    # across is telling somebody to delete their only copy of it.
+    if "board.json" in brought or not os.path.exists(
+            os.path.join(old, "board.json")):
+        return ("Your settings are now in %s, and the old copy in AppData "
+                "can be deleted" % where)
+    return ("Your settings are now in %s, but your board could not be "
+            "copied, so do NOT delete the old folder in AppData yet. Close "
+            "anything that may be holding the file and start Drop Deck "
+            "again" % where)
+
+
+def _copy_settings(old, new):
+    """Copy one settings folder into another. Returns what was brought.
+
+    Never raises and never overwrites. A file that will not copy is skipped
+    rather than stopping the rest: half the settings is better than none, and
+    the original is still there either way.
+    """
+    import shutil
+    brought = []
+    try:
+        entries = sorted(os.listdir(old))
+    except OSError:
+        return brought
+    for entry in entries:
+        source = os.path.join(old, entry)
+        target = os.path.join(new, entry)
+        if os.path.exists(target):
+            continue
+        try:
+            if os.path.isdir(source):
+                shutil.copytree(source, target)
+            else:
+                shutil.copy2(source, target)
+                # copy2 brings the read only bit with it, and a read only
+                # board.json is an app that cannot autosave, silently, for
+                # the rest of its life. The copy is the user's working file
+                # now; the original keeps whatever it had.
+                try:
+                    os.chmod(target, os.stat(target).st_mode | 0o200)
+                except OSError:
+                    pass
+            brought.append(entry)
+        except (OSError, shutil.Error):
+            continue
+    # **Whenever there IS one, not only when this copied it.** A
+    # `last_board.json` already sitting in the new folder is skipped by the
+    # loop above, so it never appears in `brought`, so it was never
+    # repointed, and it went on naming a board in the folder the user has
+    # just been told they may delete.
+    if os.path.exists(os.path.join(new, LAST_BOARD_FILE)):
+        _repoint_last_board(old, new)
+    return brought
+
+
+def _repoint_last_board(old, new):
+    """Follow the remembered board into its new home.
+
+    `last_board.json` holds an ABSOLUTE path, and the one thing it usually
+    points at is `board.json` in the old settings folder. Copied across
+    untouched it would send the app straight back to the folder the user has
+    just been told they can delete - and then deleting it would lose the
+    board after all, which is the exact fault fb40 was about.
+    """
+    try:
+        with open(os.path.join(new, LAST_BOARD_FILE), "r",
+                  encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return
+    path = data.get("path") if isinstance(data, dict) else None
+    if not isinstance(path, str) or not path.strip():
+        return
+    inside = os.path.normcase(os.path.abspath(old)) + os.sep
+    if not os.path.normcase(os.path.abspath(path)).startswith(inside):
+        return
+    moved = os.path.join(new, os.path.relpath(os.path.abspath(path),
+                                              os.path.abspath(old)))
+    if not os.path.exists(moved):
+        return
+    try:
+        with open(os.path.join(new, LAST_BOARD_FILE), "w",
+                  encoding="utf-8") as handle:
+            json.dump({"path": moved}, handle)
+    except OSError:
+        pass
 
 
 def default_board_path():
@@ -723,6 +1095,19 @@ class Board:
                 self.stream_bitrate = _stream_bitrate(self.stream_bitrate)
                 if self.live_to not in C.LIVE_TO:
                     self.live_to = C.LIVE_TO_AUDIO
+                # `Board.load` whitelists these and a station bypassed every
+                # one of them, because this is a plain setattr per field.
+                # So a board file that could not smuggle an address in
+                # through video_host could smuggle it in through a saved
+                # station, and the pre-flight then read a file path out
+                # loud as "Custom RTMP server". Nothing escaped, because
+                # `RtmpDestination.url` refuses it, but the app was
+                # describing somebody's path as a server.
+                self.video_host = _rtmp_address(self.video_host)
+                if self.video_server not in C.VIDEO_SERVER_ORDER:
+                    self.video_server = "youtube"
+                if self.picture not in C.PICTURE_SOURCES:
+                    self.picture = C.PICTURE_CARD
                 return True
         return False
 
@@ -1048,6 +1433,7 @@ class Board:
             board.live_to = C.LIVE_TO_VIDEO
             board.stream_server = "icecast"
             board.stream_host = ""
+        board.video_host = _rtmp_address(board.video_host)
         if not board.video_host:
             board.video_host = C.RTMP_INGEST.get(board.video_server, "")
         picture = data.get("picture")

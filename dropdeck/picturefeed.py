@@ -133,7 +133,36 @@ class PictureFeed:
             # a moment ago, which is how a picture chosen in between would
             # have been silently ignored. Cheap: a dict comparison.
             if fresh or self._stale():
-                self._open()
+                # **A picture that will not build must not take the
+                # broadcast with it, and must not leave it silent either.**
+                # `_open` was called bare: anything `picture.build` raised
+                # came out of here with the holder count already put up, so
+                # `_source` stayed None, `_stale()` would not rebuild it,
+                # every frame came back None and the stream went out with no
+                # video track at all. YouTube refuses an audio only ingest,
+                # which is one of the ways a presenter can be told they are
+                # live and find nothing on their channel. The health watcher
+                # cannot see it either: it is only consulted once there IS a
+                # picture.
+                try:
+                    self._open()
+                except Exception as exc:
+                    self._source = None
+                    # A sentence, never the exception. `picture.build`
+                    # raises constructor and import errors, so that tail
+                    # would be a DLL name, a file path or an error number,
+                    # spoken at the moment somebody goes live. Every other
+                    # failure path in this app turns an exception into
+                    # words; the exception itself goes where faults go.
+                    self.reason = ("The picture could not be started, so "
+                                   "there would be nothing on the screen. "
+                                   "Choose a different picture on the Video "
+                                   "streaming page, or set it to a card.")
+                    try:
+                        from . import errorlog
+                        errorlog.record_current()
+                    except Exception:
+                        pass
             source = self._source
         if ready_timeout and source is not None:
             waiter = getattr(source, "wait_ready", None)

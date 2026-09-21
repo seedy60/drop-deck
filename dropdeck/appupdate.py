@@ -64,6 +64,11 @@ MAX_BYTES = 512 * 1024 * 1024
 #: stops a runaway read.
 DOWNLOAD_SLACK = 1024 * 1024
 
+#: The folder a portable copy keeps its board and settings in, beside the
+#: program. Named here as well as in board.py because this module is copied
+#: between apps and must not import one app's board.
+USER_DATA_DIR = "userdata"
+
 STAMP_FILE = "last_app_check.json"
 DEFAULT_INTERVAL_HOURS = 24
 
@@ -286,8 +291,36 @@ def unpack_beside(zip_path, version):
         inner = os.path.join(target, entries[0])
         if os.path.isdir(inner) and os.path.exists(
                 os.path.join(inner, "%s.exe" % C.APP_NAME)):
-            return inner
+            target = inner
+    carry_user_data(here, target)
     return target
+
+
+
+def carry_user_data(old_folder, new_folder):
+    """Bring a portable copy's settings into the folder replacing it.
+
+    HarmonicaPlayer, 20 September 2026: "when next build comes out can you
+    have it copy all userdata from the TG studios folder to specified
+    userdata pre-made folder in application data when it updates".
+
+    An in-place update keeps the folder and therefore keeps the settings
+    without help. `unpack_beside` does not: it makes a NEW folder, and a new
+    folder with no `userdata` in it is a program that has forgotten
+    everything. Copied rather than moved, so the folder left behind is still
+    a working copy, and nothing already in the new one is overwritten.
+
+    Returns True when there was something to bring and it arrived.
+    """
+    source = os.path.join(old_folder, USER_DATA_DIR)
+    target = os.path.join(new_folder, USER_DATA_DIR)
+    if not os.path.isdir(source) or os.path.isdir(target):
+        return False
+    try:
+        shutil.copytree(source, target)
+        return True
+    except (OSError, shutil.Error):
+        return False
 
 
 def is_frozen():
@@ -569,6 +602,16 @@ def finish_update(target, pid, source=None):
 
     try:
         for entry in os.listdir(source):
+            if entry.lower() == USER_DATA_DIR:
+                # The settings folder of a PORTABLE copy lives in here, and
+                # the copy being replaced is the one that owns it. A staging
+                # folder should never have one - it is unpacked from the zip
+                # and never run - but if anything ever puts one there,
+                # copying it over the top would replace somebody's board
+                # with an empty one. It is the only folder in here that is
+                # the user's rather than the program's, so it is the one
+                # folder this must not touch.
+                continue
             src = os.path.join(source, entry)
             dst = os.path.join(target, entry)
             if os.path.isdir(src):

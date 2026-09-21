@@ -55,6 +55,33 @@ from .engine import CHANNELS
 # What the audio callback writes into
 # ---------------------------------------------------------------------------
 
+#: Errors that mean the far end SAID NO, on any attempt. Retrying one of
+#: these is a program sitting there looking as though it might still work,
+#: which is worse than being told once that it will not.
+#:
+#: **"the audio stopped arriving" is deliberately not here.** It is the
+#: message for a stream that HAD been carrying sound and stopped, which is a
+#: USB interface hiccuping, a machine waking from sleep or an output device
+#: changing, and every one of those is worth reconnecting through. The zero
+#: bytes case has a sentence of its own, below, and that one is fatal:
+#: nothing ever reached the encoder, so there is nothing for another
+#: connection to carry, and the presenter needs to hear once that the show
+#: is not going out rather than "on air" every eight seconds for ever.
+REFUSED = (
+    "password",
+    "no mount point by that name",
+    "stream key",
+    "there is no stream key",
+    "there is no server address",
+    "not an rtmp one",
+    "no sound ever reached",
+)
+
+#: Errors that are a typo when Ctrl+B is pressed and a network when they turn
+#: up later. See `Streamer._retryable`.
+ONLY_AT_FIRST = ("could not find",)
+
+
 class AirBus:
     """A ring per sound card, summed on the way out.
 
@@ -1046,6 +1073,20 @@ class RtmpDestination(Destination):
             raise SinkError("there is no server address for this station")
         if not key:
             raise SinkError("there is no stream key for this station")
+        # **It must be an RTMP address, and this was never checked.** The
+        # address is free text for a custom server and it is handed
+        # straight to FFmpeg, which will happily write to a file, an HTTP
+        # endpoint or a UDP socket. So a board file, which is plain JSON
+        # and which people send each other, could point one press of Ctrl+B
+        # at anywhere FFmpeg can write, live microphone and all, while the
+        # pre-flight read it out as "Custom RTMP server". Measured: a
+        # folder as the address and a file name as the key connected, wrote
+        # 6632 bytes and would have announced ON AIR.
+        scheme = urllib.parse.urlparse(base).scheme.lower()
+        if scheme not in ("rtmp", "rtmps"):
+            raise SinkError(
+                "that server address is not an RTMP one, so nothing was "
+                "sent. It has to start with rtmp or rtmps")
         return base.rstrip("/") + "/" + key
 
     # -------------------------------------------------------------- opening --
@@ -1429,8 +1470,17 @@ class _ffmpeg_log:
     def __init__(self):
         self.records = []
         self._capture = None
+        #: What the level was before this turned it up. FFmpeg's log level
+        #: is GLOBAL and this never put it back, so one press of Ctrl+B left
+        #: every later decode in the app running at INFO for the life of the
+        #: process. Measured: None before the first broadcast and 32 after.
+        self._was = None
 
     def __enter__(self):
+        try:
+            self._was = av.logging.get_level()
+        except Exception:
+            self._was = None
         try:
             av.logging.set_level(av.logging.INFO)
             self._capture = av.logging.Capture(local=False)
@@ -1446,6 +1496,10 @@ class _ffmpeg_log:
                 self._capture.__exit__(*exc)
             except Exception:
                 pass
+        try:
+            av.logging.set_level(self._was)
+        except Exception:
+            pass
         return False
 
     def text(self):
@@ -1869,7 +1923,17 @@ class Streamer:
             except (SinkError, EncoderError) as exc:
                 self.error = str(exc)
                 self._teardown()
-                if first and not self._retryable():
+                # **Asked on EVERY attempt, not only the first.** The guard
+                # was written for a wrong password and then consulted once,
+                # so a key the platform refused on the way back from a
+                # dropped connection was retried for ever: the state never
+                # reached FAILED, the app never came off air, the menu went
+                # on saying "Come off air", and because a repeat of the same
+                # state and detail is dropped the presenter heard the reason
+                # exactly once and then nothing at all, all night. That is
+                # the very failure the docstring below describes, surviving
+                # on every path but the one it was fixed on.
+                if not self._retryable():
                     self._set_state(FAILED, self.error)
                     return
                 self._set_state(RECONNECTING, self.error)
@@ -1921,14 +1985,19 @@ class Streamer:
         drops a repeat of the same state and detail the presenter heard the
         reason exactly ONCE and then nothing at all, all night.
         """
-        bad = ("password",
-               "no mount point by that name",
-               # RTMP: the far end said no, and saying it again will not help.
-               "stream key",
-               "could not find",
-               "there is no stream key",
-               "there is no server address")
-        return not any(word in self.error.lower() for word in bad)
+        said = self.error.lower()
+        if any(word in said for word in REFUSED):
+            return False
+        # **Only on the first attempt.** A name that will not resolve at
+        # Ctrl+B is a misspelt address, which is worth stopping for. The same
+        # message on the way back from a dropped connection is the network,
+        # and treating it as fatal ended a working show: measured, Wi-Fi away
+        # for ten seconds gave "could not find a.rtmps.youtube.com. Check the
+        # server address", FAILED, off air, and a presenter sent to check an
+        # address that was perfectly correct.
+        if self.attempts <= 1 and any(word in said for word in ONLY_AT_FIRST):
+            return False
+        return True
 
     def _describe(self):
         if self._destination is not None:
@@ -2031,7 +2100,17 @@ class Streamer:
                     return
                 idle += C.STREAM_POLL_SECONDS
                 if idle > C.STREAM_SILENCE_TIMEOUT:
-                    raise SinkError("the audio stopped arriving")
+                    # Two different things wearing one sentence, and the
+                    # difference is the whole of what the presenter needs.
+                    # Never anything at all means the show is not reaching
+                    # the encoder, which is a setup fault. Stopping part way
+                    # through means the sound card went away mid show.
+                    raise SinkError(
+                        "the audio stopped arriving"
+                        if self.bytes_sent else
+                        "no sound ever reached the stream, so nothing was "
+                        "broadcast. Check your sound card is working and "
+                        "that something is playing")
                 continue
             idle = 0.0
             self._beat = time.monotonic()

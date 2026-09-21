@@ -8,7 +8,7 @@ They are muscle memory and they are not up for redesign.
 from . import audiofile as _audiofile
 
 APP_NAME = "TG Drop Deck"
-APP_VERSION = "3.8.3"
+APP_VERSION = "3.8.4"
 VENDOR = "TG Studios"
 TAGLINE = "An accessible soundboard for podcasts, radio and live shows."
 
@@ -1251,8 +1251,15 @@ RTMP_INGEST_BACKUP = {
 #: have made it. With every channel off it goes nowhere at all, which makes it
 #: the one place a full end to end test can be run without touching anybody's
 #: real audience. That is worth saying rather than guessing at.
+#:
+#: **Three values, and None is a real one.** True and False are things
+#: somebody established; None means nobody knows, which is the honest answer
+#: for a server Drop Deck has never heard of. `rtmp` was False, which asserted
+#: a fact about every RTMP server in the world, while the app's own help for
+#: the same platform said "Ask them whether connecting puts you on the air".
+#: `dialogs._agree_to_check` asks unless the answer is a known False.
 RTMP_GOES_LIVE_AT_ONCE = {"youtube": True, "facebook": False,
-                          "restream": None, "rtmp": False}
+                          "restream": None, "rtmp": None}
 
 #: What the picture is, when there is no camera. YouTube refuses an audio only
 #: ingest, so a radio show still has to send something, and a still card costs

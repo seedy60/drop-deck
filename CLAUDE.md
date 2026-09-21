@@ -714,6 +714,87 @@ And specific to this one:
   (`_ambiguous`). A system default that would not open says
   `SYSTEM_DEFAULT`, never None, or it is never mentioned.
 
+- **A stream key can be checked without broadcasting, and the whole of why it
+  is safe is that NOTHING is sent.** `dropdeck/rtmpcheck.py` speaks RTMP by
+  hand as far as the answer to `publish` and stops: no FLV header, no
+  onMetaData, no codec sequence headers, no media. YouTube's API reference
+  defines a stream as `active` when "the user is receiving data via the
+  stream" and refuses to transition a broadcast whose stream is inactive, and
+  auto start is that same transition, so a publish carrying no data starts
+  nothing, notifies nobody and leaves nothing on a channel. **What nobody
+  publishes is whether YouTube counts a header as data**, which is why none
+  are sent. `RtmpDestination.connect` cannot be borrowed for this: FFmpeg does
+  the session and writes the header inside one `start_encoding()` call with no
+  way to stop between them. `tests/test_3_8_4.py` asserts against
+  `tools/mock_rtmp.py` that zero audio, video and data tags arrive.
+  **The two platforms refuse differently and both are a refusal.** Measured 20
+  September 2026 with a made up key: Facebook answers `onStatus` with "Publish
+  Rejected: Invalid URL", YouTube says nothing at all and closes the socket. So
+  `verify` tracks which stage it reached, and a dropped connection counts as a
+  refusal **only after the publish has gone out**. The same drop at the
+  handshake is the network, and calling that a bad key sends somebody hunting
+  for a key that was fine.
+
+- **Every claim the app makes about being on air has to be one it can stand
+  behind.** Joshua, 20 September 2026: Ctrl+B said it was going live to
+  YouTube and nothing appeared on his channel. Six separate faults could
+  produce that sentence and each is now a check in `tests/test_3_8_4.py`.
+  **`GoLiveDialog` focuses the TROUBLE box when the broadcast is blocked**,
+  because focus landed on the summary, so the window read out where the show
+  was going and never read the one sentence saying why it could not, and
+  Ctrl+B then Enter (the gesture the manual teaches) answered "staying off
+  air" with no reason anywhere. **`_retryable` is consulted on every attempt**,
+  not only the first, or a key refused on the way back from a dropped
+  connection is retried all night with the reason spoken exactly once.
+  **A connection that has carried no audio is not a broadcast**: the pump says
+  so in a different sentence when `bytes_sent` is zero, that sentence is not
+  retryable, and `stream_status` says "nothing has left this machine yet",
+  which it could not before because a duration and a bitrate are things a
+  stream sending nothing reports just as happily. **`_say_stream_state` says
+  ONE sentence at ON_AIR**: `announce` interrupts, so the second of two was
+  cutting off the first. And **a picture that will not build is announced**,
+  because a destination with no video track is one YouTube refuses outright,
+  and `picturefeed.acquire` used to let `_open` raise with the holder count
+  already up, so every frame came back None for ever.
+
+- **Disabling a focused button does not strand focus, it MOVES it, silently.**
+  Measured with a real Space press on Check my stream key: disabling it for
+  the length of the check handed focus to the next control in the row, "Look
+  through the camera now", which then became the dialog's default button, so
+  Space and then Enter opened the camera. A flag and a spoken line refuse a
+  second press without touching focus at all. This generalises to every
+  "disable it while it works" in the app.
+
+- **A socket timeout bounds one read, not a conversation.** `rtmpcheck` read
+  until it saw the command it wanted, and every control message on the way
+  was a `continue`, so a server sending a ping every fifty milliseconds kept
+  it reading for ever inside a ten second timeout: measured, still going at
+  thirty seconds, with the button it was started from disabled for the rest
+  of the session because the answer never came back. A monotonic deadline
+  checked before every read is the only thing that bounds it, and a loop
+  counter is not a bound when the other end chooses how cheap an iteration
+  is. The same rule holds for the three byte length field: 16 MB is
+  declarable, so there is a ceiling on what a server may make this hold.
+
+- **The stream key box must show the key that is really in force.**
+  `dialogs._loaded_key` read only the credential store while
+  `ui._stream_settings` reads the store OR `board.video_key`, so on a machine
+  whose credential store refuses a write the box came up empty over a key that
+  was working, and the OK handler, seeing an empty box, forgot it. Opening
+  Preferences to change anything at all deleted the stream key. Both read the
+  same two things in the same order now. **And a rename carries the key**: it
+  is filed under the station's name, and the OK handler reads the old name
+  before it assigns the new one.
+
+- **The address of a custom RTMP server is free text going straight to
+  FFmpeg**, which writes to a file, an HTTP endpoint or a UDP socket as
+  happily as to an ingest. `board._rtmp_address` drops a non RTMP address out
+  of a board file and `RtmpDestination.url` refuses one, because boards are
+  plain JSON that people send each other and one press of Ctrl+B would
+  otherwise have sent a live microphone wherever the board's author chose,
+  while the pre-flight read it out as "Custom RTMP server". Measured: a folder
+  as the address connected, wrote 6632 bytes and would have said ON AIR.
+
 - **A board file is the user's, and the app must never write over one it did
   not write.** fb40, 19 September 2026: "if I rename, move or copy the json
   file, it acts as if it was never set up." Three faults. Every start opened
@@ -1050,7 +1131,32 @@ out of the generator.
 ## Boards
 
 `%APPDATA%\TG Studios\TG Drop Deck\board.json`, or whichever board was open
-last, which `last_board.json` beside it remembers. Saved on change (two second
+last, which `last_board.json` beside it remembers.
+
+**Where that folder is, is one function: `board.config_dir`, worked out once
+per run and remembered.** A PORTABLE copy keeps it in `userdata` beside the
+executable, which is HarmonicaPlayer's request of 20 September 2026 and is
+what portable is supposed to mean: a copy that leaves its board in AppData is
+portable in name only. The order is `TGDROPDECK_DATA`, then a `userdata`
+folder that is already there (which is how an installed copy opts in), then a
+portable copy making one for itself, then AppData. **Any of the first three
+that cannot be written to falls through to the next** and the fall is
+announced, because this runs before wx exists and before the error log is
+installed, so nothing in it may raise and nothing in it may go quiet.
+`appupdate.is_portable` answers the portable question the one way that cannot
+be fooled by a path: Inno Setup leaves an uninstaller beside what it installs
+and nothing puts one in a zip.
+
+**Three things carry a settings folder and each was a way to lose one.**
+Moving to `userdata` rewrites `last_board.json`, which holds an ABSOLUTE path
+and usually points at the board in the folder the user has just been told
+they may delete. `appupdate.unpack_beside` copies `userdata` into the new
+folder, or a portable update is a program that has forgotten everything. And
+`appupdate.finish_update` SKIPS `userdata` when it copies staging over the
+running copy, because that is the only folder in there that is the user's
+rather than the program's. `tests/test_3_8_4.py` asserts all three.
+
+Saved on change (two second
 debounce) and on exit, atomically, and never over a file that changed outside
 the app since it was read.
 

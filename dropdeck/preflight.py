@@ -390,8 +390,20 @@ def going_live_warning(board):
     if board.live_to != C.LIVE_TO_VIDEO:
         return ""
     if C.RTMP_GOES_LIVE_AT_ONCE.get(board.video_server):
-        return ("%s puts you live the moment you connect, and tells your "
-                "subscribers" % streamout.server_label(board.video_server))
+        # **"usually", and then the thing the app cannot see.** This said
+        # "puts you live the moment you connect, and tells your subscribers"
+        # flatly, and that is only true while auto start is on for that
+        # stream, which is a YouTube setting nothing here can read. Said on
+        # the way to air, to somebody who cannot go and look, an
+        # over-confident sentence is the same fault as announcing ON AIR
+        # over a connection carrying nothing: it is the app claiming more
+        # than it knows. And the half it was leaving out is exactly what
+        # Joshua ran into on 20 September 2026.
+        platform = streamout.server_label(board.video_server)
+        return ("%s usually puts you live the moment you connect, and tells "
+                "your subscribers. If auto start is switched off for this "
+                "stream, %s waits for you to press Go live in your live "
+                "control room instead" % (platform, platform))
     if board.video_server == "facebook":
         return ("Facebook will show you a preview and post nothing until you "
                 "press Go Live Now")

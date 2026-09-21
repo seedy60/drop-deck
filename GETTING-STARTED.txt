@@ -125,6 +125,27 @@ Every device is remembered by its name, so plugging in a headset later will
 not silently move your sound somewhere you did not expect.
 
 
+WHERE YOUR SETTINGS ARE KEPT
+
+If you are running this folder as it came out of the zip, Drop Deck keeps
+your board and everything it remembers in a folder called "userdata" right
+here, next to TG Drop Deck.exe. The whole program is one folder: move it,
+copy it to a memory stick, or delete it, and nothing is left behind.
+
+The first time this copy starts it brings over anything you already had in
+AppData and tells you so, and that old folder can then be deleted. Nothing
+there is removed for you.
+
+The installed version keeps its settings in AppData instead, which is
+right for an installed program. If you want it to use a userdata folder
+too, make one called "userdata" beside TG Drop Deck.exe and it will be
+used from the next start.
+
+Your stream key is in neither folder. Windows keeps that, for you on this
+computer, so a copy of this folder taken to another machine will ask for
+the stream key again.
+
+
 ABOUT THE DEMO SOUNDS
 
 The twenty sound effects and twenty music beds that come with the app were

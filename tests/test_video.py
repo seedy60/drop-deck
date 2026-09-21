@@ -736,29 +736,65 @@ try:
     check("and never mentions a port, which RTMP does not use here",
           "8000" not in said and "8003" not in said, said)
 
-    _dialog.video_key.SetValue("abcd-efgh-ijkl-mnop")
-    _dialog._on_test_video(None)
-    said = _dialog.picture_result.GetValue()
-    check("with a key it reaches YouTube for real",
-          "reachable" in said.lower(), said)
-    # A test that completes an RTMP publish is what STARTS a broadcast, and a
-    # presenter who cannot see their channel would never notice. So this is
-    # deliberately reachability only, and it must not overclaim.
-    check("it says plainly that nothing was broadcast",
-          "nothing was broadcast" in said.lower(), said)
-    check("and admits it cannot prove the key is right",
-          "cannot" in said.lower(), said)
-    check("the key is never quoted back in full",
-          "abcd-efgh-ijkl-mnop" not in said, said)
+    # **From 3.8.4 the check is real, and it is asynchronous.** It used to
+    # be reachability only and said so: "it cannot tell you whether the key
+    # itself is right", which was the one thing worth knowing and the one
+    # thing it could not say. Now it completes an RTMP publish handshake and
+    # stops at the answer, sending no sound, no picture and no FLV at all,
+    # which is what makes it safe. See dropdeck/rtmpcheck.py.
+    #
+    # Two consequences for this test, both of which caught it out once:
+    # the answer arrives on another thread, so it has to be waited for; and
+    # a platform that is not KNOWN safe asks first with a message box, which
+    # in a test is a click that never comes. `wx.MessageBox` is stood in
+    # for, which is the rule CLAUDE.md already states for every modal path.
+    _asked = []
+    _real_box = wx.MessageBox
+    wx.MessageBox = lambda *a, **kw: (_asked.append(a[0] if a else ""),
+                                      wx.YES)[1]
 
-    pick_platform("rtmp")
-    _dialog.video_host.SetValue("rtmp://no-such-host-xyz123.invalid/live")
-    _dialog.video_key.SetValue("k")
-    _dialog._on_test_video(None)
-    said = _dialog.picture_result.GetValue()
-    check("a bad address is reported as a bad address",
-          "could not find" in said.lower(), said)
-    check("and never as an errno", "Errno" not in said, said)
+    def _answer_arrives(seconds=20.0):
+        """Let the check finish, pumping the loop so CallAfter can land."""
+        until = time.time() + seconds
+        while getattr(_dialog, "_checking", False) and time.time() < until:
+            wx.Yield()
+            time.sleep(0.05)
+        wx.Yield()
+        return _dialog.picture_result.GetValue()
+
+    try:
+        _dialog.video_key.SetValue("abcd-efgh-ijkl-mnop")
+        _dialog._on_test_video(None)
+        check("YouTube is asked about first, because connecting can go live",
+              _asked and "put you on the air" in _asked[-1],
+              _asked[-1] if _asked else None)
+        said = _answer_arrives()
+        check("with a key it really asks YouTube",
+              "stream key" in said.lower(), said)
+        check("and a made up key comes back refused",
+              "would not take" in said.lower(), said)
+        check("it still says plainly that nothing was broadcast, or posted",
+              "broadcast" in said.lower() or "posted" in said.lower(), said)
+        check("the key is never quoted back in full",
+              "abcd-efgh-ijkl-mnop" not in said, said)
+        check("and no address is read out",
+              "rtmps://" not in said and "a.rtmps.youtube.com" not in said,
+              said)
+
+        pick_platform("rtmp")
+        _dialog.video_host.SetValue("rtmp://no-such-host-xyz123.invalid/live")
+        _dialog.video_key.SetValue("k")
+        _asked.clear()
+        _dialog._on_test_video(None)
+        check("a server Drop Deck does not know is asked about too",
+              _asked and "not a service" in _asked[-1],
+              _asked[-1] if _asked else None)
+        said = _answer_arrives()
+        check("a bad address is reported as a bad address",
+              "could not find" in said.lower(), said)
+        check("and never as an errno", "Errno" not in said, said)
+    finally:
+        wx.MessageBox = _real_box
 finally:
     _dialog.Destroy()
     _frame.Destroy()

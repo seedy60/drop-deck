@@ -1,5 +1,110 @@
 # Changelog
 
+## 3.8.4 for Windows, 20 September 2026
+
+**Your stream key can be checked before a show, going live never claims more
+than it can stand behind, and the portable copy keeps everything beside
+itself.**
+
+### Check my stream key
+
+The button on the Video streaming page used to check that the address was
+reachable and then say, in as many words, that it could not tell you whether
+the key itself was right. That was the one thing worth knowing.
+
+It asks the platform now. Press **Check my stream key** and YouTube or
+Facebook answers, in about a second, and Drop Deck repeats what they said.
+
+**Nothing is broadcast and nothing is posted.** Not one frame of picture, not
+one sample of sound, not even the file header a broadcast starts with. A
+platform begins a broadcast when it starts receiving a stream, and nothing is
+ever sent, so this cannot put you on the air, cannot notify your subscribers
+and leaves nothing on your channel. On YouTube it asks you first anyway,
+because a button beside your stream key is a fair thing to be careful about.
+
+If the key is accepted on YouTube, it also tells you the commonest reason a
+good key still shows nothing: **auto start switched off**, which leaves
+YouTube waiting for you to press Go live in your own live control room.
+
+### Going live, and saying so honestly
+
+A listener reported that Ctrl+B said it was going live to YouTube and nothing
+appeared on his channel. Several separate faults could produce that, and all
+of them are fixed.
+
+- **The reason Ctrl+B will not go is now the first thing you hear.** When
+  something has to be put right, the Go live window landed on the summary,
+  so it read out where the show was going and never read the sentence saying
+  why it could not. Ctrl+B then Enter answered "staying off air" with no
+  explanation anywhere.
+- **Opening Preferences and pressing OK can no longer delete your stream
+  key.** On a computer whose credential store will not take the key, Drop
+  Deck keeps it in the board file, and the box on the Video streaming page
+  was not showing it. An empty box was then read as "there is no key" and it
+  was forgotten. The box shows the key that is really in force now.
+- **Renaming your station takes the stream key with it.** The key is filed
+  under the station's name, and a rename used to leave it behind under the
+  old one, so a setup that had worked for months answered "there is no stream
+  key for this station" the next day.
+- **A key the platform refuses now stops the broadcast, whenever it happens.**
+  It stopped only if the very first attempt was refused. A key refused on the
+  way back from a dropped connection was retried for ever: the app never came
+  off air, the menu still offered to take you off it, and the reason was
+  spoken exactly once and then never again.
+- **A stream that nothing is reaching says so and stops.** It used to
+  announce "on air", fall over eight seconds later, announce "on air" again,
+  and go round like that indefinitely, with no sound ever leaving the
+  machine and the whole "you are live, your subscribers have been told"
+  sentence repeated each time.
+- **Ctrl+Shift+B says when nothing has left the machine.** It reported a
+  duration, a bitrate and a destination, all of which a stream sending
+  absolutely nothing reports just as happily.
+- **A picture that will not start is said out loud.** It could leave the
+  stream with no picture at all, which YouTube refuses outright, and nothing
+  anywhere mentioned it.
+- **Going live says one sentence instead of two.** The second announcement
+  interrupted the first, so "on air, 2500k video, 128k audio" was never
+  heard by anybody.
+- **A board file can no longer point the show at anything but an RTMP
+  server.** The address for a custom server was free text and went straight
+  to the encoder, which will write to a file or a network socket as happily
+  as to a streaming service. Boards get sent between people.
+
+### The portable copy keeps its settings beside itself
+
+Asked for by a listener running the zip: "why don't it make a folder called
+userdata inside of application directory instead of writing the data in a
+folder called TG Studios in %appdata%".
+
+- **The portable copy now keeps everything in a folder called `userdata`
+  next to the program.** The whole thing is one folder you can move, copy to
+  a stick, or delete.
+- **The first time it starts, it copies what was in AppData across** and
+  tells you the old folder can be deleted. Nothing there is removed for you,
+  and the board you had open is followed into its new home.
+- **Updating a portable copy takes the settings with it**, whether it
+  replaces itself where it stands or unpacks beside itself.
+- **An installed copy can do the same**: make a folder called `userdata`
+  beside `TG Drop Deck.exe` and it is used from the next start.
+- A folder that cannot be written to falls back to AppData and says so,
+  rather than failing to start.
+
+**Stream keys are in neither folder.** Windows Credential Manager keeps
+those, for one person on one machine, so a copy of the folder taken
+somewhere else asks for the stream key again.
+
+### Smaller things
+
+- **Where listeners connect** could be typed on the Audio streaming page and
+  was then thrown away. Nothing in the app ever saved it.
+- **Your camera is no longer lost by opening Preferences and pressing OK
+  quickly.** Cameras are found in the background, and a list that had not
+  come back yet was read as "that camera is gone".
+- A stream key that Windows would not store safely is now said out loud,
+  rather than quietly going into the board file.
+- Going live no longer leaves the encoder's logging turned up for the rest
+  of the session.
+
 ## 3.8.3 for Windows, 19 September 2026
 
 **The microphone key can no longer do nothing, your board is never lost, and
