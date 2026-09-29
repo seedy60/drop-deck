@@ -85,6 +85,18 @@ final class MainWindow: NSWindowController, NSWindowDelegate {
 
     private var lastPlaying = Set<Int>()
 
+    /// Every save goes through this, and nothing it does writes over a board
+    /// file somebody changed outside the app. See BoardFile.swift.
+    private(set) var keeper: BoardKeeper!
+    /// What the startup line says about the board, set by the app delegate
+    /// from `BoardFiles.loadStartup` before the line is spoken.
+    var startupBoardNote = ""
+    /// The demo pack opened because there was no board of the user's.
+    var loadedDemo = false
+    /// A look at the board's file is on its way back from another thread.
+    private var boardCheckBusy = false
+    private var activeObserver: NSObjectProtocol?
+
     // ------------------------------------------------------------- building ---
 
     init(board: Board) {
@@ -104,6 +116,18 @@ final class MainWindow: NSWindowController, NSWindowDelegate {
         window.setFrameAutosaveName("DropDeckMain")
         super.init(window: window)
         window.delegate = self
+        keeper = BoardKeeper(board: board)
+        // Coming back to the app after the board's file changed meanwhile
+        // (W383-23). The APP becoming active, not the window becoming key:
+        // closing one of our own dialogs makes the window key again, and on
+        // Windows that is exactly the loop that brought a box back for ever.
+        activeObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil,
+            queue: .main) { [weak self] _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + BoardFiles.checkDelay) {
+                self?.checkBoardFile()
+            }
+        }
 
         buildContent()
         speaker.status = { [weak self] text in self?.statusMessage.stringValue = text }
@@ -389,7 +413,11 @@ final class MainWindow: NSWindowController, NSWindowDelegate {
             guard let self else { return }
             var parts = ["\(C.appName) ready"]
             let assigned = self.board.slots.filter { $0.isAssigned }.count
-            if assigned > 0 { parts.append("\(assigned) sounds loaded") }
+            // The board note, then the board's name and count, in Windows'
+            // order (W383-25). Anything wrong with the board is heard first.
+            parts += BoardFiles.startupParts(
+                note: self.startupBoardNote, loadedDemo: self.loadedDemo,
+                assigned: assigned, boardName: BoardFiles.boardName(self.board.path))
             let missing = self.board.slots.filter { $0.isMissing }.count
             if missing > 0 {
                 parts.append("\(missing) file\(missing == 1 ? "" : "s") missing. Use File, relink missing sounds")
@@ -398,8 +426,11 @@ final class MainWindow: NSWindowController, NSWindowDelegate {
                 parts.append("Audio could not start. \(self.group.lastError ?? "no reason given")")
             }
             let line = parts.joined(separator: ". ")
-            if missing > 0 || !self.group.isRunning { self.speaker.announce(line) }
-            else { self.speaker.announceHelp(line) }
+            if missing > 0 || !self.group.isRunning || !self.startupBoardNote.isEmpty {
+                self.speaker.announce(line)
+            } else {
+                self.speaker.announceHelp(line)
+            }
         }
     }
 
@@ -803,16 +834,69 @@ final class MainWindow: NSWindowController, NSWindowDelegate {
         }
     }
 
+    /// The autosave. Never over a board file changed outside the app: see
+    /// `BoardKeeper.save`.
     func saveQuietly() {
         saveTimer?.invalidate(); saveTimer = nil
         board.bankScheme = KeyMap.scheme
-        do { _ = try board.save() } catch {
-            speaker.note("The board was not saved. \(error.localizedDescription)")
+        speak(keeper.save(), quiet: true)
+    }
+
+    /// The save on the way out, from closing the window and from quitting.
+    /// Both happen on a quit, and the second is harmless (N12).
+    func saveForClose() {
+        saveTimer?.invalidate(); saveTimer = nil
+        board.bankScheme = KeyMap.scheme
+        speak(keeper.saveForClose(), quiet: true)
+    }
+
+    /// Say what a save did, on the channel it deserves. A failed autosave is
+    /// written down rather than spoken over a show, as it always was; a board
+    /// that was not saved over is something nobody could otherwise know.
+    func speak(_ outcome: BoardKeeper.Outcome, quiet: Bool) {
+        guard let line = BoardKeeper.sentence(outcome, quiet: quiet) else { return }
+        switch outcome {
+        case .saved: speaker.announceHelp(line)
+        case .failed: if quiet { speaker.note(line) } else { speaker.announce(line) }
+        case .keptBeside, .leftAlone: speaker.announce(line)
+        }
+    }
+
+    /// Is anything happening that a board loading underneath would cut off.
+    var boardBusy: Bool {
+        board.dirty || streamer.isOn || videoStreamer.isOn || recorder.isRecording
+            || videoRecorder.isRecording || sending || mic.isOpen || player.isPlaying
+            || !group.playingSlots.isEmpty
+    }
+
+    /// Has the board's file changed outside the app, and if so, act once.
+    ///
+    /// The looking is done off the main thread, because a board on a network
+    /// volume that has gone away can take most of a minute to answer and this
+    /// runs every time the app comes back. The path and what is known about
+    /// it are copied out first, so the other thread never touches the board.
+    func checkBoardFile() {
+        guard !boardCheckBusy, let path = board.path else { return }
+        boardCheckBusy = true
+        let knowledge = board.disk
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let changed = Board.changedOnDisk(path: path, knowledge: knowledge)
+            let now = changed ? Board.diskStamp(path) : nil
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.boardCheckBusy = false
+                switch self.keeper.comingBack(path: path, changed: changed, now: now,
+                                              busy: self.boardBusy) {
+                case .nothing: break
+                case .say(let line): self.speaker.announce(line)
+                case .load(let fresh): self.loadInto(path, keepPath: true, board: fresh)
+                }
+            }
         }
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        saveQuietly()
+        saveForClose()
         player.stop(fadeOut: 0.0, quiet: true)
         // Closing the app finishes the file first, so a recording always opens.
         if recorder.isRecording { _ = recorder.stop(taps: group.taps) }

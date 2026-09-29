@@ -65,8 +65,10 @@ extension MainWindow {
         var s = VideoStreamSettings()
         s.server = board.videoServer
         s.host = board.videoHost
-        s.key = Secrets.fetchVideoKey(server: board.videoServer, host: board.videoHost,
-                                      stationName: board.stream.name)
+        // The keychain's key, or the board file's when the keychain would not
+        // keep it: the same two things in the same order as the Preferences
+        // box, so the box always shows the key that is really in force.
+        s.key = board.videoKeyInForce()
         s.width = board.videoWidth
         s.height = board.videoHeight
         s.fps = board.videoFPS

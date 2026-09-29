@@ -210,19 +210,6 @@ DIVERGENCES = [
     # video_width 99999 puts 99999 on the board, and from there into the
     # encoder. The Mac whitelists each field the same way it does on load.
     ("boardvideo",
-     "after|station-junk|video_server|'vimeo'",
-     "after|station-junk|video_server|'facebook'",
-     "board.py load_station setattrs video_server without checking it is one "
-     "of the four. The Mac keeps what was there"),
-    ("boardvideo",
-     "after|station-junk|picture|'hologram'",
-     "after|station-junk|picture|'card'",
-     "the same, for the picture source"),
-    ("boardvideo",
-     "saved|station-junk|picture|'hologram'",
-     "saved|station-junk|picture|'card'",
-     "and the same value written back out"),
-    ("boardvideo",
      "after|station-junk|video_width|99999",
      "after|station-junk|video_width|3840",
      "board.py clamps video_width on LOAD and not when a station is loaded, "
@@ -238,10 +225,6 @@ DIVERGENCES = [
      "and saves it straight back out, so a hand edited station can leave a "
      "board whose overlay settings are a string. The Mac takes four places "
      "or nothing"),
-    ("boardvideo",
-     "saved|station-junk|video_server|'vimeo'",
-     "saved|station-junk|video_server|'facebook'",
-     "the unwhitelisted server, written back out"),
     ("boardvideo",
      "saved|station-junk|video_width|99999",
      "saved|station-junk|video_width|3840",

@@ -282,7 +282,10 @@ extension MainWindow {
     /// video platform. Saying only the station's host would not mention that,
     /// which is why this answers with the pre-flight's summary.
     func loadSavedSetup(_ name: String) {
-        guard !name.isEmpty, name != board.stream.name else { return }
+        // A nameless setup can be picked too: it is on the menu under
+        // "Station 1, no name", and a menu item that does nothing is worse
+        // than none.
+        guard name.isEmpty || name != board.stream.name else { return }
         if streamer.isOn || videoStreamer.isOn {
             speaker.announce("Come off air first, Command B, then change where it goes")
             updateAirMenu()
@@ -293,7 +296,8 @@ extension MainWindow {
             mic.onAir = board.stream.sendMic
             touch()
             let report = preflight()
-            var said = "\(name). Command B goes to \(report.summary())"
+            let label = Board.stationLabel(name, at: board.stationNames.firstIndex(of: name) ?? 0)
+            var said = "\(label). Command B goes to \(report.summary())"
             if wasVideo != (board.liveTo == C.liveToVideo) {
                 said += ", which is a different kind of destination from the last one"
             }

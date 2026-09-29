@@ -76,6 +76,16 @@ CASES = [
                       "colour_accent": "gold"}),
     ("unknown-keys", {"something_from_a_later_build": {"a": 1},
                       "another": [1, 2, 3], "video_server": "restream"}),
+    # 3.8.2: the video channel's own name, which is not the radio station's.
+    ("video-name", {"video_name": "Tony Gebhard", "stream_name": "Blindside Radio"}),
+    # 3.8.4: an address out of a board file must be rtmp or rtmps, or have no
+    # scheme at all so somebody can correct what they typed.
+    ("host-path", {"video_server": "rtmp", "video_host": "/Users/Public"}),
+    ("host-drive", {"video_server": "rtmp", "video_host": "C:/Users/Public"}),
+    ("host-http", {"video_server": "rtmp", "video_host": "http://evil.example/up"}),
+    ("host-colon", {"video_server": "rtmp", "video_host": "localhost:1935/live"}),
+    ("host-noscheme", {"video_server": "rtmp", "video_host": "live.example.com/app"}),
+    ("host-rtmps", {"video_server": "rtmp", "video_host": "  RTMPS://x.example/live  "}),
 ]
 
 #: Saved setups, which are the half that was quietly losing the video keys.
@@ -84,7 +94,8 @@ CASES = [
 #: survive.
 STATIONS = [
     ("station-full", [{
-        "stream_name": "Blindside Radio", "stream_server": "icecast",
+        "stream_name": "Blindside Radio", "video_name": "Tony Gebhard",
+        "stream_server": "icecast",
         "stream_host": "radio.example.com", "stream_port": 8000,
         "stream_mount": "/live", "stream_password": "secret",
         "video_server": "youtube", "video_host": "rtmps://a.rtmps.youtube.com/live2",
@@ -106,6 +117,14 @@ STATIONS = [
                        "text_places": "not a dict"},
                       {"no_name": True},
                       "not a dict at all"]),
+    # 3.8.3: a station with no name, as a board from before saved setups
+    # gets, beside one with a name.
+    ("station-nameless", [{"stream_name": "", "stream_server": "icecast",
+                           "stream_host": "nameless.example.com"},
+                          {"stream_name": "Named", "stream_host": "named.example.com"}]),
+    # 3.8.4: a saved station cannot smuggle an address past the whitelist.
+    ("station-path", [{"stream_name": "Their Setup", "video_server": "rtmp",
+                       "video_host": "C:/Users/Public", "live_to": "video"}]),
 ]
 
 # vision_provider is in here even though its value depends on what keys are in
@@ -113,7 +132,7 @@ STATIONS = [
 # does not fall back to a constant like its fourteen neighbours, it asks
 # best_provider. With no keys stored on either machine both sides answer the
 # fallback, and that is what is compared.
-FIELDS = ("video_server", "video_host", "video_key", "live_to", "picture",
+FIELDS = ("video_server", "video_host", "video_name", "video_key", "live_to", "picture",
           "picture_file", "picture_clock", "camera", "screen", "split_corner",
           "colour_background", "colour_text", "colour_accent",
           "vision_model", "video_width", "video_height", "video_fps",

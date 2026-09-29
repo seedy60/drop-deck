@@ -20,7 +20,9 @@ enum SourceCheck {
         print("\(C.appName) \(C.appVersion), checking the audio sources")
         print("")
 
-        let board = Board.load(Board.defaultBoardPath()) ?? Board()
+        // The board the app would open: the one open last time when it is
+        // there, not board.json whatever board is in use (N7).
+        let board = Board.load(BoardFiles.boardToOpen()) ?? Board()
         let configs = board.sources
         if configs.isEmpty {
             print("This board has no extra sources. Option Shift S adds one.")

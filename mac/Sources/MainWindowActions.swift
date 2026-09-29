@@ -389,16 +389,26 @@ extension MainWindow {
         fresh.bankDevices = board.bankDevices
         fresh.bankScheme = board.bankScheme
         adopt(fresh, path: nil)
+        claimIfUnknown()
         speaker.announceHelp("New board, eighty empty slots")
     }
 
+    /// A new board or the demo takes this board's path without reading it.
+    ///
+    /// Windows claims the path afresh here. On a Mac the board OBJECT stays
+    /// and so does its path, and what it already knows about that file, from
+    /// reading or writing it, is the better answer: claiming afresh would
+    /// take a board somebody copied in a minute ago as ours and save over it,
+    /// which is fb40 again by another door. So it claims only when nothing is
+    /// known yet.
+    func claimIfUnknown() {
+        if board.disk == nil { board.claimPath(board.path) }
+    }
+
+    /// Command S. Through the same guard as every other save.
     func saveBoardNow() {
-        do {
-            let path = try board.save()
-            speaker.announceHelp("Saved to \((path as NSString).lastPathComponent)")
-        } catch {
-            speaker.announce("The board was not saved. \(error.localizedDescription)")
-        }
+        board.bankScheme = KeyMap.scheme
+        speak(keeper.save(), quiet: false)
     }
 
     func saveBoardAs() {
@@ -407,12 +417,10 @@ extension MainWindow {
         panel.nameFieldStringValue = "board.json"
         panel.message = "Save this board to a file of its own."
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            _ = try board.save(to: url.path)
-            speaker.announceHelp("Saved to \(url.lastPathComponent)")
-        } catch {
-            speaker.announce("The board was not saved. \(error.localizedDescription)")
-        }
+        // A place somebody chose. It is the board from now on, and the one
+        // that opens next time.
+        board.bankScheme = KeyMap.scheme
+        speak(keeper.save(to: url.path), quiet: false)
     }
 
     func openBoard() {
@@ -434,6 +442,7 @@ extension MainWindow {
                           confirmTitle: "Load demo pack") else { return }
         }
         loadInto(demo, keepPath: false)
+        claimIfUnknown()
     }
 
     /// An old soundboard bank, from the 1.2 app, or a board somebody exported.
@@ -454,13 +463,18 @@ extension MainWindow {
     /// `keepPath` means the file becomes the live board and is saved to from
     /// here on, which is what File, Open means. The demo and an import are
     /// copied into your own board file instead.
-    private func loadInto(_ path: String, keepPath: Bool) {
-        guard let loaded = Board.load(path) else {
+    ///
+    /// `board` is one already read, from coming back to the window, which
+    /// must never show a box: see `BoardKeeper.comingBack`.
+    func loadInto(_ path: String, keepPath: Bool, board already: Board? = nil) {
+        guard let loaded = already ?? Board.load(path) else {
             speaker.announce("That board could not be read")
             plainAlert("Open failed", "That board could not be opened.")
             return
         }
         adopt(loaded, path: keepPath ? path : nil)
+        // So the next start opens this board, not board.json. fb40.
+        if keepPath { keeper.opened(path) }
         let missing = board.missingSlots.count
         var line = "Loaded \((path as NSString).lastPathComponent), \(board.assignedTotal) sounds"
         if missing > 0 { line += ", \(missing) file\(missing == 1 ? "" : "s") missing" }
@@ -481,7 +495,12 @@ extension MainWindow {
         if hotkeys.enabled { hotkeys.unregisterAll() }
 
         board.replaceContents(with: loaded)
-        if let newPath { board.path = newPath }
+        if let newPath {
+            board.path = newPath
+            // What the loaded board knew about its file comes with it, or the
+            // next save would have nothing to compare against.
+            board.takeDiskKnowledge(from: loaded)
+        }
 
         KeyMap.scheme = board.bankScheme
         speaker.level = board.speechLevel

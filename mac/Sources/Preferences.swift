@@ -258,7 +258,9 @@ extension MainWindow {
                 stationPopup.addItem(withTitle: "No stations saved yet")
                 stationPopup.item(at: 0)?.isEnabled = false
             } else {
-                for name in names { stationPopup.addItem(withTitle: name) }
+                for (offset, name) in names.enumerated() {
+                    stationPopup.addItem(withTitle: Board.stationLabel(name, at: offset))
+                }
                 if let at = names.firstIndex(of: board.stream.name) { stationPopup.selectItem(at: at) }
             }
         }
@@ -266,8 +268,11 @@ extension MainWindow {
         let stationControls = StationControls()
         let videoControls = VideoControls()
         stationControls.onPick = { [weak self, board] in
-            guard let self, let name = stationPopup.titleOfSelectedItem,
-                  board.loadStation(name) else { return }
+            let names = board.stationNames
+            let at = stationPopup.indexOfSelectedItem
+            guard let self, at >= 0, at < names.count else { return }
+            let name = names[at]
+            guard board.loadStation(name) else { return }
             serverPopup.selectItem(at: C.streamServers.firstIndex(of: board.stream.server) ?? 0)
             hostField.stringValue = board.stream.host
             portField.stringValue = "\(board.stream.port)"
@@ -283,7 +288,7 @@ extension MainWindow {
             publicBox.state = board.stream.isPublic ? .on : .off
             micAirBox.state = board.stream.sendMic ? .on : .off
             titlesBox.state = board.stream.sendTitles ? .on : .off
-            self.speaker.announce("Loaded \(name).")
+            self.speaker.announce("Loaded \(Board.stationLabel(name, at: at)).")
         }
         stationControls.onSave = { [weak self, board] in
             guard let self else { return }
@@ -314,13 +319,16 @@ extension MainWindow {
             self.speaker.announce("Saved \(name).")
         }
         stationControls.onForget = { [weak self, board] in
-            guard let self, let name = stationPopup.titleOfSelectedItem else { return }
+            let names = board.stationNames
+            let at = stationPopup.indexOfSelectedItem
+            guard let self, at >= 0, at < names.count else { return }
+            let name = names[at]
             guard board.forgetStation(name) else {
                 self.speaker.announce("There is nothing saved by that name.")
                 return
             }
             fillStations()
-            self.speaker.announce("Forgot \(name).")
+            self.speaker.announce("Forgot \(Board.stationLabel(name, at: at)).")
         }
         stationControls.onTest = { [weak self] in
             guard let self else { return }
@@ -402,9 +410,15 @@ extension MainWindow {
         // The key is NOT in the board file. Anybody holding a YouTube key can
         // broadcast to that channel, and a board is plain JSON that people
         // send each other.
-        let keyField = NSSecureTextField(string: Secrets.fetchVideoKey(
-            server: board.videoServer, host: board.videoHost,
-            stationName: board.stream.name))
+        //
+        // **The box shows the key that is really in force**, the keychain's
+        // OR the board file's, in the same order the streamer reads them
+        // (W384-20). And what was in it when the window opened is kept, so OK
+        // can tell an untouched box from an edited one: a keychain that could
+        // not be read at open, locked or asking after a re-signing, gave an
+        // empty box, and OK then deleted a working key.
+        var keyAtOpen = VideoPrefs.cleanKey(board.videoKeyInForce())
+        let keyField = NSSecureTextField(string: keyAtOpen)
         keyField.setAccessibilityLabel("Stream key")
         videoBox.addArrangedSubview(field("Stream key", keyField))
         videoBox.addArrangedSubview(note(
@@ -434,8 +448,12 @@ extension MainWindow {
 
         let cameraPopup = NSPopUpButton()
         let cameras = Cameras.all()
-        cameraPopup.addItems(withTitles: cameras.isEmpty ? ["No camera found"] : cameras)
-        if let at = cameras.firstIndex(of: board.camera) { cameraPopup.selectItem(at: at) }
+        // A saved camera that is not plugged in today is offered as itself,
+        // "(not connected)", and chosen, so OK keeps it rather than quietly
+        // swapping in whichever camera happens to be first (W384-30).
+        let cameraChoice = VideoPrefs.cameraChoices(cameras: cameras, saved: board.camera)
+        cameraPopup.addItems(withTitles: cameraChoice.titles)
+        cameraPopup.selectItem(at: cameraChoice.selected)
         cameraPopup.setAccessibilityLabel("Camera")
         videoBox.addArrangedSubview(field("Camera", cameraPopup))
 
@@ -622,9 +640,12 @@ extension MainWindow {
             }
             // Each platform keeps its own key, so moving between them brings
             // the right one back rather than showing the last one typed.
-            keyField.stringValue = Secrets.fetchVideoKey(
-                server: which, host: videoHostField.stringValue,
-                stationName: board.stream.name)
+            keyAtOpen = VideoPrefs.cleanKey(Board.keyInForce(
+                keychain: Secrets.fetchVideoKey(
+                    server: which, host: videoHostField.stringValue,
+                    stationName: board.stream.name),
+                board: board.videoKey))
+            keyField.stringValue = keyAtOpen
             whatText.string = GoingLive.note(which)
             whatText.setSelectedRange(NSRange(location: 0, length: 0))
             self?.speaker.announceState("\(StreamServers.serverLabel(which)). "
@@ -744,10 +765,8 @@ extension MainWindow {
             ? (C.rtmpIngest[board.videoServer] ?? typedHost)
             : (typedHost.isEmpty ? (C.rtmpIngest[board.videoServer] ?? "") : typedHost)
         board.picture = C.pictureSources[max(0, showPopup.indexOfSelectedItem)]
-        if !cameras.isEmpty {
-            board.camera = cameras[max(0, min(cameras.count - 1,
-                                              cameraPopup.indexOfSelectedItem))]
-        }
+        board.camera = VideoPrefs.cameraAfterOK(cameras: cameras, saved: board.camera,
+                                                selected: cameraPopup.indexOfSelectedItem)
         board.pictureFile = pictureField.stringValue.trimmingCharacters(in: .whitespaces)
         let size = sizes[max(0, min(sizes.count - 1, sizePopup.indexOfSelectedItem))]
         board.videoWidth = size.0
@@ -763,9 +782,27 @@ extension MainWindow {
         // keychain and nothing could find it, so it had to be fetched from the
         // platform again every single time.
         let station = Secrets.videoStation(server: board.videoServer, host: board.videoHost)
-        let typedKey = keyField.stringValue.trimmingCharacters(in: .whitespaces)
-        if typedKey != Secrets.fetch(station: station) {
-            Secrets.store(station: station, key: typedKey)
+        // Every space and newline out, not only the ends: a key pasted from a
+        // web page often carries one, and it is one of the commonest reasons
+        // a key that LOOKS right is refused (M11, Windows' rule).
+        let typedKey = VideoPrefs.cleanKey(keyField.stringValue)
+        var keyWarning = ""
+        switch VideoPrefs.videoKeyAction(typed: typedKey, atOpen: keyAtOpen) {
+        case .leave:
+            break
+        case .forget:
+            board.videoKey = ""
+            Secrets.forget(station: station)
+        case .store:
+            if Secrets.store(station: station, key: typedKey) {
+                board.videoKey = ""
+            } else {
+                // W384-23. The keychain would not keep it, so it goes where it
+                // always used to, and that is SAID: a broadcast credential in
+                // a file people send each other is not something to do quietly.
+                board.videoKey = typedKey
+                keyWarning = VideoPrefs.keyNotKept
+            }
         }
         board.visionProvider = ShotCheck.providers[
             max(0, min(ShotCheck.providers.count - 1, providerPopup.indexOfSelectedItem))]
@@ -896,6 +933,7 @@ extension MainWindow {
             line += ". Banks 2 and 3 now fire on \(KeyMap.bank2Spoken) and \(KeyMap.bank3Spoken)"
         }
         line += ". " + micSummary()
+        if !keyWarning.isEmpty { line += ". " + keyWarning }
         speaker.announce(line)
     }
 
@@ -1236,5 +1274,70 @@ final class SettingsCategories: NSObject, NSTableViewDataSource, NSTableViewDele
 
     func tableViewSelectionDidChange(_ notification: Notification) {
         show(list.selectedRow)
+    }
+}
+
+// ------------------------------------------------ the video page's rules ---
+
+/// The Video streaming page's decisions, as plain functions so each can be
+/// asserted without a window.
+enum VideoPrefs {
+
+    enum KeyAction: Equatable { case leave, store, forget }
+
+    /// What OK does with the stream key box.
+    ///
+    /// **An untouched box changes nothing at all** (W384-20, W384-21). The box
+    /// is filled from the keychain OR the board file, and a board file is a
+    /// thing people send each other: merely opening Preferences and pressing
+    /// OK must not promote somebody else's key into this user's keychain, and
+    /// a box that came up empty because the keychain could not be read must
+    /// not delete a key that works. **An emptied box means forget it**, which
+    /// is the only way to remove a key.
+    ///
+    /// One deliberate difference from Windows, which forgets on an empty box
+    /// even when it was empty at open: on a Mac that is exactly the locked
+    /// keychain case, and forgetting there deletes the key the read missed.
+    static func videoKeyAction(typed: String, atOpen: String) -> KeyAction {
+        if typed == atOpen { return .leave }
+        return typed.isEmpty ? .forget : .store
+    }
+
+    /// A stream key with every space and newline taken out, which is Windows'
+    /// `"".join(key.split())`.
+    static func cleanKey(_ key: String) -> String {
+        String(key.unicodeScalars.filter {
+            !CharacterSet.whitespacesAndNewlines.contains($0) }.map(Character.init))
+    }
+
+    /// Windows' sentence, with the operating system's name changed.
+    static let keyNotKept = "macOS would not store your stream key safely, so it is in "
+        + "your board file. Do not send that file to anybody."
+
+    /// What the camera list offers and which is chosen.
+    ///
+    /// A saved camera that is not in the list today is offered FIRST as
+    /// "<name> (not connected)" and chosen, so OK keeps it. It used to sit on
+    /// item 0, which is somebody's other camera, and OK then replaced the
+    /// user's camera with it for good.
+    static func cameraChoices(cameras: [String], saved: String)
+        -> (titles: [String], selected: Int) {
+        if !saved.isEmpty && !cameras.contains(saved) {
+            return (["\(saved) (not connected)"] + cameras, 0)
+        }
+        if cameras.isEmpty { return (["No camera found"], 0) }
+        return (cameras, cameras.firstIndex(of: saved) ?? 0)
+    }
+
+    /// The camera OK leaves on the board, from the item chosen.
+    static func cameraAfterOK(cameras: [String], saved: String, selected: Int) -> String {
+        let placeholder = !saved.isEmpty && !cameras.contains(saved)
+        if placeholder {
+            if selected <= 0 { return saved }
+            let at = selected - 1
+            return at < cameras.count ? cameras[at] : saved
+        }
+        if cameras.isEmpty { return saved }
+        return cameras[max(0, min(cameras.count - 1, selected))]
     }
 }

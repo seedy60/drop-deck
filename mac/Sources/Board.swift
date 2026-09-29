@@ -13,13 +13,31 @@
 //      mac_key_code and mac_modifiers sit beside them.
 
 import Foundation
+import CryptoKit
 
 let boardFormatVersion = 3
 
 final class Board {
 
-    var path: String?
+    /// Where this board lives on disk.
+    ///
+    /// **Pointing a board at a different file forgets what it knew about the
+    /// old one**, which is Windows' `Board.path` setter exactly. The demo
+    /// loaded over a board used to carry the demo's fingerprint against
+    /// somebody's own board.json, and a fingerprint compared against the wrong
+    /// file answers the wrong question with complete confidence.
+    var path: String? {
+        didSet {
+            if !Board.samePath(path, oldValue) { disk = nil }
+        }
+    }
     var dirty = false
+
+    /// What the file at `path` looked like when this board last read or
+    /// wrote it, or what was there when the path was claimed without reading
+    /// it. See `changedOnDisk`. Nil means nothing is known, and nothing known
+    /// is never counted as a change.
+    private(set) var disk: DiskKnowledge?
 
     var slots: [Slot] = []
     var bankNames: [Int: String] = [:]
@@ -97,6 +115,13 @@ final class Board {
 
     var videoServer = "youtube"
     var videoHost = C.rtmpIngest["youtube"] ?? ""
+    /// What the VIDEO platform's channel is called, which is not the radio
+    /// station's name and must never be printed as though it were. Windows
+    /// 3.8.2's `video_name`: "Blindside Radio, on YouTube Live" was the go
+    /// live summary putting an Icecast station's name on a YouTube channel.
+    /// Empty is the ordinary state and means "just say the platform", because
+    /// a name nobody typed is not a name.
+    var videoName = ""
     /// Kept only so a board written by an older build round trips. The key
     /// itself belongs in the keychain: see Secrets.swift.
     var videoKey = ""
@@ -251,7 +276,29 @@ final class Board {
 
     // ----------------------------------------------------------- where it is ---
 
+    /// Set only by the self test, for the length of a check, so nothing it
+    /// does can reach the real board in Application Support.
+    static var configDirOverride: String?
+
+    /// The Windows `TGDROPDECK_DATA`, with the same name and the same job:
+    /// everything goes to the folder it names instead. It exists so a check
+    /// run from the command line can be pointed at a scratch folder, and it
+    /// is an escape hatch for anybody who wants their settings elsewhere.
+    static let dataEnvironment = "TGDROPDECK_DATA"
+
     static func configDir() -> String {
+        if let override = configDirOverride { return override }
+        let named = (ProcessInfo.processInfo.environment[dataEnvironment] ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !named.isEmpty {
+            let folder = ((named as NSString).expandingTildeInPath as NSString).standardizingPath
+            try? FileManager.default.createDirectory(atPath: folder,
+                                                     withIntermediateDirectories: true)
+            // A folder that cannot be written to falls through to the usual
+            // place, as it does on Windows, rather than a board that can
+            // never be saved.
+            if FileManager.default.isWritableFile(atPath: folder) { return folder }
+        }
         let base = FileManager.default.urls(for: .applicationSupportDirectory,
                                             in: .userDomainMask).first!
         return base.appendingPathComponent("TG Studios/TG Drop Deck").path
@@ -327,6 +374,7 @@ final class Board {
         d["ask_before_live"] = askBeforeLive
         d["video_server"] = videoServer
         d["video_host"] = videoHost
+        d["video_name"] = videoName
         d["video_key"] = videoKey
         d["live_to"] = liveTo
         d["picture"] = picture
@@ -373,20 +421,33 @@ final class Board {
     @discardableResult
     func save(to target: String? = nil) throws -> String {
         let dest = target ?? path ?? Board.defaultBoardPath()
-        try FileManager.default.createDirectory(
+        let files = FileManager.default
+        try files.createDirectory(
             atPath: (dest as NSString).deletingLastPathComponent,
             withIntermediateDirectories: true)
+        // **A board marked read only is refused at once.** On a Mac the swap
+        // below renames over a read only file quite happily, because what it
+        // needs is the folder's permission, not the file's, so a board
+        // somebody had deliberately locked was written over. Windows refuses
+        // it too, and does not wait a second retrying a setting.
+        if files.fileExists(atPath: dest) && !files.isWritableFile(atPath: dest) {
+            throw BoardSaveError.readOnly
+        }
         let data = try JSONSerialization.data(withJSONObject: toDict(),
                                               options: [.prettyPrinted, .sortedKeys])
         // Write beside the target then swap, so a crash mid save cannot leave a
         // half written board where the real one used to be. Dropbox holds a
         // newly created file open long enough to break the swap, so it retries.
         let temp = dest + ".tmp"
+        // Never leave the half of a save that did not land lying beside
+        // somebody's board (N6). After a swap that worked there is nothing
+        // there to remove, which is fine.
+        defer { try? files.removeItem(atPath: temp) }
         try data.write(to: URL(fileURLWithPath: temp))
         var lastError: Error?
         for attempt in 0..<5 {
             do {
-                _ = try FileManager.default.replaceItemAt(
+                _ = try files.replaceItemAt(
                     URL(fileURLWithPath: dest), withItemAt: URL(fileURLWithPath: temp))
                 lastError = nil
                 break
@@ -397,25 +458,203 @@ final class Board {
         }
         if let lastError {
             // Last resort: write straight over it. Worse than the swap and far
-            // better than not saving the show.
+            // better than not saving the show, but never over a file somebody
+            // else has changed since this board read it: that guard is the
+            // whole of fb40 and a last resort does not get to skip it.
+            if target == nil && changedOnDisk() { throw lastError }
             try data.write(to: URL(fileURLWithPath: dest))
-            _ = lastError
-            try? FileManager.default.removeItem(atPath: temp)
         }
         path = dest
         dirty = false
+        disk = Board.diskStamp(dest).map { .stamp($0) }
         return dest
+    }
+
+    // ------------------------------------------------- whose file it is ---
+    //
+    // Windows 3.8.3, fb40: "if I rename, move or copy the json file, it acts
+    // as if it was never set up." A board copied into place while the app was
+    // open was saved over by the very act of closing the app to pick it up.
+    // So a board remembers what its file looked like, and nothing saves over
+    // a file that has changed since.
+
+    /// Two paths naming the same file. APFS is usually case insensitive and
+    /// /tmp is /private/tmp, so text alone is not the answer: a file that
+    /// exists is compared by identity.
+    static func samePath(_ a: String?, _ b: String?) -> Bool {
+        guard let a, let b, !a.isEmpty, !b.isEmpty else { return false }
+        let left = URL(fileURLWithPath: (a as NSString).expandingTildeInPath)
+            .standardizedFileURL.resolvingSymlinksInPath()
+        let right = URL(fileURLWithPath: (b as NSString).expandingTildeInPath)
+            .standardizedFileURL.resolvingSymlinksInPath()
+        if left.path == right.path { return true }
+        guard let one = try? left.resourceValues(forKeys: [.fileResourceIdentifierKey])
+                .fileResourceIdentifier,
+              let two = try? right.resourceValues(forKeys: [.fileResourceIdentifierKey])
+                .fileResourceIdentifier else { return false }
+        return one.isEqual(two)
+    }
+
+    /// The bytes of a file and what they looked like, from ONE open.
+    ///
+    /// Size and time come from the open handle, after the read, so they
+    /// describe exactly the bytes that were read: a separate stat could see a
+    /// write that landed in between, and that write would then never be
+    /// noticed and would be saved over. Windows' `_stamp_of`, for the same
+    /// reason.
+    static func readStamped(_ path: String) throws -> (Data, DiskStamp) {
+        let fd = open(path, O_RDONLY)
+        if fd < 0 {
+            let code = errno
+            throw (code == EACCES || code == EPERM) ? BoardReadFailure.noPermission
+                                                     : BoardReadFailure.missing
+        }
+        defer { close(fd) }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+        let data: Data
+        do { data = try handle.readToEnd() ?? Data() } catch {
+            throw BoardReadFailure.noPermission
+        }
+        var info = stat()
+        guard fstat(fd, &info) == 0 else { throw BoardReadFailure.missing }
+        return (data, DiskStamp(size: Int64(info.st_size),
+                                modified: Board.nanoseconds(info.st_mtimespec),
+                                hash: Board.sha1(data)))
+    }
+
+    static func nanoseconds(_ t: timespec) -> Int64 {
+        Int64(t.tv_sec) * 1_000_000_000 + Int64(t.tv_nsec)
+    }
+
+    static func sha1(_ data: Data) -> String {
+        Insecure.SHA1.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Size, time and hash of a file, or nil if it cannot be read.
+    static func diskStamp(_ path: String) -> DiskStamp? {
+        (try? readStamped(path))?.1
+    }
+
+    /// Point this board at a file it did NOT load, writing down what is there.
+    ///
+    /// The demo at first run, a new board, the demo loaded over a board: each
+    /// takes a path without reading it, and knowing nothing about a file is
+    /// not the same as owning it. Mark found the first run case on Windows:
+    /// with nothing remembered, a board copied into the settings folder while
+    /// the demo was open was written over on close. So NOTHING THERE means a
+    /// file appearing later is somebody else's, and `unreadable` is a file
+    /// that could not be read or even copied aside, which is never written
+    /// over at all.
+    func claimPath(_ newPath: String?, unreadable: Bool = false) {
+        path = newPath
+        guard let newPath, !newPath.isEmpty else { return }
+        if unreadable {
+            disk = .unreadable
+        } else if FileManager.default.fileExists(atPath: newPath) {
+            disk = Board.diskStamp(newPath).map { .stamp($0) } ?? .unreadable
+        } else {
+            disk = .nothingThere
+        }
+    }
+
+    /// Take over what another board knew about ITS file, for a board whose
+    /// contents and path have just been replaced by that one's.
+    func takeDiskKnowledge(from other: Board) {
+        disk = other.disk
+    }
+
+    /// Has something other than this app changed the board's file?
+    ///
+    /// A file that is not there is not a change: saving puts it back, which
+    /// is what always happened.
+    func changedOnDisk() -> Bool {
+        Board.changedOnDisk(path: path, knowledge: disk)
+    }
+
+    /// The same question with its inputs handed over, so it can be asked off
+    /// the main thread without touching a board the main thread owns.
+    static func changedOnDisk(path: String?, knowledge: DiskKnowledge?) -> Bool {
+        guard let path, !path.isEmpty, let knowledge else { return false }
+        switch knowledge {
+        case .nothingThere, .unreadable:
+            // Nothing was there and something is now, or what was there was
+            // never ours to write over in the first place.
+            return FileManager.default.fileExists(atPath: path)
+        case .stamp(let was):
+            var info = stat()
+            guard stat(path, &info) == 0 else { return false }
+            // Size and time are the quick question. The hash is the real one,
+            // asked only when those two differ, so something that touched the
+            // file without changing it does not count as somebody's edit.
+            if Int64(info.st_size) == was.size
+                && Board.nanoseconds(info.st_mtimespec) == was.modified { return false }
+            guard let now = diskStamp(path) else { return false }
+            return now.hash != was.hash
+        }
+    }
+
+    /// What the board's file holds at this moment, for telling one change
+    /// from the next. Nil when there is nothing readable there.
+    func diskNow() -> DiskStamp? {
+        path.flatMap { Board.diskStamp($0) }
+    }
+
+    /// Where to keep this board when its own file belongs to somebody else.
+    ///
+    /// Beside the original, with the time in the name, so both are found in
+    /// the same place and neither is ever written over.
+    func sidecarPath(now: Date = Date()) -> String {
+        Board.besidePath(path ?? Board.defaultBoardPath(), words: "Drop Deck copy", now: now)
+    }
+
+    /// "<name> (<words> YYYY-MM-DD HHMM[, n]).<ext>", never an existing file.
+    static func besidePath(_ original: String, words: String, now: Date = Date()) -> String {
+        let ns = original as NSString
+        let ext = ns.pathExtension.isEmpty ? "json" : ns.pathExtension
+        let stem = ns.deletingPathExtension
+        let format = DateFormatter()
+        format.locale = Locale(identifier: "en_US_POSIX")
+        format.dateFormat = "yyyy-MM-dd HHmm"
+        let stamp = format.string(from: now)
+        var candidate = "\(stem) (\(words) \(stamp)).\(ext)"
+        var count = 2
+        while FileManager.default.fileExists(atPath: candidate) {
+            candidate = "\(stem) (\(words) \(stamp), \(count)).\(ext)"
+            count += 1
+        }
+        return candidate
     }
 
     // -------------------------------------------------------------- loading ---
 
     static func load(_ path: String) -> Board? {
-        guard let data = FileManager.default.contents(atPath: path),
-              let raw = try? JSONSerialization.jsonObject(with: data),
-              let dict = raw as? [String: Any] else { return nil }
+        try? read(path).get()
+    }
+
+    /// A board, or why it would not load, in words that can be said.
+    ///
+    /// `load` answered nil for a missing file and an unreadable one alike, so
+    /// the demo loaded with board.json's path and the next autosave wrote it
+    /// over a board that might only have needed a comma fixing. The reason is
+    /// what the startup line says; the file is copied aside before anything
+    /// can touch it.
+    static func read(_ path: String) -> Result<Board, BoardReadFailure> {
+        let data: Data
+        let stamp: DiskStamp
+        do { (data, stamp) = try readStamped(path) } catch let failure as BoardReadFailure {
+            return .failure(failure)
+        } catch {
+            return .failure(.notRecognised)
+        }
+        let raw: Any
+        do { raw = try JSONSerialization.jsonObject(with: data) } catch {
+            return .failure(BoardReadFailure.parsing(data, error))
+        }
+        guard let dict = raw as? [String: Any] else { return .failure(.notRecognised) }
         let board = Board.from(dict: dict, relativeTo: (path as NSString).deletingLastPathComponent)
         board.path = path
-        return board
+        board.disk = .stamp(stamp)
+        return .success(board)
     }
 
     static func from(dict: [String: Any], relativeTo folder: String?) -> Board {
@@ -440,7 +679,7 @@ final class Board {
             "stream_stats_url", "stream_public", "stream_mic", "stream_titles",
             "stream_stations",
             "ask_before_live",
-            "video_server", "video_host", "video_key", "live_to",
+            "video_server", "video_host", "video_name", "video_key", "live_to",
             "picture", "picture_file", "picture_clock", "camera", "screen",
             "split_corner", "text_places", "colour_background", "colour_text",
             "colour_accent", "vision_provider", "vision_model",
@@ -571,6 +810,7 @@ final class Board {
         let server = dict["video_server"] as? String ?? ""
         b.videoServer = C.videoServerOrder.contains(server) ? server : "youtube"
         b.videoHost = dict["video_host"] as? String ?? ""
+        b.videoName = dict["video_name"] as? String ?? ""
         b.videoKey = dict["video_key"] as? String ?? ""
         let liveTo = dict["live_to"] as? String ?? ""
         b.liveTo = C.liveTo.contains(liveTo) ? liveTo : C.liveToAudio
@@ -587,6 +827,13 @@ final class Board {
             b.stream.server = C.streamServerIcecast
             b.stream.host = ""
         }
+        // W384-24. A board file is plain JSON that people send each other,
+        // and one press of Command B on a board whose address is a folder or
+        // an http endpoint would have sent a live microphone wherever its
+        // author chose, while the pre-flight read it out as a server.
+        // `RTMPClient.parse` refuses such an address as well; this keeps it
+        // out of the settings in the first place.
+        b.videoHost = Board.rtmpAddress(b.videoHost)
         if b.videoHost.isEmpty {
             b.videoHost = C.rtmpIngest[b.videoServer] ?? ""
         }
@@ -685,7 +932,8 @@ final class Board {
     /// does not, which is exactly why they are per station rather than per
     /// board.
     static let stationFields = [
-        "stream_name", "stream_server", "stream_host", "stream_port",
+        "stream_name", "video_name",
+        "stream_server", "stream_host", "stream_port",
         "stream_mount", "stream_user", "stream_password", "stream_format",
         "stream_bitrate", "stream_description", "stream_genre", "stream_url",
         "stream_public", "stream_mic", "stream_titles", "stream_stats_url",
@@ -716,6 +964,7 @@ final class Board {
     func stationSettings() -> [String: Any] {
         [
             "stream_name": stream.name,
+            "video_name": videoName,
             "stream_server": stream.server,
             "stream_host": stream.host,
             "stream_port": stream.port,
@@ -756,6 +1005,16 @@ final class Board {
         streamStations.compactMap { $0["stream_name"] as? String }
     }
 
+    /// What a saved station is called in a menu. **Never an empty label**:
+    /// Windows asserted on one while the window was being built, so a board
+    /// whose server was set up without a station name could not be opened at
+    /// all, and on a Mac an empty item is simply silent under VoiceOver. A
+    /// board from before saved setups gets exactly that, a setup made from its
+    /// server with whatever name it had, which may be none. Windows' words.
+    static func stationLabel(_ name: String, at offset: Int) -> String {
+        name.isEmpty ? "Station \(offset + 1), no name" : name
+    }
+
     /// Put a saved station into the live settings. True if there was one.
     @discardableResult
     func loadStation(_ name: String) -> Bool {
@@ -792,14 +1051,22 @@ final class Board {
         // the board with a destination that was neither of the two and then
         // behaved as audio whatever the user had chosen. So each of these is
         // only touched when the station really has it.
-        if let v = station["video_server"] as? String, C.videoServerOrder.contains(v) {
-            videoServer = v
+        // A platform or a picture the station names that this build does not
+        // know becomes YouTube and the card, as Windows 3.8.4 does it
+        // (W384-25), so one station loads the same way on both machines.
+        if let raw = station["video_server"], !(raw is NSNull) {
+            let v = raw as? String ?? ""
+            videoServer = C.videoServerOrder.contains(v) ? v : "youtube"
         }
         if let v = station["video_host"] as? String { videoHost = v }
+        // Only when the station has one: a station saved before 3.8.2 has no
+        // channel name, and that is not the same as asking for none.
+        if let v = station["video_name"] as? String { videoName = v }
         if let v = station["video_key"] as? String { videoKey = v }
         if let v = station["live_to"] as? String, C.liveTo.contains(v) { liveTo = v }
-        if let v = station["picture"] as? String, C.pictureSources.contains(v) {
-            picture = v
+        if let raw = station["picture"], !(raw is NSNull) {
+            let v = raw as? String ?? ""
+            picture = C.pictureSources.contains(v) ? v : C.pictureCard
         }
         if let v = station["picture_file"] as? String { pictureFile = v }
         if let v = station["picture_clock"] as? Bool { pictureClock = v }
@@ -833,6 +1100,12 @@ final class Board {
             videoBitrate = Board.videoNumber(station["video_bitrate"], videoBitrate,
                                              200, 20000)
         }
+        // W384-25. The board loader whitelists the address and a station went
+        // round it, so a board that could not smuggle a path in through
+        // video_host could smuggle it in through a saved station. Windows'
+        // `load_station` does exactly this, and leaves the address empty
+        // rather than putting the platform's default back.
+        videoHost = Board.rtmpAddress(videoHost)
         return true
     }
 
@@ -944,6 +1217,7 @@ final class Board {
         askBeforeLive = other.askBeforeLive
         videoServer = other.videoServer
         videoHost = other.videoHost
+        videoName = other.videoName
         videoKey = other.videoKey
         liveTo = other.liveTo
         picture = other.picture
@@ -977,9 +1251,145 @@ final class Board {
         dirty = true
     }
 
+    // ---------------------------------------------------- the stream key ---
+
+    /// The video stream key that is really in force: the keychain's, or the
+    /// one in the board file when the keychain would not keep it.
+    ///
+    /// **Every place the key is read asks this, in this order.** Windows
+    /// found the other shape the hard way: the Preferences box read the
+    /// credential store alone while the streamer read the store OR the board,
+    /// so on a machine whose store refused a write the box came up empty over
+    /// a key that was working, and OK, seeing an empty box, forgot it.
+    func videoKeyInForce() -> String {
+        Board.keyInForce(keychain: Secrets.fetchVideoKey(
+            server: videoServer, host: videoHost, stationName: stream.name),
+            board: videoKey)
+    }
+
+    /// The read order, as arithmetic, so it can be asserted.
+    static func keyInForce(keychain: String, board: String) -> String {
+        keychain.isEmpty ? board : keychain
+    }
+
+    // ------------------------------------------------------ the address ---
+
+    /// An RTMP address out of a board file, or "" so the default is used.
+    ///
+    /// Windows 3.8.4's `_rtmp_address`, rule for rule, including how Python's
+    /// `urlparse` decides what the scheme is (letters first, then letters,
+    /// digits, plus, minus or dot, up to the first colon), because the two
+    /// copies read one file and must keep and drop the same addresses.
+    ///
+    /// **An address with NO scheme is kept, and that is on purpose.** It is
+    /// what somebody typed who left the rtmp off, and erasing it means they
+    /// open the app to an empty box with nothing to correct. It cannot reach
+    /// a server either way, because `RTMPClient.parse` refuses anything that
+    /// is not rtmp or rtmps. What must never survive is a scheme that names
+    /// another kind of output, or a path, because those are the shapes that
+    /// would have worked.
+    static func rtmpAddress(_ value: String) -> String {
+        let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.isEmpty { return "" }
+        let scheme = pythonScheme(text)
+        if scheme == "rtmp" || scheme == "rtmps" { return text }
+        let chars = Array(text)
+        let drivePath = chars.count >= 3 && chars[1] == ":" && chars[2] == "\\"
+        if !scheme.isEmpty || text.hasPrefix("\\\\") || drivePath || text.hasPrefix("/") {
+            return ""
+        }
+        return text
+    }
+
+    /// The scheme Python's `urllib.parse.urlsplit` would find, lower case, or
+    /// "" when it finds none.
+    static func pythonScheme(_ text: String) -> String {
+        guard let colon = text.firstIndex(of: ":"), colon != text.startIndex else { return "" }
+        let head = text[text.startIndex..<colon]
+        guard let first = head.first, first.isASCII, first.isLetter else { return "" }
+        let allowed = Set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+-.")
+        guard head.allSatisfy({ allowed.contains($0) }) else { return "" }
+        return head.lowercased()
+    }
+
     /// Scan every folder slot once, on a background thread, so a label is right
     /// before the user reaches it and no scan ever happens on the trigger path.
     func warmFolders() {
         for slot in slots where slot.isFolder { slot.scanFolder() }
+    }
+}
+
+// ------------------------------------------------------ the file on disk ---
+
+/// Size, modification time in nanoseconds, and SHA-1 of a board file's bytes.
+struct DiskStamp: Equatable {
+    let size: Int64
+    let modified: Int64
+    let hash: String
+}
+
+/// What a board knows about the file at its path. Windows' `_disk`, with its
+/// two markers spelled as cases rather than strings.
+enum DiskKnowledge: Equatable {
+    /// Read or written by this board, and this is what it looked like.
+    case stamp(DiskStamp)
+    /// There was no file when the path was claimed, so one appearing later is
+    /// somebody else's.
+    case nothingThere
+    /// There was one this board could not read, so it is never written over.
+    case unreadable
+}
+
+/// Why a board file would not load, in a few words for the startup line.
+///
+/// Never an error's class name or code: "NSCocoaErrorDomain 3840" is noise
+/// read aloud. Windows' `_short_reason`, sentence for sentence.
+enum BoardReadFailure: Error, Equatable {
+    case missing
+    case noPermission
+    case notText
+    case mistake(line: Int)
+    case notRecognised
+
+    var reason: String {
+        switch self {
+        case .mistake(let line): return "there is a mistake in it on line \(line)"
+        case .notText: return "it is not saved as text Drop Deck can read"
+        case .noPermission: return "macOS would not let Drop Deck open it"
+        case .missing, .notRecognised: return "Drop Deck does not recognise what is in it"
+        }
+    }
+
+    /// What a JSON parser's complaint means, from the bytes it was given.
+    ///
+    /// The line is counted from the byte offset the parser reports rather
+    /// than read out of its English, which is not a promise. A file that is
+    /// not UTF-8 at all is the text case, which is what Windows' reading as
+    /// `utf-8-sig` would have refused.
+    static func parsing(_ data: Data, _ error: Error) -> BoardReadFailure {
+        var body = data
+        if body.starts(with: [0xEF, 0xBB, 0xBF]) { body = body.dropFirst(3) }
+        if String(data: body, encoding: .utf8) == nil { return .notText }
+        let info = (error as NSError).userInfo
+        if let index = info["NSJSONSerializationErrorIndex"] as? Int, index >= 0 {
+            let upto = data.prefix(min(index, data.count))
+            return .mistake(line: upto.reduce(1) { $0 + ($1 == 0x0A ? 1 : 0) })
+        }
+        if let said = info["NSDebugDescription"] as? String,
+           let range = said.range(of: "line ") {
+            let digits = said[range.upperBound...].prefix { $0.isNumber }
+            if let line = Int(digits) { return .mistake(line: line) }
+        }
+        return .notRecognised
+    }
+}
+
+enum BoardSaveError: Error, LocalizedError {
+    case readOnly
+
+    var errorDescription: String? {
+        switch self {
+        case .readOnly: return "The file is marked read only"
+        }
     }
 }

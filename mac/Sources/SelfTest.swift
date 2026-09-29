@@ -66,6 +66,7 @@ final class SelfTest {
         runAirChecks()
         runSendChecks()
         runVideoChecks()
+        runBoardFileChecks()
         testRealDevice()
 
         out.append("")

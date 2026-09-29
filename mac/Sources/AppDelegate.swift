@@ -79,9 +79,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         trace("loading board")
-        let board = loadBoard()
+        let startup = loadBoard()
+        let board = startup.board
         trace("board loaded, \(board.slots.filter { $0.isAssigned }.count) assigned")
         main = MainWindow(board: board)
+        main.startupBoardNote = startup.note
+        main.loadedDemo = startup.loadedDemo
+        main.keeper.pinned = startup.pinned
+        main.keeper.noteStartingVersion()
         trace("window built")
         buildMenus()
         main.showWindow(nil)
@@ -148,42 +153,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { true }
 
     func applicationWillTerminate(_ notification: Notification) {
-        main?.saveQuietly()
+        main?.saveForClose()
         if let monitor { NSEvent.removeMonitor(monitor) }
     }
 
     // ------------------------------------------------------------ the board ---
 
-    private func loadBoard() -> Board {
-        let path = Board.defaultBoardPath()
-        if let existing = Board.load(path) { return existing }
-        // First run: the demo pack, so the app makes a noise the moment it is
-        // opened rather than presenting eighty empty buttons.
-        if let demo = demoBoard() { return demo }
-        let fresh = Board()
-        fresh.path = path
-        return fresh
-    }
-
-    /// The forty piece demo pack that ships beside the Windows copy.
-    private func demoBoard() -> Board? {
-        let candidates = [
-            Bundle.main.resourcePath.map { ($0 as NSString).appendingPathComponent("demo") },
-            // Running from the source tree during development.
-            (FileManager.default.currentDirectoryPath as NSString).appendingPathComponent("demo"),
-            ((Bundle.main.bundlePath as NSString).deletingLastPathComponent as NSString)
-                .appendingPathComponent("demo"),
-        ].compactMap { $0 }
-        for folder in candidates {
-            let file = (folder as NSString).appendingPathComponent("demo-board.json")
-            guard FileManager.default.fileExists(atPath: file),
-                  let board = Board.load(file) else { continue }
-            // The demo is a starting point, not the user's document: it is
-            // saved to their own board path from here on.
-            board.path = Board.defaultBoardPath()
-            return board
-        }
-        return nil
+    /// The board you had open last time, otherwise yours, otherwise the demo.
+    /// See `BoardFiles.loadStartup`; what it has to say about the board goes
+    /// to the window for the startup line.
+    private func loadBoard() -> BoardFiles.Startup {
+        BoardFiles.loadStartup(configDir: Board.configDir(),
+                               demoPath: AppDelegateDemo.locate())
     }
 
     // ------------------------------------------------------- the key monitor ---
@@ -736,8 +717,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let names = main.board.stationNames
         if !names.isEmpty {
             let saved = NSMenu(title: "Load a saved setup")
-            for name in names.prefix(20) {
-                let entry = NSMenuItem(title: name, action: #selector(pickSavedSetup(_:)),
+            for (offset, name) in names.prefix(20).enumerated() {
+                let entry = NSMenuItem(title: Board.stationLabel(name, at: offset),
+                                       action: #selector(pickSavedSetup(_:)),
                                        keyEquivalent: "")
                 entry.target = self
                 entry.representedObject = name

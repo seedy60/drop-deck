@@ -76,13 +76,14 @@ if CommandLine.arguments.contains("--check-updates") {
 // publish. The key is never printed, only what the platform said about it.
 // Run it from a Developer ID signed build, or the keychain asks first.
 if CommandLine.arguments.contains("--check-stream-key") {
-    let path = Board.defaultBoardPath()
+    // The board the app would open, and the key it would really use: the
+    // keychain's, or the board file's when the keychain would not keep it.
+    let path = BoardFiles.boardToOpen()
     guard let board = Board.load(path) else {
         print("could not read \(path)")
         exit(2)
     }
-    let key = Secrets.fetchVideoKey(server: board.videoServer, host: board.videoHost,
-                                    stationName: board.stream.name)
+    let key = board.videoKeyInForce()
     let result = StreamKeyCheck.verify(host: board.videoHost, key: key,
                                        server: board.videoServer)
     print("platform  : \(board.videoServer)")
