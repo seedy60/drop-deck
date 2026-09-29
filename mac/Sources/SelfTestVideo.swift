@@ -39,6 +39,7 @@ extension SelfTest {
         testEditMenu()
         testPermissions()
         testChunkReader()
+        runKeyCheckChecks()
         testFreezeSubjects()
         testSavedSetups()
     }

@@ -469,9 +469,33 @@ enum C {
     /// account, so with every channel off it goes nowhere at all. That makes
     /// it the one place a full end to end test can run without touching
     /// anybody's real audience.
+    ///
+    /// A custom server is nil too, and it used to be false (W384-09). False
+    /// means somebody ESTABLISHED that connecting posts nothing, which is true
+    /// of Facebook; for a server nobody here has seen, the honest answer is
+    /// that nobody knows, and the app's own help already tells such a user to
+    /// ask. `StreamKeyCheck.needsAsking` asks first for anything not known to
+    /// be safe.
     static let rtmpGoesLiveAtOnce: [String: Bool?] = [
-        "youtube": true, "facebook": false, "restream": nil, "rtmp": false,
+        "youtube": true, "facebook": false, "restream": nil, "rtmp": nil,
     ]
+
+    /// How long Check my stream key may take, the whole conversation. Ten
+    /// seconds is generous: the measured answer from YouTube and Facebook is
+    /// under one. `STREAM_TIMEOUT` on Windows.
+    static let streamKeyCheckTimeout = 10.0
+
+    /// No audio off the bus for this long means something is wrong worth
+    /// saying (W384-16). `STREAM_SILENCE_TIMEOUT` on Windows. The bus carries
+    /// silence when nothing is playing, so this is not a quiet show: it is
+    /// the mixer or the sound card delivering nothing at all.
+    static let streamSilenceTimeout = 5.0
+
+    /// How long on air before Command Shift B may say nothing has left the
+    /// machine. Not sooner: the state is live before the first packet is
+    /// sent, and a healthy stream asked straight after Command B would be
+    /// reported as sending nothing.
+    static let streamNothingYetSeconds = 2.0
 
     /// What the picture is, when there is no camera. YouTube refuses an audio
     /// only ingest, so a radio show still has to send something, and a still
@@ -497,10 +521,13 @@ enum C {
     /// How long to listen for a refusal after saying publish, before starting
     /// to send anyway.
     ///
-    /// **Not a wait for permission.** YouTube never answers publish at all, so
-    /// waiting for a yes is waiting for ever; this is only long enough to
-    /// catch a no that comes straight back. A no that arrives later is caught
-    /// by the pump, which asks on every turn.
+    /// **Not a wait for permission.** A yes ends it at once, a no or a hang up
+    /// is a refusal, and silence for the whole grace still goes on, because a
+    /// platform that says nothing either way must not be waited on for ever.
+    /// The belief that YouTube never answers publish came from a made up key,
+    /// which YouTube answers by hanging up; Windows measured a real key
+    /// accepted with NetStream.Publish.Start in 0.60 s (20 September 2026). A
+    /// no that arrives later is caught by the pump, which asks on every turn.
     static let rtmpPublishGrace = 2.0
 
     /// The most frames that may be sent in one go when catching up.

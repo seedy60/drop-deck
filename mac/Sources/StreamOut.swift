@@ -573,12 +573,24 @@ final class Streamer {
     var onState: ((StreamState, String) -> Void)?
 
     private var bus: AirBus?
+    private weak var group: MixerGroup?
     private var thread: Thread?
     private var stopping = false
     private let lock = NSLock()
     private var connection: NWConnection?
     private var connected = false
     private var currentTitle = ""
+    /// Which run a worker thread belongs to. A worker from a run that has
+    /// been stopped, or replaced by a new Command B, may not change the state
+    /// (M6): it used to be able to say ON AIR after Command B had taken the
+    /// show off.
+    private(set) var generation = 0
+    /// Connection attempts in this run, the first being 1.
+    private(set) var attempts = 0
+    /// Encoded audio that really went out, across every connection of this
+    /// run. Not the handshake and not the Ogg or WAV preamble.
+    private(set) var mediaBytes = 0
+    private(set) var liveSince: Date?
 
     var isOn: Bool {
         lock.lock(); defer { lock.unlock() }
@@ -607,15 +619,23 @@ final class Streamer {
 
         let bus = AirBus(sampleRate: rate)
         self.bus = bus
+        self.group = group
         group.addAirBus(bus)
 
+        lock.lock()
         stopping = false
+        generation += 1
+        let run = generation
+        attempts = 0
+        mediaBytes = 0
+        liveSince = nil
+        lock.unlock()
         reconnects = 0
         droppedBlocks = 0
         startedAt = Date()
-        set(.connecting, settings.host)
+        applyState(.connecting, settings.host, generation: run)
 
-        let t = Thread { [weak self] in self?.run(rate: rate) }
+        let t = Thread { [weak self] in self?.run(rate: rate, generation: run) }
         t.name = "dropdeck-stream"
         thread = t
         t.start()
@@ -623,29 +643,83 @@ final class Streamer {
     }
 
     func stop(group: MixerGroup) {
-        lock.lock(); stopping = true; lock.unlock()
-        connection?.cancel()
+        lock.lock()
+        stopping = true
+        let open = connection
         connection = nil
+        lock.unlock()
+        open?.cancel()
         if let bus { group.removeAirBus(bus) }
         bus = nil
         thread = nil
         startedAt = nil
+        liveSince = nil
         connected = false
-        set(.off, "")
+        applyState(.off, "")
     }
 
     private func set(_ newState: StreamState, _ newDetail: String) {
+        applyState(newState, newDetail)
+    }
+
+    /// Change the state, and tell the window, unless nothing changed.
+    ///
+    /// **An unchanged state and detail are not said again** (M13). Every
+    /// retry used to be spoken, "Off air, trying again" and the same reason,
+    /// all night. And a worker from a run that has been stopped or replaced
+    /// changes nothing at all (M6). Returns whether the window was told, for
+    /// the checks.
+    @discardableResult
+    func applyState(_ newState: StreamState, _ newDetail: String,
+                    generation run: Int? = nil) -> Bool {
         lock.lock()
+        if let run, run != generation || stopping {
+            lock.unlock()
+            return false
+        }
+        if state == newState && detail == newDetail {
+            lock.unlock()
+            return false
+        }
         state = newState
         detail = newDetail
         lock.unlock()
         let s = newState, d = newDetail
         DispatchQueue.main.async { [weak self] in self?.onState?(s, d) }
+        return true
+    }
+
+    /// Whether this worker's run is still the one that counts.
+    private func current(_ run: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return run == generation && !stopping
+    }
+
+    /// A run that ended itself, on a refusal or on silence, lets go of the
+    /// programme bus, which Command B would otherwise leave being filled for
+    /// nobody until the app quits.
+    private func releaseAfterFailure(_ run: Int, bus used: AirBus) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            // The bus THIS run used, whatever has happened since: a Command B
+            // straight after the failure has already made a new one.
+            self.group?.removeAirBus(used)
+            if self.bus === used { self.bus = nil }
+        }
+    }
+
+    private func dropConnection() {
+        lock.lock()
+        let open = connection
+        connection = nil
+        lock.unlock()
+        open?.cancel()
+        connected = false
     }
 
     // ------------------------------------------------------------ the thread ---
 
-    private func run(rate: Double) {
+    private func run(rate: Double, generation run: Int) {
         guard let bus, let encoder = makeStreamEncoder(format: settings.format, rate: rate,
                                                        bitrate: settings.bitrate)
         else { return }
@@ -659,42 +733,52 @@ final class Streamer {
         var interleaved = [Float](repeating: 0, count: chunk * 2)
 
         var backoff = 1.0
-        while true {
-            lock.lock(); let finishing = stopping; lock.unlock()
-            if finishing { break }
+        var lastAudio = ProcessInfo.processInfo.systemUptime
+        var failed = false
 
+        /// One failure, decided: stop for good, or wait and go round again.
+        /// Returns false when the run is over.
+        func survive(_ fault: StreamFault) -> Bool {
+            dropConnection()
+            lock.lock(); let tries = attempts; lock.unlock()
+            if Retry.isFatal(fault, attempts: tries) {
+                applyState(.failed, fault.said, generation: run)
+                failed = true
+                return false
+            }
+            reconnects += 1
+            applyState(.retrying, fault.said, generation: run)
+            var waited = 0.0
+            while waited < backoff && current(run) {
+                Thread.sleep(forTimeInterval: 0.1)
+                waited += 0.1
+            }
+            backoff = min(15.0, backoff * 2)
+            return true
+        }
+
+        while current(run) {
             if !connected {
-                if connect() {
-                    connected = true
-                    backoff = 1.0
-                    // Ogg and WAV both begin with bytes that are not audio, and
-                    // a reconnect is a new request body, so they go again. AAC
-                    // is self framing and has none.
-                    if let preamble = encoder.preamble(), !send(preamble) {
-                        connected = false
-                        connection?.cancel()
-                        connection = nil
-                        set(.retrying, "the connection dropped")
-                        continue
-                    }
-                    set(.live, settings.host)
-                    if settings.sendTitles && !currentTitle.isEmpty {
-                        pushMetadata(currentTitle)
-                    }
-                } else {
-                    // The stream loses audio and your own sound carries on,
-                    // which is the right way round.
-                    reconnects += 1
-                    set(.retrying, detail)
-                    var waited = 0.0
-                    while waited < backoff {
-                        lock.lock(); let f = stopping; lock.unlock()
-                        if f { break }
-                        Thread.sleep(forTimeInterval: 0.1)
-                        waited += 0.1
-                    }
-                    backoff = min(15.0, backoff * 2)
-                    continue
+                lock.lock(); attempts += 1; lock.unlock()
+                if let fault = connect() {
+                    if survive(fault) { continue }
+                    break
+                }
+                guard current(run) else { break }
+                connected = true
+                backoff = 1.0
+                // Ogg and WAV both begin with bytes that are not audio, and
+                // a reconnect is a new request body, so they go again. AAC
+                // is self framing and has none.
+                if let preamble = encoder.preamble(), !send(preamble) {
+                    if survive(.dropped("the connection dropped")) { continue }
+                    break
+                }
+                applyState(.live, settings.host, generation: run)
+                liveSince = Date()
+                lastAudio = ProcessInfo.processInfo.systemUptime
+                if settings.sendTitles && !currentTitle.isEmpty {
+                    pushMetadata(currentTitle)
                 }
             }
 
@@ -702,8 +786,16 @@ final class Streamer {
             behindSeconds = Double(ready) / rate
             if ready < chunk {
                 Thread.sleep(forTimeInterval: C.streamPollSeconds)
+                let idle = ProcessInfo.processInfo.systemUptime - lastAudio
+                lock.lock(); let sent = mediaBytes; lock.unlock()
+                if let fault = SilenceWatch.fault(idle: idle, mediaBytes: sent) {
+                    lastAudio = ProcessInfo.processInfo.systemUptime
+                    if survive(fault) { continue }
+                    break
+                }
                 continue
             }
+            lastAudio = ProcessInfo.processInfo.systemUptime
 
             interleaved.withUnsafeMutableBufferPointer { raw in
                 bus.read(frames: chunk, into: raw.baseAddress!)
@@ -715,55 +807,74 @@ final class Streamer {
                 }
             }
             guard let packet = encoder.encode(pcm) else { continue }
-            if !send(packet) {
-                connected = false
-                connection?.cancel()
-                connection = nil
-                set(.retrying, "the connection dropped")
+            if send(packet) {
+                lock.lock(); mediaBytes += packet.count; lock.unlock()
+            } else {
+                // A drop, not a refusal: straight back round to reconnect.
+                dropConnection()
+                reconnects += 1
+                applyState(.retrying, "the connection dropped", generation: run)
             }
         }
-        connection?.cancel()
-        connection = nil
-        connected = false
+        dropConnection()
+        if failed { releaseAfterFailure(run, bus: bus) }
     }
 
     // ------------------------------------------------------------ the socket ---
 
-    private func connect() -> Bool {
+    /// One attempt at the source connection. Nil when the server took it,
+    /// otherwise what went wrong, sorted for `Retry`.
+    private func connect() -> StreamFault? {
         let host = NWEndpoint.Host(settings.host)
-        guard let port = NWEndpoint.Port(rawValue: UInt16(settings.port)) else {
-            set(.failed, "that port number is not valid")
-            return false
+        guard settings.port > 0, let port = NWEndpoint.Port(rawValue: UInt16(clamping: settings.port))
+        else {
+            return .refused("that port number is not valid")
         }
         let connection = NWConnection(host: host, port: port, using: .tcp)
-        self.connection = connection
+        lock.lock(); self.connection = connection; lock.unlock()
 
         let ready = DispatchSemaphore(value: 0)
-        var ok = false
+        let settle = NSLock()
+        var settled = false
+        var failure: StreamFault?
+        let named = settings.host
+        func finish(_ fault: StreamFault?) {
+            settle.lock()
+            if !settled { settled = true; failure = fault; ready.signal() }
+            settle.unlock()
+        }
+        func sorted(_ error: NWError) -> StreamFault {
+            if case .dns = error {
+                return .notFound("could not find \(named). Check the server address")
+            }
+            return .dropped("the server could not be reached")
+        }
         connection.stateUpdateHandler = { state in
             switch state {
-            case .ready: ok = true; ready.signal()
-            case .failed, .cancelled: ok = false; ready.signal()
+            case .ready: finish(nil)
+            // Waiting is an answer (M2): a name that will not resolve or a
+            // port nothing listens on leaves the connection WAITING, and this
+            // used to sit out the whole eight seconds for it.
+            case .waiting(let error): finish(sorted(error))
+            case .failed(let error): finish(sorted(error))
+            case .cancelled: finish(.dropped("the server could not be reached"))
             default: break
             }
         }
         connection.start(queue: DispatchQueue.global(qos: .userInitiated))
         if ready.wait(timeout: .now() + 8) == .timedOut {
-            set(.retrying, "the server did not answer")
-            connection.cancel()
-            self.connection = nil
-            return false
+            dropConnection()
+            return .dropped("the server did not answer")
         }
-        guard ok else {
-            set(.retrying, "the server could not be reached")
-            connection.cancel()
-            self.connection = nil
-            return false
+        settle.lock(); let why = failure; settle.unlock()
+        if let why {
+            dropConnection()
+            return why
         }
 
         guard send(Data(handshake().utf8)) else {
-            set(.retrying, "the server would not take the connection")
-            return false
+            dropConnection()
+            return .dropped("the server would not take the connection")
         }
 
         // Icecast answers a PUT with a status line. SHOUTcast answers "OK2".
@@ -773,26 +884,20 @@ final class Streamer {
         let answer = readAnswer(timeout: 3.0)
         if let answer, !answer.isEmpty {
             let head = answer.split(separator: "\r\n").first.map(String.init) ?? answer
+            var refused: String?
             if head.contains("401") || head.lowercased().contains("unauthor") {
-                set(.failed, "the server refused the password")
-                connection.cancel()
-                self.connection = nil
-                return false
+                refused = "the server refused the password"
+            } else if head.contains("403") {
+                refused = "the server refused the mount point"
+            } else if head.contains("404") {
+                refused = "the server has no such mount point"
             }
-            if head.contains("403") {
-                set(.failed, "the server refused the mount point")
-                connection.cancel()
-                self.connection = nil
-                return false
-            }
-            if head.contains("404") {
-                set(.failed, "the server has no such mount point")
-                connection.cancel()
-                self.connection = nil
-                return false
+            if let refused {
+                dropConnection()
+                return .refused(refused)
             }
         }
-        return true
+        return nil
     }
 
     /// Prove the settings before the show rather than during it: connect,
@@ -896,6 +1001,7 @@ final class Streamer {
 
     @discardableResult
     private func send(_ data: Data) -> Bool {
+        lock.lock(); let connection = self.connection; lock.unlock()
         guard let connection else { return false }
         let done = DispatchSemaphore(value: 0)
         var ok = true
@@ -910,6 +1016,7 @@ final class Streamer {
     }
 
     private func readAnswer(timeout: Double) -> String? {
+        lock.lock(); let connection = self.connection; lock.unlock()
         guard let connection else { return nil }
         let done = DispatchSemaphore(value: 0)
         var text: String?
@@ -978,6 +1085,14 @@ final class Streamer {
                 parts.append("WITHOUT your microphone, which Preferences, Streaming turns on")
             }
             parts.append("to \(settings.host)")
+            // **Whether anything has actually left the machine** (W384-17).
+            // A duration, a bitrate and a host are all things a stream sending
+            // nothing reports just as happily.
+            lock.lock(); let sent = mediaBytes; lock.unlock()
+            if let nothing = SilenceWatch.nothingYetNote(
+                liveFor: liveSince.map { -$0.timeIntervalSinceNow } ?? 0, mediaBytes: sent) {
+                parts.append(nothing)
+            }
             if let bus, bus.dropped > 0 {
                 parts.append("\(bus.dropped) blocks lost, so listeners have heard gaps")
             }

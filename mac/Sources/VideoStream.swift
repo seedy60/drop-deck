@@ -50,9 +50,24 @@ final class VideoStreamer {
 
     private let lock = NSLock()
     private var bus: AirBus?
+    private weak var group: MixerGroup?
     private var thread: Thread?
     private var stopping = false
+    /// The connection in use, or being made. Held under `lock` so Command B
+    /// can hang it up from the main thread while the worker is inside
+    /// `connect()`, which is where the stop race lived (M6).
     private var client: RTMPClient?
+    /// Which run a worker belongs to. See `Streamer.generation`.
+    private(set) var generation = 0
+    /// Connection attempts in this run, the first being 1.
+    private(set) var attempts = 0
+    /// Audio and video that really went out, across every connection of this
+    /// run: the frames, not the sequence headers and not the metadata.
+    private(set) var mediaBytes = 0
+    /// Video frames that really went out (M7). `videoFrames` is the CLOCK and
+    /// counts frames that were due, including ones the picture never made.
+    private(set) var framesSent = 0
+    private(set) var liveSince: Date?
     private var encoder: VideoEncoder?
     private var source: PictureSource?
     private var wantedSource: PictureSource?
@@ -81,7 +96,9 @@ final class VideoStreamer {
     }
 
     var elapsed: Double { startedAt.map { -$0.timeIntervalSinceNow } ?? 0 }
-    var bytesSent: Int { client?.bytesSent ?? 0 }
+    /// What has gone out that a viewer could receive (M8). It used to be
+    /// every byte including the handshake, which is never nought.
+    var bytesSent: Int { lock.lock(); defer { lock.unlock() }; return mediaBytes }
 
     // ------------------------------------------------------------ going on ---
 
@@ -100,6 +117,7 @@ final class VideoStreamer {
         let rate = group.sampleRate
         let bus = AirBus(sampleRate: rate)
         self.bus = bus
+        self.group = group
         group.addAirBus(bus)
 
         overlay.apply(settings.overlay)
@@ -114,13 +132,21 @@ final class VideoStreamer {
             self?.say(text.replacingOccurrences(of: "The picture", with: "The camera"))
         }
 
+        lock.lock()
         stopping = false
+        generation += 1
+        let run = generation
+        attempts = 0
+        mediaBytes = 0
+        framesSent = 0
+        liveSince = nil
+        lock.unlock()
         samplesSent = 0
         videoFrames = 0
         startedAt = Date()
-        set(.connecting, "")
+        applyState(.connecting, "", generation: run)
 
-        let worker = Thread { [weak self] in self?.run(rate: rate) }
+        let worker = Thread { [weak self] in self?.run(rate: rate, generation: run) }
         worker.name = "dropdeck-rtmp"
         worker.qualityOfService = .userInitiated
         thread = worker
@@ -129,19 +155,29 @@ final class VideoStreamer {
     }
 
     func stop(group: MixerGroup) {
-        lock.lock(); stopping = true; lock.unlock()
+        lock.lock()
+        stopping = true
+        let open = client
+        client = nil
+        let picture = source
+        let waiting = wantedSource
+        source = nil
+        wantedSource = nil
+        lock.unlock()
+        // Hung up first, so a worker inside connect() is woken by the close
+        // rather than finishing the conversation and going live after it.
+        open?.close()
         thread?.cancel()
         thread = nil
         if let bus { group.removeAirBus(bus) }
         bus = nil
-        source?.close()
-        source = nil
+        picture?.close()
+        waiting?.close()
         encoder?.close()
         encoder = nil
-        client?.close()
-        client = nil
         startedAt = nil
-        set(.off, "")
+        liveSince = nil
+        applyState(.off, "")
     }
 
     /// Change what is going out, without dropping the stream.
@@ -160,7 +196,13 @@ final class VideoStreamer {
         made.start()
         let ready = made.waitReady(timeout: C.cameraOpenTimeout)
         made.setTitle(currentTitle)
-        lock.lock(); wantedSource = made; lock.unlock()
+        lock.lock()
+        // Off air by the time it opened, a refusal having come back first:
+        // closed rather than left holding the camera for nobody.
+        let wanted = state != .off && state != .failed && !stopping
+        if wanted { wantedSource = made }
+        lock.unlock()
+        if !wanted { made.close(); return "" }
         if ready { return "" }
         // A card cannot fail and never reports one, so an error here is the
         // real source saying it could not open.
@@ -208,7 +250,9 @@ final class VideoStreamer {
         lock.lock()
         let now = state
         let said = detail
-        let frames = videoFrames
+        let frames = framesSent
+        let sent = mediaBytes
+        let since = liveSince
         lock.unlock()
         switch now {
         case .off: return "Off air"
@@ -220,6 +264,11 @@ final class VideoStreamer {
             let where_ = StreamServers.serverLabel(settings.server)
             var line = "On air to \(where_) for \(seconds / 60) minutes "
                      + "\(seconds % 60) seconds, \(frames) frames sent"
+            // **Whether anything has actually left the machine** (W384-17).
+            if let nothing = SilenceWatch.nothingYetNote(
+                liveFor: since.map { -$0.timeIntervalSinceNow } ?? 0, mediaBytes: sent) {
+                line += ", " + nothing
+            }
             if let source { line += ", showing \(source.describe())" }
             let picture = health.describe()
             if picture != "the picture looks fine" { line += ". " + picture }
@@ -229,10 +278,10 @@ final class VideoStreamer {
 
     // ------------------------------------------------------------ the pump ---
 
-    private func run(rate: Double) {
+    private func run(rate: Double, generation run: Int) {
         guard let bus else { return }
         guard let aac = AACEncoder(rate: rate, bitrate: settings.audioBitrate) else {
-            set(.failed, "the sound encoder would not start")
+            applyState(.failed, "the sound encoder would not start", generation: run)
             return
         }
         let chunk = AACEncoder.frameSize
@@ -245,23 +294,61 @@ final class VideoStreamer {
         let video = VideoEncoder(width: settings.width, height: settings.height,
                                  fps: settings.fps, bitrate: settings.videoBitrate)
         guard video.open() else {
-            set(.failed, video.error)
+            applyState(.failed, video.error, generation: run)
             return
         }
         encoder = video
 
         var sequenceSent = false
         var backoff = 1.0
+        var live: RTMPClient?
+        var lastAudio = ProcessInfo.processInfo.systemUptime
+        var failed = false
 
-        while true {
-            lock.lock(); let finishing = stopping; lock.unlock()
-            if finishing { break }
+        /// Hang up the connection in use, if any.
+        func hangUp() {
+            lock.lock()
+            let open = client
+            client = nil
+            lock.unlock()
+            open?.close()
+            live = nil
+        }
 
-            if client == nil {
+        /// One failure, decided: stop for good, or wait and go round again.
+        /// Returns false when the run is over.
+        func survive(_ fault: StreamFault) -> Bool {
+            hangUp()
+            lock.lock(); let tries = attempts; lock.unlock()
+            if Retry.isFatal(fault, attempts: tries) {
+                applyState(.failed, fault.said, generation: run)
+                failed = true
+                return false
+            }
+            reconnects += 1
+            applyState(.retrying, fault.said, generation: run)
+            var waited = 0.0
+            while waited < backoff && current(run) {
+                Thread.sleep(forTimeInterval: 0.1)
+                waited += 0.1
+            }
+            backoff = min(15.0, backoff * 2)
+            return true
+        }
+
+        while current(run) {
+            if live == nil {
                 let made = RTMPClient(url: settings.host, key: settings.key)
+                lock.lock()
+                attempts += 1
+                // Held where stop() can reach it BEFORE the conversation
+                // starts, so Command B during connect() hangs this up.
+                self.client = made
+                lock.unlock()
                 do {
                     try made.connect()
-                    client = made
+                    guard current(run) else { hangUp(); break }
+                    live = made
                     backoff = 1.0
                     sequenceSent = false
                     try made.send(metadata: FLV.metadata(
@@ -272,30 +359,23 @@ final class VideoStreamer {
                     try made.send(audio: FLV.audio(
                         FLV.audioSpecificConfig(sampleRate: Int(rate), channels: 2),
                         sequence: true), timestamp: 0)
-                    set(.live, StreamServers.serverLabel(settings.server))
+                    applyState(.live, StreamServers.serverLabel(settings.server),
+                               generation: run)
+                    lock.lock(); liveSince = Date(); lock.unlock()
+                    lastAudio = ProcessInfo.processInfo.systemUptime
                 } catch {
-                    made.close()
-                    reconnects += 1
-                    set(.retrying, "\(error)")
-                    var waited = 0.0
-                    while waited < backoff {
-                        lock.lock(); let f = stopping; lock.unlock()
-                        if f { break }
-                        Thread.sleep(forTimeInterval: 0.1)
-                        waited += 0.1
-                    }
-                    backoff = min(15.0, backoff * 2)
-                    continue
+                    if survive(fault(for: error)) { continue }
+                    break
                 }
             }
-            guard let client else { continue }
+            guard let link = live else { continue }
 
             // A platform that is going to refuse may do it after the first
             // frames rather than at publish, so it is asked every turn.
-            if let refused = client.refusal() {
-                client.close()
-                self.client = nil
-                set(.failed, refused)
+            if let refused = link.refusal() {
+                hangUp()
+                applyState(.failed, refused, generation: run)
+                failed = true
                 break
             }
 
@@ -319,8 +399,19 @@ final class VideoStreamer {
             behindSeconds = Double(ready) / rate
             if ready < chunk {
                 Thread.sleep(forTimeInterval: C.streamPollSeconds)
+                // **Nothing off the bus is not a broadcast** (W384-16). This
+                // used to sleep and go round for ever, ON AIR with nothing
+                // leaving the machine.
+                let idle = ProcessInfo.processInfo.systemUptime - lastAudio
+                lock.lock(); let sent = mediaBytes; lock.unlock()
+                if let fault = SilenceWatch.fault(idle: idle, mediaBytes: sent) {
+                    lastAudio = ProcessInfo.processInfo.systemUptime
+                    if survive(fault) { continue }
+                    break
+                }
                 continue
             }
+            lastAudio = ProcessInfo.processInfo.systemUptime
 
             interleaved.withUnsafeMutableBufferPointer { raw in
                 bus.read(frames: chunk, into: raw.baseAddress!)
@@ -337,26 +428,43 @@ final class VideoStreamer {
             var ok = true
             if let packet = aac.encode(pcm) {
                 for frame in VideoStreamer.adtsFrames(packet) {
+                    let raw = FLV.stripADTS(frame)
                     do {
-                        try client.send(audio: FLV.audio(FLV.stripADTS(frame),
-                                                         sequence: false),
+                        try link.send(audio: FLV.audio(raw, sequence: false),
                                         timestamp: milliseconds)
+                        lock.lock(); mediaBytes += raw.count; lock.unlock()
                     } catch { ok = false; break }
                 }
             }
 
-            if ok { ok = pumpVideo(client: client, video: video,
+            if ok { ok = pumpVideo(client: link, video: video,
                                    milliseconds: milliseconds,
                                    sequenceSent: &sequenceSent) }
             if !ok {
-                client.close()
-                self.client = nil
-                connectedLost()
+                // A drop, not a refusal: straight back round to reconnect.
+                hangUp()
+                reconnects += 1
+                applyState(.retrying, "the connection dropped", generation: run)
             }
         }
         video.close()
-        client?.close()
-        client = nil
+        hangUp()
+        if failed { releaseAfterFailure(run, bus: bus) }
+    }
+
+    /// What a connect failure means for a retry, in words that name the
+    /// platform rather than its address.
+    private func fault(for error: Error) -> StreamFault {
+        guard let rtmp = error as? RTMPError else { return .dropped("\(error)") }
+        if case .keyRefused = rtmp {
+            // Windows' sentence for the same refusal, with the platform's
+            // name where Windows puts the host, because a host name is a run
+            // of letter clusters to a screen reader.
+            return .refused("\(StreamServers.serverLabel(settings.server)) would not take "
+                          + "the stream key. Check it has been copied in full and has not "
+                          + "expired")
+        }
+        return rtmp.fault
     }
 
     /// How many frames should exist by now, capped.
@@ -409,6 +517,7 @@ final class VideoStreamer {
                 try client.send(video: FLV.video(out.data, keyframe: out.keyframe,
                                                  sequence: false),
                                 timestamp: out.timestamp)
+                lock.lock(); framesSent += 1; mediaBytes += out.data.count; lock.unlock()
             } catch {
                 return false
             }
@@ -450,12 +559,6 @@ final class VideoStreamer {
         return out.isEmpty ? [packet] : out
     }
 
-    private func connectedLost() {
-        reconnects += 1
-        // The stream loses picture and sound and your own monitoring carries
-        // on, which is the right way round.
-        set(.retrying, "the connection dropped")
-    }
 
     private func say(_ text: String) {
         guard !text.isEmpty else { return }
@@ -463,12 +566,55 @@ final class VideoStreamer {
     }
 
     private func set(_ newState: StreamState, _ newDetail: String) {
+        applyState(newState, newDetail)
+    }
+
+    /// Change the state, and tell the window, unless nothing changed. See
+    /// `Streamer.applyState`: an unchanged state is not said again (M13), and
+    /// a worker from a stopped or replaced run changes nothing (M6).
+    @discardableResult
+    func applyState(_ newState: StreamState, _ newDetail: String,
+                    generation run: Int? = nil) -> Bool {
         lock.lock()
+        if let run, run != generation || stopping {
+            lock.unlock()
+            return false
+        }
+        if state == newState && detail == newDetail {
+            lock.unlock()
+            return false
+        }
         state = newState
         detail = newDetail
         lock.unlock()
         DispatchQueue.main.async { [weak self] in
             self?.onState?(newState, newDetail)
+        }
+        return true
+    }
+
+    private func current(_ run: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return run == generation && !stopping
+    }
+
+    /// A run that ended itself lets go of the programme bus and the picture,
+    /// or the camera stays open, and the bus filled, for nobody.
+    private func releaseAfterFailure(_ run: Int, bus used: AirBus) {
+        lock.lock()
+        let same = run == generation
+        let picture = same ? source : nil
+        let waiting = same ? wantedSource : nil
+        if same { source = nil; wantedSource = nil }
+        lock.unlock()
+        picture?.close()
+        waiting?.close()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            // The bus THIS run used, whatever has happened since: a Command B
+            // straight after the failure has already made a new one.
+            self.group?.removeAirBus(used)
+            if self.bus === used { self.bus = nil }
         }
     }
 }

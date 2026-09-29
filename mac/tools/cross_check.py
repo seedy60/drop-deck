@@ -86,6 +86,12 @@ SOURCES = {
     "cuefile": ["CueFile.swift"],
     "cuesheet": ["Constants.swift", "KeyMap.swift", "Colours.swift",
                  "CueSheet.swift"],
+    # Check my stream key: the address rules, the accept and give up rules and
+    # every sentence, against dropdeck/rtmpcheck.py and the verdict and
+    # question methods lifted out of dropdeck/dialogs.py.
+    "keycheck": ["Constants.swift", "KeyMap.swift", "Colours.swift",
+                 "Secrets.swift", "StreamServers.swift", "FLV.swift",
+                 "RTMP.swift", "StreamTruth.swift", "StreamKeyCheck.swift"],
     "shotcheck": ["Constants.swift", "KeyMap.swift", "Colours.swift",
                   "Secrets.swift", "Overlay.swift", "Picture.swift",
                   "Camera.swift", "Screen.swift", "Permissions.swift",
@@ -100,6 +106,7 @@ SOURCES = {
                    "M3U.swift", "Speech.swift", "InputUnit.swift", "CueFile.swift",
                    "MicInput.swift", "PlaylistPlayer.swift", "Recorder.swift",
                    "SoundButton.swift", "GlobalHotkeys.swift", "Feedback.swift",
+                   "StreamTruth.swift",
                    "AppUpdate.swift", "StreamServers.swift", "Preflight.swift",
                    "Health.swift", "StreamHelp.swift", "Overlay.swift",
                    "Picture.swift", "Camera.swift", "Screen.swift",
@@ -282,6 +289,7 @@ FRAMEWORKS = {
     "preflight": ["AppKit", "Carbon"],
     "streamhelp": ["AppKit", "Carbon"],
     "secrets": ["AppKit", "Carbon", "Security"],
+    "keycheck": ["AppKit", "Carbon", "Security", "Network"],
     "overlay": ["AppKit", "Carbon", "CoreText", "CoreGraphics"],
     "framing": ["AppKit", "Carbon", "Vision", "CoreVideo"],
     "shotcheck": ["AppKit", "Carbon", "Security", "CoreText", "CoreGraphics",

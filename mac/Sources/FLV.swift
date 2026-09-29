@@ -25,6 +25,9 @@ enum AMF0 {
         case object([(String, Value)])
         case null
         case ecmaArray([(String, Value)])
+        /// A strict array. Nothing here sends one; a server may, and a reader
+        /// that stops at a type it does not know loses every value after it.
+        case strictArray([Value])
     }
 
     static func encode(_ value: Value) -> Data {
@@ -56,6 +59,10 @@ enum AMF0 {
                 out.append(encode(item))
             }
             out.append(contentsOf: [0x00, 0x00, 0x09])
+        case .strictArray(let items):
+            out.append(0x0a)
+            out.append(contentsOf: withUnsafeBytes(of: UInt32(items.count).bigEndian) { Array($0) })
+            for item in items { out.append(encode(item)) }
         }
         return out
     }
@@ -119,6 +126,38 @@ enum AMF0 {
             return (.object(pairs), i)
         case 0x05, 0x06:
             return (.null, i)
+        // **The three the reader used to stop at** (M10 in the 3.8.4 port).
+        // A server that put a date or a strict array ahead of its status
+        // object had everything after it thrown away, including the `code`
+        // and the `description` the whole answer is in. Read the way
+        // `dropdeck/rtmpcheck.py` reads them.
+        case 0x0a:
+            guard d.distance(from: i, to: d.endIndex) >= 4 else { return nil }
+            var count = 0
+            for _ in 0..<4 { count = (count << 8) | Int(d[i]); i = d.index(after: i) }
+            // The count is the far end's to choose; the loop is bounded by
+            // the bytes that really arrived as well as by this.
+            var items: [Value] = []
+            for _ in 0..<min(count, 1000) {
+                guard let (value, next) = readOne(d, i) else { return nil }
+                items.append(value)
+                i = next
+            }
+            return (.strictArray(items), i)
+        case 0x0b:
+            // A date: eight bytes of milliseconds and two of time zone.
+            guard d.distance(from: i, to: d.endIndex) >= 10 else { return nil }
+            var raw: UInt64 = 0
+            for _ in 0..<8 { raw = (raw << 8) | UInt64(d[i]); i = d.index(after: i) }
+            return (.number(Double(bitPattern: raw)), d.index(i, offsetBy: 2))
+        case 0x0c:
+            // A long string, with a four byte length.
+            guard d.distance(from: i, to: d.endIndex) >= 4 else { return nil }
+            var length = 0
+            for _ in 0..<4 { length = (length << 8) | Int(d[i]); i = d.index(after: i) }
+            guard d.distance(from: i, to: d.endIndex) >= length else { return nil }
+            let end = d.index(i, offsetBy: length)
+            return (.string(String(decoding: d[i..<end], as: UTF8.self)), end)
         default:
             return nil
         }
@@ -144,6 +183,21 @@ enum AMF0 {
                     if case .string(let s) = item { return s }
                 }
             }
+        }
+        return nil
+    }
+
+    /// One string field out of the status object a server answered with:
+    /// the first object carrying a `code` or a `level`, whatever position it
+    /// came in. `description` is where a platform puts its own words.
+    static func field(_ name: String, in values: [Value]) -> String? {
+        for value in values {
+            guard case .object(let pairs) = value,
+                  pairs.contains(where: { $0.0 == "code" || $0.0 == "level" }) else { continue }
+            for (key, item) in pairs where key == name {
+                if case .string(let s) = item { return s }
+            }
+            return nil
         }
         return nil
     }
