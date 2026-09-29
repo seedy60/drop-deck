@@ -42,6 +42,7 @@ extension SelfTest {
         runKeyCheckChecks()
         testFreezeSubjects()
         testSavedSetups()
+        runPictureChecks()
     }
 
     // -------------------------------------------------------------- colours ---

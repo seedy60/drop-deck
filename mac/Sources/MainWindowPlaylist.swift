@@ -56,6 +56,9 @@ extension MainWindow: PlaylistViewDelegate {
             // The track list beside any recording, and the cue sheet window if
             // one is open. Pads are deliberately not in a track list.
             self.trackWentOut(track)
+            // The card and the words on top follow the track, on the air and
+            // in a picture recording alike.
+            self.pictureFollowsTrack()
         }
         player.onStopped = { [weak self] in
             guard let self else { return }

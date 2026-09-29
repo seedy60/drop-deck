@@ -105,7 +105,7 @@ enum Screens {
 }
 
 /// The desktop, captured on ScreenCaptureKit's own queue.
-final class ScreenSource: NSObject, PictureSource, SCStreamOutput {
+final class ScreenSource: NSObject, PictureSource, SCStreamOutput, SCStreamDelegate {
 
     let kind = C.pictureScreen
     let which: String
@@ -127,11 +127,19 @@ final class ScreenSource: NSObject, PictureSource, SCStreamOutput {
     private var scaled: CVPixelBuffer?
     private var scaledKey: String?
     private(set) var error = ""
-    private(set) var framesRead = 0
+    private var frameCount = 0
     private(set) var width = 0
     private(set) var height = 0
     private let ready = DispatchSemaphore(value: 0)
     private var signalled = false
+    /// A start is under way, so a retry arriving at the same moment does not
+    /// ask ScreenCaptureKit twice.
+    private var opening = false
+
+    /// How many real pictures have arrived. Nought means still starting.
+    var framesRead: Int? { lock.lock(); defer { lock.unlock() }; return frameCount }
+    /// Whether a capture is held. For the checks, which never start one.
+    var holdsCapture: Bool { lock.lock(); defer { lock.unlock() }; return stream != nil }
     /// How many of the first frames were entirely blank. See `looksBlank`.
     private var blankRun = 0
     private var checkedBlank = false
@@ -172,7 +180,8 @@ final class ScreenSource: NSObject, PictureSource, SCStreamOutput {
 
     func start() {
         lock.lock()
-        if stream != nil { lock.unlock(); return }
+        if stream != nil || opening { lock.unlock(); return }
+        opening = true
         lock.unlock()
         // The same fault as the camera, and worse, because there is no
         // "never asked" to read for the screen: an app that has never asked
@@ -190,10 +199,58 @@ final class ScreenSource: NSObject, PictureSource, SCStreamOutput {
             }
             if waiting.wait(timeout: .now() + 120) == .timedOut || !granted {
                 setError(said.isEmpty ? Screens.notAllowed : said)
+                lock.lock(); opening = false; lock.unlock()
                 return
             }
         }
-        Task { await open() }
+        Task {
+            await open()
+            self.doneOpening()
+        }
+    }
+
+    private func doneOpening() {
+        lock.lock(); opening = false; lock.unlock()
+    }
+
+    /// The size to ask ScreenCaptureKit for: the display fitted inside the
+    /// frame, keeping its shape (W381-30).
+    ///
+    /// It used to capture at the display's own size and the CPU then scaled
+    /// every frame down on the thread that also carries the audio. The
+    /// window server scales for nothing, and on a 16 by 9 display the picture
+    /// then arrives exactly the size of the frame, which is the letterbox's
+    /// fast path. Even numbers, because the encoder wants them.
+    static func captureSize(displayWidth: Int, displayHeight: Int,
+                            wantWidth: Int, wantHeight: Int) -> (width: Int, height: Int) {
+        guard displayWidth > 0, displayHeight > 0, wantWidth > 0, wantHeight > 0 else {
+            return (max(2, wantWidth), max(2, wantHeight))
+        }
+        let scale = min(Double(wantWidth) / Double(displayWidth),
+                        Double(wantHeight) / Double(displayHeight))
+        func even(_ v: Double) -> Int { max(2, Int(v.rounded()) & ~1) }
+        return (even(Double(displayWidth) * scale), even(Double(displayHeight) * scale))
+    }
+
+    /// ScreenCaptureKit stopped the capture: the display went away, the
+    /// permission was withdrawn, or the system ended it. Let it go, so the
+    /// fallback's retry can start a new one (W381-32). It used to be created
+    /// with no delegate at all, so nobody heard it stop.
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        lost(explain(error))
+    }
+
+    /// The capture has gone. Safe on a source that never started.
+    func lost(_ why: String) {
+        lock.lock()
+        let dead = stream
+        stream = nil
+        latest = nil
+        scaled = nil
+        scaledKey = nil
+        error = why.isEmpty ? "the screen stopped being captured" : why
+        lock.unlock()
+        if let dead { Task { try? await dead.stopCapture() } }
     }
 
     private func open() async {
@@ -215,8 +272,12 @@ final class ScreenSource: NSObject, PictureSource, SCStreamOutput {
                                          excludingApplications: mine,
                                          exceptingWindows: [])
             let config = SCStreamConfiguration()
-            config.width = display.width
-            config.height = display.height
+            let size = ScreenSource.captureSize(displayWidth: display.width,
+                                                displayHeight: display.height,
+                                                wantWidth: wantWidth,
+                                                wantHeight: wantHeight)
+            config.width = size.width
+            config.height = size.height
             config.pixelFormat = kCVPixelFormatType_32BGRA
             config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(wantFPS))
             // One frame in hand. The newest is the only one worth having and
@@ -225,7 +286,7 @@ final class ScreenSource: NSObject, PictureSource, SCStreamOutput {
             config.showsCursor = true
             config.scalesToFit = true
 
-            let made = SCStream(filter: filter, configuration: config, delegate: nil)
+            let made = SCStream(filter: filter, configuration: config, delegate: self)
             try made.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
             try await made.startCapture()
             keep(made)
@@ -347,7 +408,7 @@ final class ScreenSource: NSObject, PictureSource, SCStreamOutput {
         latest = buffer
         latestAt = now()
         heartbeatAt = latestAt
-        framesRead += 1
+        frameCount += 1
         width = CVPixelBufferGetWidth(buffer)
         height = CVPixelBufferGetHeight(buffer)
         if !error.isEmpty && error != Screens.notAllowed { error = "" }
@@ -357,9 +418,18 @@ final class ScreenSource: NSObject, PictureSource, SCStreamOutput {
         if first { ready.signal() }
     }
 
+    /// Every waiter is answered, not only the first. See CameraSource.
     func waitReady(timeout: Double = C.screenOpenTimeout) -> Bool {
-        if !error.isEmpty { return false }
-        return ready.wait(timeout: .now() + timeout) == .success
+        lock.lock()
+        let answered = frameCount > 0, failed = !error.isEmpty
+        lock.unlock()
+        if answered { return true }
+        if failed { return false }
+        if ready.wait(timeout: .now() + timeout) == .success {
+            ready.signal()
+        }
+        lock.lock(); defer { lock.unlock() }
+        return frameCount > 0
     }
 
     func live() -> Bool {
@@ -403,7 +473,7 @@ final class ScreenSource: NSObject, PictureSource, SCStreamOutput {
     func describe() -> String {
         lock.lock(); defer { lock.unlock() }
         if !error.isEmpty { return "a screen that could not be captured" }
-        if framesRead == 0 { return "the screen, still starting" }
+        if frameCount == 0 { return "the screen, still starting" }
         for entry in Screens.all() where entry.value == which {
             return "\(entry.label.lowercased()) at \(width) by \(height)"
         }
@@ -435,8 +505,22 @@ final class SplitSource: PictureSource {
     let screen: ScreenSource
     let camera: CameraSource
     private let edge: RGB
-    private let corner: String
+    private let cornerLock = NSLock()
+    private var cornerNow: String
     private(set) var showingCamera = false
+
+    /// Which corner the camera is in. Read on every frame, so moving it needs
+    /// no rebuild at all (W381-09): the corner used to be a constant, so every
+    /// arrow in the corner popup closed and reopened the camera, and waited
+    /// for it on the main thread.
+    var corner: String {
+        get { cornerLock.lock(); defer { cornerLock.unlock() }; return cornerNow }
+        set {
+            guard C.splitCorners.contains(newValue) else { return }
+            cornerLock.lock(); cornerNow = newValue; cornerLock.unlock()
+        }
+    }
+    var framesRead: Int? { screen.framesRead }
 
     /// The composite is mostly desktop: the camera is a quarter of the width
     /// in one corner, which is about a sixteenth of the picture. So even a
@@ -451,7 +535,7 @@ final class SplitSource: PictureSource {
         self.screen = screen
         self.camera = camera
         self.edge = edge
-        self.corner = C.splitCorners.contains(corner) ? corner : C.splitCorner
+        self.cornerNow = C.splitCorners.contains(corner) ? corner : C.splitCorner
     }
 
     func start() {
@@ -476,6 +560,7 @@ final class SplitSource: PictureSource {
         }
         showingCamera = true
 
+        let corner = self.corner
         let marginX = Int((Double(width) * C.splitInsetMargin).rounded())
         let marginY = Int((Double(height) * C.splitInsetMargin).rounded())
         // The margin is kept on whichever edges the box is against, so the

@@ -807,6 +807,16 @@ enum C {
     /// within a song, rare enough that a dead one is not hammered.
     static let pictureRetrySeconds = 5.0
 
+    /// How long a picture source may be STARTING before its silence counts as
+    /// a failure (W381-31). A camera is about six tenths of a second to its
+    /// first frame and a screen one compositor tick, so the first frames asked
+    /// of either are legitimately nothing. Treating that as a failure put the
+    /// card up, latched it for `pictureRetrySeconds` and announced that the
+    /// picture had stopped, about a source that was about to work. A source
+    /// that really cannot open says why and is failed at once, so this only
+    /// ever catches one that goes quiet without saying why. Windows' number.
+    static let pictureStartSeconds = 3.0
+
     // ------------------------------- knowing what the camera can see ---
     //
     // Mirrors dropdeck/constants.py. Windows detects faces with a YuNet model
@@ -1060,6 +1070,33 @@ enum C {
     /// stamping against audio still waiting in the bus removes another 20 to 30
     /// ms of the error. Capped so it can never run away.
     static let recordStampLeadFrames = 4
+
+    /// Frames of stamp lead that pay for `FrameTap`'s own depth. The tap hands
+    /// over the OLDEST of the pictures waiting, which is what stops frames
+    /// being lost, so the picture encoded can be up to a frame older than the
+    /// newest capture. Windows swept this on 12 September 2026 and found the
+    /// sign is the opposite of what the name suggests: more lead puts the
+    /// content LATER. **Swept here too, not copied**, and the Mac's answer is
+    /// not Windows' -1. Measured 29 September 2026 with `--check-record-frames`
+    /// at a depth of two, which reads each second's picture back out of the
+    /// decoded file against a tone burst in the decoded sound, thirty seconds
+    /// a run at 1280 by 720, mean offset of the picture against its sound:
+    ///
+    ///     lead -2   about -67 ms (median, one run)
+    ///     lead -1   -39 to -43 ms, five runs
+    ///     lead  0   -6 to -19 ms, five runs
+    ///     lead +1   about +33 ms (median, one run), and more frames lost
+    ///
+    /// The one slot tap it replaced sat at -35 ms. So nought: the recorder here
+    /// already stamps against the sound still waiting in the bus, which is
+    /// where Windows' extra frame went. If `FrameTap.depth` changes, sweep it
+    /// again.
+    static let recordTapLeadFrames = 0
+
+    /// How much of a picture recording may be repeated frames before it is
+    /// worth saying the file is close to a still. Not a fault: a card IS a
+    /// still. Said only when somebody would be surprised. Windows' number.
+    static let recordStillShare = 0.98
 
     /// Headroom before the AAC encoder, in decibels. The soft clip ceilings at
     /// exactly 0 dBFS with no headroom at all, which is right for the speakers

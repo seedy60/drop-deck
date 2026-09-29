@@ -141,58 +141,79 @@ extension MainWindow {
 
     // ---------------------------------------------------------- the keys ---
 
-    /// Refuse a picture window when Command B is pointed at the radio station.
-    ///
-    /// **A picture nobody will ever send is worse than no window**, because
-    /// it answers confidently. The same silent-wrong-answer class as the 3.5.1
-    /// fault, where the shot check described a card the user had not chosen.
-    private func videoIsWhereItGoes() -> Bool {
-        if board.liveTo == C.liveToVideo { return true }
-        speaker.announceAnswer("Command B is set to go to your radio station, which "
-                             + "sends no picture. Video streaming is in Preferences")
-        return false
-    }
+    // Nothing on the picture side is gated on where Command+B is pointed
+    // (W381-06). Since 3.7.0 a recording carries a picture, and a presenter set
+    // up for a radio station could not choose the picture going into their own
+    // file: Option+Shift+V and Option+Shift+T refused, and Command+Shift+V
+    // answered "Nothing" while a picture was being written to disk.
 
+    /// Option+Shift+V. What the picture is, whatever Command+B is pointed at.
     func showVideoSource() {
-        guard videoIsWhereItGoes() else { return }
         let panel = VideoSourcePanel(
-            board: board, speaker: speaker, live: videoStreamer.isOn,
-            apply: { [weak self] kind in
-                guard let self else { return "" }
-                let was = self.board.picture
-                self.board.picture = kind
-                self.board.dirty = true
-                guard self.videoStreamer.isOn else { return "" }
-                let trouble = self.videoStreamer.setPicture(self.pictureSettings())
-                if !trouble.isEmpty {
-                    // The picture stays where it was, because a chosen source
-                    // that did not open is not the one going out.
-                    self.board.picture = was
-                    _ = self.videoStreamer.setPicture(self.pictureSettings())
-                }
-                return trouble
+            board: board, speaker: speaker, live: pictureLive(),
+            using: { [weak self] in
+                (self?.showingPicture ?? false, self?.videoRecorder.isRecording ?? false)
             },
-            applyCorner: { [weak self] _ in
-                guard let self, self.videoStreamer.isOn,
-                      self.board.picture == C.pictureSplit else { return }
-                self.videoStreamer.setPicture(self.pictureSettings())
+            apply: { [weak self] kind in self?.setPicture(kind) ?? "" },
+            applyCorner: { [weak self] corner in
+                guard let self, self.board.picture == C.pictureSplit,
+                      self.pictureFeed.held else { return }
+                // MOVED ON THE LIVE SOURCE, no rebuild (W381-09). It used to
+                // rebuild the whole picture and wait up to five seconds for the
+                // camera on the main thread, for every arrow in the popup.
+                if !self.pictureFeed.setCorner(corner) { self.pictureFeed.rebuild() }
             })
         panel.run(over: window)
     }
 
+    /// Change the picture, for the stream and a recording at once (W381-04).
+    ///
+    /// Returns the sentence to say now, or "" when the answer is said once the
+    /// new picture has opened: said OFF THE RESULT, because a camera that will
+    /// not open comes back as the card, and "Now showing a camera" to somebody
+    /// looking at a card is the class of fault this release is about.
+    ///
+    /// **The choice is kept either way.** The Mac used to put the board back
+    /// to the old picture when the new one did not open; Windows keeps what
+    /// was asked for and says a card is standing in, which is right: the
+    /// camera being unplugged for a moment is not a reason to forget it was
+    /// chosen, and the fallback's retry brings it back by itself.
+    func setPicture(_ kind: String) -> String {
+        board.picture = kind
+        board.dirty = true
+        let label = (C.pictureLabels[kind] ?? kind).lowercased()
+        let feed = pictureFeed
+        if feed.held { feed.rebuild() }
+        guard pictureLive() else { return MainWindow.nextTimeSentence(label) }
+        let showing = showingPicture, recording = videoRecorder.isRecording
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            _ = feed.waitReady(timeout: C.cameraOpenTimeout)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                feed.setTitle(self.nowPlayingTitle)
+                let fell = feed.fallenBack || !feed.reason.isEmpty
+                    || (!feed.kind.isEmpty && feed.kind != kind)
+                let said = fell
+                    ? "Asked for \(label), and a card is showing instead"
+                      + (feed.reason.isEmpty ? "" : ": \(feed.reason)")
+                    : "\(MainWindow.pictureVerb(showing: showing, recording: recording)) \(label)"
+                self.speaker.announceState(said)
+                self.updateStatusLine()
+            }
+        }
+        return ""
+    }
+
+    /// Option+Shift+T. Words on the picture, wherever the picture is going.
     func showScreenText() {
-        guard videoIsWhereItGoes() else { return }
         let panel = ScreenTextPanel(
-            board: board, speaker: speaker, live: videoStreamer.isOn, window: window,
+            board: board, speaker: speaker, live: pictureLive(), window: window,
             ask: { [weak self] title, message, value, fieldLabel in
                 self?.ask(title: title, message: message, value: value,
                           okTitle: "OK", fieldLabel: fieldLabel)
             },
             nowPlaying: { [weak self] in self?.nowPlayingTitle ?? "" },
-            apply: { [weak self] in
-                guard let self else { return }
-                self.videoStreamer.setOverlay(self.overlaySettings())
-            })
+            apply: { [weak self] in self?.refreshPictureWords() })
         panel.run(over: window)
     }
 
@@ -202,10 +223,11 @@ extension MainWindow {
             sample: { [weak self] in self?.brandSample() },
             apply: { [weak self] in
                 guard let self else { return }
-                self.videoStreamer.setOverlay(self.overlaySettings())
-                if self.videoStreamer.isOn {
-                    self.videoStreamer.setPicture(self.pictureSettings())
-                }
+                self.refreshPictureWords()
+                // Whatever is holding the picture, the stream or a recording
+                // or both, gets the new colours (W381-21). It used to reach
+                // the stream alone, and only while it was on.
+                if self.pictureFeed.held { self.pictureFeed.rebuild() }
             })
         panel.run(over: window)
     }
@@ -213,7 +235,8 @@ extension MainWindow {
     /// A real frame of the brand, with the overlay on it.
     ///
     /// Not a list of colour names: a model cannot judge what three names look
-    /// like together any better than the person asking can.
+    /// like together any better than the person asking can. A card only, so
+    /// it opens nothing.
     func brandSample() -> CVPixelBuffer? {
         var settings = pictureSettings()
         settings.picture = C.pictureCard
@@ -227,34 +250,43 @@ extension MainWindow {
                                 height: board.videoHeight)
     }
 
-    /// The picture going out, or the one that would go out.
+    /// The picture going out or being recorded, or the one that would be.
     ///
-    /// **Checking after you are live is not checking**, so this builds the
-    /// picture, looks at it and puts it away again when nothing is on the air.
-    /// Never on the main queue: opening a camera blocks.
+    /// **Through the one shared feed** (W381-40). Whatever already holds the
+    /// picture is looked through rather than a second one opened; when nothing
+    /// does, a hold is taken for the look and let go again, and it is a
+    /// RELEASE rather than a close, so a stream or a recording that took hold
+    /// meanwhile keeps the device. Never on the main queue: it waits for the
+    /// picture.
     func previewPicture() -> CVPixelBuffer? {
-        if videoStreamer.isOn, let frame = videoStreamer.currentFrame() { return frame }
-        let source = Picture.build(pictureSettings())
-        source.start()
-        // Closed whatever happens: a camera left open holds the device and
-        // its light stays on.
-        defer { source.close() }
-        _ = source.waitReady(timeout: C.cameraOpenTimeout)
-        let frame = source.frame(width: board.videoWidth, height: board.videoHeight)
+        let feed = pictureFeed
+        let width = board.videoWidth, height = board.videoHeight
         let overlay = Overlay(settings: overlaySettings())
         overlay.setTitle(nowPlayingTitle)
-        return frame.map {
-            Pixels.composite($0, overlay, width: board.videoWidth,
-                             height: board.videoHeight)
+        var taken = false
+        if !feed.running {
+            feed.acquire(PictureFeed.forPreview)
+            taken = true
+            _ = feed.waitReady(timeout: C.cameraOpenTimeout)
+        }
+        defer { if taken { feed.release(PictureFeed.forPreview) } }
+        return feed.frame(width: width, height: height).map {
+            Pixels.composite($0, overlay, width: width, height: height)
         }
     }
 
     func showShotCheck() {
+        // Made here, on the main thread, before the panel looks through it
+        // from another.
+        _ = pictureFeed
         // The kind decides whether consent is asked for, so it is read from
         // what the picture really is rather than passed around.
         let kind = C.pictureNeedsScreen.contains(board.picture) ? "screen" : "camera"
         let panel = ShotCheckPanel(board: board, speaker: speaker, window: window,
                                    kind: kind,
+                                   where: MainWindow.shotWhere(
+                                       showing: showingPicture,
+                                       recording: videoRecorder.isRecording),
                                    grab: { [weak self] in self?.previewPicture() })
         panel.run(over: window)
     }
@@ -262,9 +294,22 @@ extension MainWindow {
     /// What the camera can see. Answers at every talkativeness setting,
     /// including off: a switch that silences the announcements must not
     /// silence the answer to a direct question.
+    ///
+    /// **Through the shared feed** (W381-41), never a camera of its own. A
+    /// second capture of a device the stream or a recording holds is the two
+    /// owner case this whole change exists to remove.
     func sayWhatTheCameraSees() {
+        guard C.pictureNeedsCamera.contains(board.picture) else {
+            speaker.announceAnswer("Your picture is not set to a camera. Picture settings "
+                                 + "are in Preferences, or press Option+Shift+V")
+            return
+        }
         if videoStreamer.isOn {
             speaker.announceAnswer(videoStreamer.framer.describe())
+            return
+        }
+        if let pump = recordPump, pump.isRunning {
+            speaker.announceAnswer(pump.framer.describe())
             return
         }
         guard !board.camera.isEmpty else {
@@ -272,20 +317,21 @@ extension MainWindow {
             return
         }
         speaker.announce("Looking through the camera.")
+        let feed = pictureFeed
+        let level = board.framingLevel
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-            let camera = CameraSource(device: self.board.camera)
-            camera.start()
-            defer { camera.close() }
-            guard camera.waitReady(timeout: C.cameraOpenTimeout),
-                  let frame = camera.latestFrame() else {
-                let why = camera.error.isEmpty ? "The camera did not answer" : camera.error
-                DispatchQueue.main.async { self.speaker.announceAnswer(why) }
+            let held = feed.held
+            if !held { feed.acquire(PictureFeed.forPreview) }
+            defer { if !held { feed.release(PictureFeed.forPreview) } }
+            _ = feed.waitReady(timeout: C.cameraOpenTimeout)
+            guard let frame = feed.latest() else {
+                let why = feed.reason.isEmpty ? "The camera did not answer" : feed.reason
+                DispatchQueue.main.async { self?.speaker.announceAnswer(why) }
                 return
             }
-            let framer = Framer(level: self.board.framingLevel)
+            let framer = Framer(level: level)
             let reading = framer.measure(frame)
-            DispatchQueue.main.async { self.speaker.announceAnswer(reading.sentence()) }
+            DispatchQueue.main.async { self?.speaker.announceAnswer(reading.sentence()) }
         }
     }
 
@@ -297,16 +343,10 @@ extension MainWindow {
     /// a stream what is currently in it.
     func sayWhatIsOnScreen() {
         var parts: [String] = []
-        if videoStreamer.isOn {
-            parts.append("On air, showing \(videoStreamer.describePicture())")
-        } else if board.liveTo != C.liveToVideo {
-            speaker.announceAnswer("Nothing. Command B is set to go to your radio "
-                                 + "station, which sends no picture")
-            return
-        } else {
-            let label = (C.pictureLabels[board.picture] ?? board.picture).lowercased()
-            parts.append("\(label), once you go live")
-        }
+        parts.append(MainWindow.screenHead(
+            live: pictureLive(), showing: showingPicture,
+            recording: videoRecorder.isRecording, described: pictureFeed.describe(),
+            chosen: chosenPictureLabel))
         let overlay = Overlay(settings: overlaySettings())
         overlay.setTitle(nowPlayingTitle)
         parts.append("On top of it: \(overlay.describe())")

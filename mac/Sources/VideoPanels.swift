@@ -74,7 +74,12 @@ final class ActionTable: NSTableView {
 
 // ------------------------------------------------------------ video source ---
 
-/// What the stream is showing. Option+Shift+V.
+/// The picture, for a stream and a recording alike. Option+Shift+V.
+///
+/// Called "Picture" and not "Video source" (W381-07): it sets the picture for
+/// a stream, a recording, the shot check and the framing watcher, and "video"
+/// read as "streaming" to exactly the presenter who most needed it, a radio
+/// presenter recording video.
 ///
 /// A switcher, not a settings page. There is no OK, because a list you have to
 /// arrow through and then Tab out of to confirm is not something anybody uses
@@ -84,7 +89,10 @@ final class VideoSourcePanel: NSObject, NSTableViewDataSource, NSTableViewDelega
     private let board: Board
     private let speaker: Speaker
     private let live: Bool
-    /// Told to put one on the air. Answers with what went wrong, or "".
+    /// What is using the picture right now: the air, a recording.
+    private let using: () -> (showing: Bool, recording: Bool)
+    /// Told to change the picture. Answers with the sentence to say now, or ""
+    /// when the answer comes once the new picture has opened.
     private let apply: (String) -> String
     private let applyCorner: (String) -> Void
 
@@ -93,11 +101,13 @@ final class VideoSourcePanel: NSObject, NSTableViewDataSource, NSTableViewDelega
     private var kinds: [String] = []
 
     init(board: Board, speaker: Speaker, live: Bool,
+         using: @escaping () -> (showing: Bool, recording: Bool) = { (false, false) },
          apply: @escaping (String) -> String,
          applyCorner: @escaping (String) -> Void) {
         self.board = board
         self.speaker = speaker
         self.live = live
+        self.using = using
         self.apply = apply
         self.applyCorner = applyCorner
         super.init()
@@ -108,15 +118,44 @@ final class VideoSourcePanel: NSObject, NSTableViewDataSource, NSTableViewDelega
     /// A machine with no camera is not offered a camera, and one whose screen
     /// cannot be captured is not offered its screen. An entry that would
     /// always fail is worse than a shorter list.
-    private func offered() -> [String] {
-        let hasCamera = !Cameras.all().isEmpty
-        let hasScreen = Screens.available()
-        return C.pictureSources.filter { kind in
+    ///
+    /// **Except the one the board is set to, which is ALWAYS offered** (W381-07).
+    /// Leaving it out dropped the row silently, landed the cursor on something
+    /// else, and told nobody that the setting they had was not in the list.
+    static func offered(chosen: String, hasCamera: Bool, hasScreen: Bool) -> [String] {
+        C.pictureSources.filter { kind in
+            if kind == chosen { return true }
             if C.pictureNeedsCamera.contains(kind) && !hasCamera { return false }
             if C.pictureNeedsScreen.contains(kind) && !hasScreen { return false }
             return true
         }
     }
+
+    /// Why a source is not in the list, said rather than left out. A machine
+    /// with no camera had a shorter list and nothing to read about why.
+    static func missingNote(hasCamera: Bool, hasScreen: Bool, screenReason: String) -> String {
+        var said: [String] = []
+        if !hasCamera { said.append("A camera is not offered: macOS can see none") }
+        if !hasScreen {
+            said.append(screenReason.isEmpty
+                        ? "Your screen cannot be captured on this machine" : screenReason)
+        }
+        return said.joined(separator: ". ")
+    }
+
+    /// The "Using" column: what is using this picture right now, in words.
+    /// Empty for every row but the chosen one, so it reads as a state and
+    /// not as a tick, and "chosen" when nothing is using it.
+    static func useLabel(_ kind: String, chosen: String, showing: Bool,
+                         recording: Bool) -> String {
+        guard kind == chosen else { return "" }
+        var uses: [String] = []
+        if showing { uses.append("on air") }
+        if recording { uses.append("recording") }
+        return uses.isEmpty ? "chosen" : uses.joined(separator: " and ")
+    }
+
+    private var missing = ""
 
     /// What a row's third column says.
     ///
@@ -131,24 +170,33 @@ final class VideoSourcePanel: NSObject, NSTableViewDataSource, NSTableViewDelega
     }
 
     func run(over parent: NSWindow?) {
-        kinds = offered()
+        let hasCamera = !Cameras.all().isEmpty
+        let hasScreen = Screens.available()
+        kinds = VideoSourcePanel.offered(chosen: board.picture, hasCamera: hasCamera,
+                                         hasScreen: hasScreen)
+        missing = VideoSourcePanel.missingNote(hasCamera: hasCamera, hasScreen: hasScreen,
+                                               screenReason: Screens.whyUnavailable())
         let alert = NSAlert()
-        alert.messageText = "Video source"
-        alert.informativeText = live
-            ? "Up and down read the choices. Return puts one on the air."
-            : "Up and down read the choices. Return picks one for the next time you go live."
+        alert.messageText = "Picture"
+        // The missing note goes in the text read as the window opens, as well
+        // as the status line Windows puts it on: a status line is somewhere a
+        // VoiceOver user has to go looking.
+        let lead = live
+            ? "Up and down read the choices. Return changes the picture now."
+            : "Up and down read the choices. Return picks one. It applies to a stream "
+              + "and to a recording."
+        alert.informativeText = missing.isEmpty ? lead : "\(lead) \(missing)."
         alert.addButton(withTitle: "Close")
 
         let box = NSView(frame: NSRect(x: 0, y: 0, width: 620, height: 320))
         let scroll = NSScrollView(frame: NSRect(x: 0, y: 70, width: 620, height: 250))
         table = ActionTable(frame: scroll.bounds)
-        // The second column's title is decided ONCE, from whether a picture is
-        // really going out. Windows titles it "On air" always and writes "yes"
-        // off air as well, which tells somebody who cannot look at a preview
-        // that a card is on the air when nothing is.
-        for (id, title, width) in [("name", "Source", 220),
-                                   ("air", live ? "On air" : "Chosen", 70),
-                                   ("what", "What it sends", 320)] {
+        // "Using", not "On air" (W381-07). A recording is not on air, and the
+        // column used to say "yes" against the chosen row whether or not
+        // anything at all was happening.
+        for (id, title, width) in [("name", "Source", 200),
+                                   ("air", "Using", 110),
+                                   ("what", "What it sends", 300)] {
             let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
             column.title = title
             column.width = CGFloat(width)
@@ -156,7 +204,7 @@ final class VideoSourcePanel: NSObject, NSTableViewDataSource, NSTableViewDelega
         }
         table.dataSource = self
         table.delegate = self
-        table.setAccessibilityLabel("Video sources")
+        table.setAccessibilityLabel("Pictures")
         table.onChoose = { [weak self] in self?.choose() }
         scroll.documentView = table
         scroll.hasVerticalScroller = true
@@ -211,20 +259,14 @@ final class VideoSourcePanel: NSObject, NSTableViewDataSource, NSTableViewDelega
         let row = max(0, table.selectedRow)
         guard row < kinds.count else { return }
         let kind = kinds[row]
-        let label = (C.pictureLabels[kind] ?? kind).lowercased()
-        let trouble = apply(kind)
+        let said = apply(kind)
         table.reloadData()
         table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
         describe()
         // The only thing that reports the change: the two rows whose cell just
-        // flipped are not re-read by VoiceOver.
-        if !trouble.isEmpty {
-            speaker.announceState("That did not work: \(trouble). Still showing a card")
-        } else if live {
-            speaker.announceState("Now showing \(label)")
-        } else {
-            speaker.announceState("Next time you go live: \(label)")
-        }
+        // flipped are not re-read by VoiceOver. When the picture is live the
+        // answer comes once the new one has opened, from what really opened.
+        if !said.isEmpty { speaker.announceState(said) }
     }
 
     private func describe() {
@@ -233,13 +275,18 @@ final class VideoSourcePanel: NSObject, NSTableViewDataSource, NSTableViewDelega
         let kind = kinds[row]
         let label = (C.pictureLabels[kind] ?? kind).lowercased()
         let detail = sentence(kind)
+        var whole: String
         if kind == board.picture {
-            doing.stringValue = (live ? "This is the one going out now.  "
-                                      : "This is the one chosen.  ") + detail
+            whole = (live ? "This is the one in use now.  "
+                          : "This is the one chosen.  ") + detail
         } else {
-            doing.stringValue = (live ? "Return puts \(label) on the air.  "
-                                      : "Return picks \(label).  ") + detail
+            whole = (live ? "Return changes the picture to \(label).  "
+                          : "Return picks \(label).  ") + detail
         }
+        doing.stringValue = whole
+        if !missing.isEmpty { whole += " \(missing)" }
+        // Written down and never spoken: VoiceOver is reading the row.
+        speaker.note(whole)
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { kinds.count }
@@ -251,7 +298,10 @@ final class VideoSourcePanel: NSObject, NSTableViewDataSource, NSTableViewDelega
         let text: String
         switch column.identifier.rawValue {
         case "name": text = C.pictureLabels[kind] ?? kind
-        case "air": text = kind == board.picture ? "yes" : "no"
+        case "air":
+            let now = using()
+            text = VideoSourcePanel.useLabel(kind, chosen: board.picture,
+                                             showing: now.showing, recording: now.recording)
         default: text = sentence(kind)
         }
         let cell = NSTextField(labelWithString: text)
@@ -685,6 +735,9 @@ final class ShotCheckPanel: NSObject {
     /// queue: opening a camera is about six tenths of a second.
     private let grab: () -> CVPixelBuffer?
     private let kind: String
+    /// Where the picture is: going out, going into a recording, or would go
+    /// out. See `whatLine`.
+    private let whereTo: String
 
     private var looks: NSTextView!
     private var ask: AskPanel!
@@ -694,24 +747,33 @@ final class ShotCheckPanel: NSObject {
     private static var toldAboutTabbing = false
 
     init(board: Board, speaker: Speaker, window: NSWindow?, kind: String,
+         where whereTo: String = "going out",
          grab: @escaping () -> CVPixelBuffer?) {
         self.board = board
         self.speaker = speaker
         self.window = window
         self.kind = kind
+        self.whereTo = whereTo
         self.grab = grab
         super.init()
+    }
+
+    /// The first line, which is the one somebody reads before deciding to send
+    /// their desktop to a company (W381-39). "Going out" is wrong off air and
+    /// wrong during a recording.
+    static func whatLine(kind: String, who: String, where whereTo: String) -> String {
+        ShotCheck.needsConsent(kind)
+            ? "This describes the picture \(whereTo), which includes your screen. "
+              + "\(who) is asked."
+            : "This describes the picture \(whereTo), camera and anything on top of it. "
+              + "\(who) is asked."
     }
 
     func run(over parent: NSWindow?) {
         let who = ShotCheck.providerNames[board.visionProvider] ?? board.visionProvider
         let alert = NSAlert()
         alert.messageText = "Check my shot"
-        alert.informativeText = ShotCheck.needsConsent(kind)
-            ? "This describes the picture going out, which right now includes your "
-              + "screen. \(who) is asked."
-            : "This describes the picture going out, camera and anything on top of "
-              + "it. \(who) is asked."
+        alert.informativeText = ShotCheckPanel.whatLine(kind: kind, who: who, where: whereTo)
         alert.addButton(withTitle: "Check the shot")
         alert.addButton(withTitle: "Close")
 

@@ -49,6 +49,19 @@ if let at = CommandLine.arguments.firstIndex(of: "--check-send") {
     exit(SendCheck.run(seconds: seconds, deviceUID: uid))
 }
 
+// Every picture into a recording, once, in order, and where it lands against
+// its sound. A synthetic picture and silence, nothing real opened. See
+// RecordFrameCheck.swift.
+if let at = CommandLine.arguments.firstIndex(of: "--check-record-frames") {
+    let rest = Array(CommandLine.arguments.dropFirst(at + 1))
+    func number(_ i: Int) -> Double? { i < rest.count ? Double(rest[i]) : nil }
+    exit(RecordFrameCheck.run(seconds: number(0) ?? 20,
+                              width: Int(number(1) ?? 640),
+                              height: Int(number(2) ?? 360),
+                              depth: Int(number(3) ?? Double(FrameTap.depth)),
+                              lead: Int(number(4) ?? Double(C.recordTapLeadFrames))))
+}
+
 // The F1 list exactly as the app would show it, so the half of it that is
 // derived can be read rather than taken on trust.
 if CommandLine.arguments.contains("--dump-help") {

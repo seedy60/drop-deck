@@ -43,6 +43,10 @@ protocol PictureSource: AnyObject {
     var moving: Bool { get }
     /// Why it could not answer, when it could not.
     var error: String { get }
+    /// How many real frames it has ever produced, or nil when it does not
+    /// count. Only a source that counts can claim the starting grace in
+    /// `FallbackSource`: nought means "not yet", which is not "broken".
+    var framesRead: Int? { get }
 }
 
 extension PictureSource {
@@ -52,6 +56,7 @@ extension PictureSource {
     func setTitle(_ title: String) {}
     var moving: Bool { false }
     var error: String { "" }
+    var framesRead: Int? { nil }
 }
 
 // ---------------------------------------------------------------- buffers ---
@@ -130,10 +135,22 @@ enum Pixels {
     }
 
     /// Fit a picture inside a frame without stretching it out of shape.
+    ///
+    /// **The common case is no resize at all** (W381-30). ScreenCaptureKit is
+    /// asked for the target size and a 720p camera delivers 720p, so most of
+    /// the time the picture is already exactly the frame. Windows measured
+    /// its version doing a full resampling pass anyway, 41 ms against a
+    /// 33 ms frame budget, on the thread carrying the audio. Here the same
+    /// size is a straight copy with no interpolation at all.
     static func letterbox(_ image: CGImage, into ctx: CGContext,
                           width: Int, height: Int) {
         let sw = Double(image.width), sh = Double(image.height)
         guard sw > 0, sh > 0 else { return }
+        if image.width == width && image.height == height {
+            ctx.interpolationQuality = .none
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return
+        }
         let scale = min(Double(width) / sw, Double(height) / sh)
         let w = max(1.0, (sw * scale).rounded())
         let h = max(1.0, (sh * scale).rounded())
@@ -362,7 +379,19 @@ final class FallbackSource: PictureSource {
     private(set) var fallenBack = false
     private(set) var reason = ""
     private var triedAt: Double = 0
+    /// When this was FIRST asked for a picture. See `isStarting`.
+    private var firstAsked: Double = 0
+    /// Whether the card is standing in only while the real one starts. Not
+    /// the same as `fallenBack`: nothing is announced, nothing is latched, and
+    /// the very next frame asks the primary again.
+    private(set) var starting = false
     var now: () -> Double = { ProcessInfo.processInfo.systemUptime }
+    /// How a restart is run. Off the calling thread, because the caller is
+    /// the thread carrying the audio and starting a camera can block. A test
+    /// runs it in place.
+    var restart: (PictureSource) -> Void = { source in
+        DispatchQueue.global(qos: .userInitiated).async { source.start() }
+    }
 
     init(primary: PictureSource, backup: PictureSource,
          onFallback: @escaping (String) -> Void = { _ in }) {
@@ -374,6 +403,7 @@ final class FallbackSource: PictureSource {
     var kind: String { primary.kind }
     var moving: Bool { fallenBack ? backup.moving : primary.moving }
     var error: String { primary.error }
+    var framesRead: Int? { primary.framesRead }
 
     func start() {
         primary.start()
@@ -398,38 +428,105 @@ final class FallbackSource: PictureSource {
     /// camera was fine again. Retrying costs one call every few seconds and
     /// gets the presenter their camera back.
     func frame(width: Int, height: Int) -> CVPixelBuffer? {
+        // One caller at a time. The stream, a recording's own picture thread
+        // and a preview can all ask the ONE shared source (PictureFeed), and
+        // the latch below is state. The announcement is made after letting
+        // go, because it reaches the window.
+        gate.lock()
+        var said: String?
+        let picture = decide(width: width, height: height, said: &said)
+        gate.unlock()
+        if let said { onFallback(said) }
+        return picture
+    }
+
+    private let gate = NSLock()
+
+    private func decide(width: Int, height: Int, said: inout String?) -> CVPixelBuffer? {
         let at = now()
         if fallenBack {
             if (at - triedAt) >= C.pictureRetrySeconds {
                 triedAt = at
+                // START IT AGAIN FIRST (W381-32). A camera unplugged, taken by
+                // another program or reset by its driver leaves its session
+                // torn down, and asking a dead source for another frame
+                // answers nothing for ever, so "is back" was unreachable for
+                // every fault except a stall. Starting a live source is the no
+                // op it always was, and it runs off this thread.
+                restart(primary)
                 if let picture = primary.frame(width: width, height: height) {
                     fallenBack = false
                     reason = ""
-                    onFallback("The camera is back")
+                    said = FallbackSource.backLine(primary.kind)
                     return picture
                 }
             }
         } else {
             if let picture = primary.frame(width: width, height: height) {
+                starting = false
                 return picture
             }
-            fallBack(primary.error.isEmpty ? "the picture stopped" : primary.error)
+            if isStarting(at) {
+                // STAND IN, do not fall back. No latch and no announcement,
+                // and the next frame asks the primary again, so a camera
+                // appears the moment it is ready rather than five seconds
+                // later (W381-31).
+                starting = true
+                return backup.frame(width: width, height: height)
+            }
+            starting = false
+            said = fallBack(primary.error.isEmpty ? "the picture stopped" : primary.error)
         }
         return backup.frame(width: width, height: height)
     }
 
-    private func fallBack(_ why: String) {
-        if fallenBack { return }
+    /// Has the primary simply not produced its first frame yet.
+    ///
+    /// Three ways out, each of which matters. A source that has said what is
+    /// wrong is BROKEN, not starting, so a refused camera is reported at once.
+    /// A source that has ever answered has started, so this can never excuse
+    /// a picture that dies later. And there is a ceiling. A source that does
+    /// not count its frames gets no grace at all, which keeps the old
+    /// behaviour for anything that cannot say.
+    private func isStarting(_ at: Double) -> Bool {
+        guard let read = primary.framesRead else { return false }
+        if read > 0 { return false }
+        if !primary.error.isEmpty { return false }
+        if firstAsked == 0 { firstAsked = at }
+        return (at - firstAsked) < C.pictureStartSeconds
+    }
+
+    /// What is said when the real picture comes back, naming what came back
+    /// (N6). It was "The camera is back" whatever it was, so a screen coming
+    /// back announced a camera the presenter does not have.
+    static func backLine(_ kind: String) -> String {
+        switch kind {
+        case C.pictureCamera: return "The camera is back"
+        case C.pictureScreen, C.pictureSplit: return "The screen is back"
+        default: return "The picture is back"
+        }
+    }
+
+    /// The sentence to say, once, or nil when it has been said already.
+    private func fallBack(_ why: String) -> String? {
+        if fallenBack { return nil }
         fallenBack = true
         reason = why
         triedAt = now()
         // Said once, not once a frame. A camera that has gone is going to keep
         // being gone thirty times a second.
-        onFallback(why)
+        return why
     }
 
     func describe() -> String {
-        fallenBack ? "\(primary.describe()), showing a card instead" : primary.describe()
+        if fallenBack { return "\(primary.describe()), showing a card instead" }
+        if starting {
+            // Said as what it is. The sources say "still starting" themselves,
+            // so this does not repeat it.
+            let said = primary.describe()
+            return said.lowercased().contains("starting") ? said : "\(said), starting up"
+        }
+        return primary.describe()
     }
 
     func setTitle(_ title: String) {
@@ -448,7 +545,7 @@ final class FallbackSource: PictureSource {
 /// What the picture needs out of a board. A value rather than the board, for
 /// the same reason the pre-flight takes one: it can be built and checked with
 /// no camera, no screen and no display.
-struct PictureSettings {
+struct PictureSettings: Equatable {
     var picture = C.pictureCard
     var pictureFile = ""
     var pictureClock = false

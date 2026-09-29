@@ -254,7 +254,10 @@ extension MainWindow {
         let (ok, why) = group.keepingUp()
         if !ok { parts.append("One of your outputs is not keeping up: \(why).") }
         parts.append(contentsOf: routingConflicts())
-        return parts.joined(separator: " ")
+        // And the picture, and what is using it (W381-11). Nowhere else
+        // answered "what picture have I got, and what does it apply to".
+        parts.append(pictureReport())
+        return parts.filter { !$0.isEmpty }.joined(separator: " ")
     }
 
     /// The whole answer to "how is the send doing", as one spoken line.

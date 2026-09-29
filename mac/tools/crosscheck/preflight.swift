@@ -114,4 +114,56 @@ for liveTo in C.liveTo {
         }
     }
 }
+// ------------------------------------------------------ picture notes ---
+for consumer in [Preflighter.forStream, Preflighter.forRecording] {
+    for picture in C.pictureSources {
+        for cam in ["", "MacBook Pro Camera"] {
+            for pf in ["", "/tmp/nope/art.png"] {
+                for titles in [true, false] {
+                    for screenReady in [true, false] {
+                        var s = PreflightSettings()
+                        s.picture = picture; s.camera = cam; s.pictureFile = pf
+                        s.name = "Blindside Radio"
+                        s.videoWidth = 1280; s.videoHeight = 720
+                        var b = PreflightBoard()
+                        b.liveTo = C.liveToAudio; b.videoServer = ""
+                        b.streamMic = true; b.streamTitles = titles
+                        let notes = Preflighter.pictureNotes(
+                            settings: s, board: b, screenReady: screenReady,
+                            screenReason: "", consumer: consumer)
+                        out.append("picnotes|\(consumer)|\(picture)|\(cam)|\(pf)|"
+                                 + "\(py(titles))|\(py(screenReady))|\(notes.count)")
+                        for note in notes {
+                            out.append("  note|\(note.level.rawValue)|\(note.fix)|\(note.text)")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------- note order ---
+for pair in [("facebook", "rtmps://live-api-s.facebook.com:443/rtmp/k"),
+             ("restream", "rtmp://live.restream.io/live")] {
+    for titles in [true, false] {
+        for vb in [400, 2500] {
+            var s = PreflightSettings()
+            s.server = pair.0; s.host = pair.1; s.mount = "/live"
+            s.name = "Blindside Radio"; s.password = "secret"
+            s.format = "mp3"; s.bitrate = 128; s.picture = C.pictureCard
+            s.pictureFile = ""; s.camera = ""
+            s.videoWidth = 1280; s.videoHeight = 720; s.videoFPS = 30
+            s.videoBitrate = vb
+            var b = PreflightBoard()
+            b.liveTo = C.liveToVideo; b.videoServer = pair.0
+            b.streamMic = true; b.streamTitles = titles
+            let pf = Preflighter.check(settings: s, board: b)
+            out.append("order|\(pair.0)|\(py(titles))|\(vb)|\(pf.notes.count)")
+            for note in pf.notes {
+                out.append("  note|\(note.level.rawValue)|\(note.fix)|\(note.text)")
+            }
+        }
+    }
+}
 print(out.joined(separator: "\n"))

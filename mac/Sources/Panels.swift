@@ -469,10 +469,11 @@ enum KeyboardHelp {
           stream, and closing the app finishes the file first so a recording
           always opens.
 
-          Command Shift R takes the same picture that would go out, so it works
-          off air too, and if you are already live it uses the identical frames
-          the stream is sending. The sound is the master clock and the picture
-          is fitted to it.
+          Command Shift R does not need you to be on air, and it takes whatever
+          Option Shift V is set to. It says which picture that is when it
+          starts. If you are already live it takes the identical frames the
+          stream is sending, so one camera serves both. The sound is the master
+          clock and the picture is fitted to it.
 
           Both keys say what is really in the file when they start, including
           anything you can HEAR that is not on the air and therefore not in the
@@ -500,7 +501,9 @@ enum KeyboardHelp {
           Command Shift H               Hear exactly what is being sent
           Command Shift O               Is the send keeping up
           Command Shift W               Where is everything going: your sounds,
-                                        what you hear, and what is being sent
+                                        what you hear, what is being sent, and
+                                        your picture and what is using it, all
+                                        in one go
 
           Point it at a virtual audio cable and set the other program's
           microphone to the other end of the same cable. It sends the whole
@@ -546,9 +549,14 @@ enum KeyboardHelp {
 
           Nothing goes out until you press Command B.
 
-        THE PICTURE, WHEN YOU ARE STREAMING VIDEO
-          Option Shift V                Video source: a card, a picture, your
-                                        camera, your screen, or both
+        THE PICTURE, FOR A STREAM OR A RECORDING
+          Option Shift V                Change the picture: a card, your
+                                        artwork, a camera, your screen, or
+                                        your screen with the camera in the
+                                        corner. It is the same picture for a
+                                        stream and for a recording, and it
+                                        changes while you are on air or
+                                        recording
           Option Shift T                Screen text: your station name, what is
                                         playing, a clock or your own words, in
                                         four named places

@@ -47,6 +47,23 @@ final class MainWindow: NSWindowController, NSWindowDelegate {
     /// and something else owns the socket, the other is a session that owns
     /// its own. Command B goes to one or the other, never both.
     let videoStreamer = VideoStreamer()
+    /// The one picture, for everything that wants one: the stream, a picture
+    /// recording, the shot check and Command+Shift+F. See PictureFeed.swift.
+    /// Made on first use, so a board of WAVs never touches a camera.
+    private(set) lazy var pictureFeed: PictureFeed = makePictureFeed()
+    /// Where a picture recording's frames arrive, while one is running.
+    var recordTap: FrameTap?
+    /// The recording's own picture thread, while the stream is not filling
+    /// the tap. See `syncRecordPicture`.
+    var recordPump: RecordPicturePump?
+    /// The words on top of a recording made off air. ONE object, updated in
+    /// place, so an edit or a new track reaches the file while it records.
+    let recordOverlay = Overlay()
+    /// Command+Shift+R has been pressed and the picture is still opening. A
+    /// flag rather than a disabled control, and a second press is answered.
+    var videoRecordingStarting = false
+    /// The window has been closed down once already.
+    var closedDown = false
     var hotkeys: GlobalHotkeys!
     enum View { case board, playlist }
     private(set) var currentView: View = .board
@@ -389,7 +406,8 @@ final class MainWindow: NSWindowController, NSWindowDelegate {
             parts.append("Mic off")
         }
         parts.append(streamer.state == .off ? "Off air" : streamer.state.spoken.uppercased())
-        if recorder.isRecording { parts.append("RECORDING") }
+        parts += MainWindow.recordingStatus(audio: recorder.isRecording,
+                                            picture: videoRecorder.isRecording)
         // Muted and soloed sources are the two states you can hear the effect
         // of but not the cause of, so the line says them rather than leaving
         // somebody to wonder why a guest has gone quiet.
@@ -862,10 +880,37 @@ final class MainWindow: NSWindowController, NSWindowDelegate {
         }
     }
 
+    /// The status line's recording words. "RECORDING PICTURE" is its own word
+    /// (W381-12): a picture recording running with nothing on the line was a
+    /// camera light on in the room with nothing anywhere saying why.
+    static func recordingStatus(audio: Bool, picture: Bool) -> [String] {
+        var out: [String] = []
+        if audio { out.append("RECORDING") }
+        if picture { out.append("RECORDING PICTURE") }
+        return out
+    }
+
+    /// Closing the app finishes BOTH files first, so a recording always
+    /// opens (N2). F1 has always promised that, and for a picture recording
+    /// it was not true: closing the window left the MP4 without its end, and
+    /// the camera open. Once only, whichever of closing and quitting comes
+    /// first.
+    func closeDownRecordingsAndPicture() {
+        guard !closedDown else { return }
+        closedDown = true
+        if recorder.isRecording { _ = recorder.stop(taps: group.taps) }
+        if videoRecorder.isRecording { finishVideoRecording(quiet: true) }
+        streamer.stop(group: group)
+        videoStreamer.stop(group: group)
+        pictureFeed.close()
+        pictureFeed.settle()
+    }
+
     /// Is anything happening that a board loading underneath would cut off.
     var boardBusy: Bool {
         board.dirty || streamer.isOn || videoStreamer.isOn || recorder.isRecording
-            || videoRecorder.isRecording || sending || mic.isOpen || player.isPlaying
+            || videoRecorder.isRecording || videoRecordingStarting || sending || mic.isOpen
+            || player.isPlaying
             || !group.playingSlots.isEmpty
     }
 
@@ -898,9 +943,7 @@ final class MainWindow: NSWindowController, NSWindowDelegate {
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         saveForClose()
         player.stop(fadeOut: 0.0, quiet: true)
-        // Closing the app finishes the file first, so a recording always opens.
-        if recorder.isRecording { _ = recorder.stop(taps: group.taps) }
-        streamer.stop(group: group)
+        closeDownRecordingsAndPicture()
         sourceGroup.stopAll()
         mic.close()
         hotkeys.unregisterAll()

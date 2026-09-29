@@ -184,27 +184,35 @@ enum Preflighter {
         }
     }
 
+    /// What is going to consume the picture, for the warnings to name. A
+    /// recording is not a stream, and "the stream would show an empty screen"
+    /// said to somebody about to record ninety minutes tells them to check the
+    /// wrong thing.
+    static let forStream = "the stream"
+    static let forRecording = "the recording"
+
     /// Everything that can be wrong with the picture, before it is opened.
     private static func checkPicture(_ settings: PreflightSettings,
                                      _ notes: inout [PreflightNote],
-                                     screenReady: Bool, screenReason: String) {
+                                     screenReady: Bool, screenReason: String,
+                                     consumer: String) {
         let kind = settings.picture
         if kind == C.pictureImage {
             let path = settings.pictureFile
             if path.isEmpty {
                 notes.append(PreflightNote(.warn, "No picture file has been chosen, so "
-                    + "the stream would show an empty screen", C.fixVideo))
+                    + "\(consumer) would show an empty screen", C.fixVideo))
             } else if !FileManager.default.fileExists(atPath: path) {
                 // The expensive one. The image source fills a canvas with the
                 // background colour rather than returning nothing, so the
                 // fallback never fires, nothing is announced, and the whole
                 // broadcast is a dark rectangle that looks deliberate.
                 notes.append(PreflightNote(.warn, "That picture file is not there any "
-                    + "more, so the stream would show an empty screen", C.fixVideo))
+                    + "more, so \(consumer) would show an empty screen", C.fixVideo))
             }
         }
         if C.pictureNeedsCamera.contains(kind) && settings.camera.isEmpty {
-            notes.append(PreflightNote(.warn, "No camera has been chosen, so the stream "
+            notes.append(PreflightNote(.warn, "No camera has been chosen, so \(consumer) "
                 + "would fall back to a card", C.fixVideo))
         }
         if C.pictureNeedsScreen.contains(kind) && !screenReady {
@@ -212,6 +220,29 @@ enum Preflighter {
                 ? "The screen cannot be captured on this machine" : screenReason,
                 C.fixVideo))
         }
+    }
+
+    /// Everything wrong with the picture, for anybody who wants one (W381-15).
+    ///
+    /// Split out of `check` so Command+Shift+R can ask it. The picture half of
+    /// the pre-flight was only reached for a video destination, so a board
+    /// pointed at a radio station got no picture checks at all, which is
+    /// exactly the board that records video.
+    static func pictureNotes(settings: PreflightSettings, board: PreflightBoard,
+                             screenReady: Bool = true, screenReason: String = "",
+                             consumer: String = forStream,
+                             text: TextFitting? = nil) -> [PreflightNote] {
+        var notes: [PreflightNote] = []
+        checkPicture(settings, &notes, screenReady: screenReady,
+                     screenReason: screenReason, consumer: consumer)
+        checkScreenText(settings, board, &notes, text)
+        if settings.picture == C.pictureCard && !board.streamTitles {
+            // The card is the only place a viewer finds out what is playing,
+            // and the switch that freezes it lives on the other page.
+            notes.append(PreflightNote(.warn, "Track titles are turned off, so the "
+                + "card will not say what is playing", C.fixAudio))
+        }
+        return notes
     }
 
     /// Whether anything on top of the picture would be cut off.
@@ -331,22 +362,17 @@ enum Preflighter {
                 + "is nothing to send", C.fixAudio))
         }
         if video {
-            checkPicture(settings, &notes, screenReady: screenReady,
-                         screenReason: screenReason)
-            checkScreenText(settings, board, &notes, text)
+            // The picture's notes first and the bitrate advice after, which is
+            // Windows' order since 3.8.1 (W381-16).
+            notes += pictureNotes(settings: settings, board: board,
+                                  screenReady: screenReady, screenReason: screenReason,
+                                  consumer: forStream, text: text)
             let advice = StreamServers.bitrateAdvice(
                 server: settings.server, width: settings.videoWidth,
                 height: settings.videoHeight, fps: settings.videoFPS,
                 videoKbps: settings.videoBitrate, audioKbps: settings.bitrate)
             if !advice.isEmpty {
                 notes.append(PreflightNote(.warn, advice, C.fixVideo))
-            }
-            if settings.picture == C.pictureCard && !board.streamTitles {
-                // The card is the only place a viewer finds out what is
-                // playing, and the switch that freezes it lives on the other
-                // page.
-                notes.append(PreflightNote(.warn, "Track titles are turned off, so the "
-                    + "card will not say what is playing", C.fixAudio))
             }
         }
         let warning = goingLiveWarning(board)

@@ -104,4 +104,50 @@ for live_to in C.LIVE_TO:
                                         out.append("  note|%s|%s|%s"
                                                    % (note.level, note.fix, note.text))
                                     out.append("  summary|%s" % pf.summary())
+# ------------------------------------------------------ picture notes ---
+# W381-15: the picture half of the pre-flight on its own, for Ctrl+Shift+R as
+# well as the stream, and on a board pointed at a radio station.
+for consumer in (P.FOR_STREAM, P.FOR_RECORDING):
+    for picture in C.PICTURE_SOURCES:
+        for cam in ("", "MacBook Pro Camera"):
+            for pf in ("", "/tmp/nope/art.png"):
+                for titles in (True, False):
+                    for screen_ready in (True, False):
+                        s = {"picture": picture, "camera": cam, "picture_file": pf,
+                             "name": "Blindside Radio", "video_width": 1280,
+                             "video_height": 720}
+                        b = Board(C.LIVE_TO_AUDIO, "", True, titles)
+                        notes = P.picture_notes(s, b, screen_ready=screen_ready,
+                                                screen_reason="",
+                                                consumer=consumer)
+                        out.append("picnotes|%s|%s|%s|%s|%s|%s|%d"
+                                   % (consumer, picture, cam, pf, titles,
+                                      screen_ready, len(notes)))
+                        for note in notes:
+                            out.append("  note|%s|%s|%s"
+                                       % (note.level, note.fix, note.text))
+
+# ---------------------------------------------------------- note order ---
+# W381-16: the grid above never produces the titles note and the bitrate
+# advice together, so the order between them was never exercised. 400 kbps
+# with titles off does. Notes only: the summary line is where_it_goes, which
+# is a separate question.
+# YouTube is left out on purpose: its going live warning is the Windows 3.8.4
+# auto start wording, a separate port, and repeating that difference here
+# would only hide the one this row exists to catch.
+for server, host in (("facebook", "rtmps://live-api-s.facebook.com:443/rtmp/k"),
+                     ("restream", "rtmp://live.restream.io/live")):
+    for titles in (True, False):
+        for vb in (400, 2500):
+            s = {"server": server, "host": host, "mount": "/live",
+                 "name": "Blindside Radio", "password": "secret",
+                 "format": "mp3", "bitrate": 128, "picture": C.PICTURE_CARD,
+                 "picture_file": "", "camera": "",
+                 "video_width": 1280, "video_height": 720, "video_fps": 30,
+                 "video_bitrate": vb}
+            b = Board(C.LIVE_TO_VIDEO, server, True, titles)
+            pf = P.check(s, b)
+            out.append("order|%s|%s|%d|%d" % (server, titles, vb, len(pf.notes)))
+            for note in pf.notes:
+                out.append("  note|%s|%s|%s" % (note.level, note.fix, note.text))
 print("\n".join(out))

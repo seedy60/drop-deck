@@ -65,31 +65,89 @@ import AVFoundation
 import CoreMedia
 import CoreVideo
 
-/// One picture, put down by whoever has it and picked up by the recorder.
+/// Pictures, put down by whoever has them and picked up by the recorder.
 ///
-/// One lock and one slot. Deliberately not a queue: the recorder wants the
-/// NEWEST frame and nothing else, and a queue would let a slow encoder build a
-/// backlog of stale pictures and then play them late.
+/// A short queue, bounded, with a sequence number on every picture. It was one
+/// slot, holding the NEWEST frame, and that is the design Windows measured
+/// losing a quarter of the pictures (W381-26): the producer runs on its own
+/// clock and the recorder on the audio's, so the two beat against each other
+/// and one slot drops whichever frame lands between two looks. `--check-record-
+/// frames` measures it on this Mac; the numbers are in `FrameTap.depth`.
+///
+/// **Bounded on purpose.** A deep queue lets a slow encoder build a backlog of
+/// stale pictures and then play them late, which is what the one slot design
+/// was right to avoid.
 final class FrameTap {
-    private var frame: CVPixelBuffer?
-    private let lock = NSLock()
-    private(set) var puts = 0
 
+    /// How many pictures may wait. See the note on the measurement below.
+    ///
+    /// Measured 29 September 2026 on this Mac with `--check-record-frames`,
+    /// the REAL recorder writing an MP4 and the file decoded back, a synthetic
+    /// picture on its own 30 Hz clock with its number burned into it, thirty
+    /// seconds a run, 1280 by 720 (a fast, unoptimised build):
+    ///
+    ///     one slot, the newest   6.7 to 7.8 per cent never arrived, and about
+    ///                            the same share of the file repeats
+    ///     two, the oldest first  1.2 to 2.4 per cent
+    ///
+    /// Five runs of one slot, six of two. At 640 by 360 the one slot lost 1.4
+    /// to 2.1 per cent in thirty seconds and 10.2 in one twenty second run, so
+    /// the loss moves with the beat between the two clocks and is never
+    /// nothing. Deliberately not deeper: see above.
+    static let depth = 2
+
+    let depth: Int
+    private var frames: [(seq: Int, buffer: CVPixelBuffer)] = []
+    private let lock = NSLock()
+    private var putCount = 0
+    private var droppedCount = 0
+    private var sequence = 0
+
+    init(depth: Int = FrameTap.depth) {
+        self.depth = max(1, depth)
+    }
+
+    /// How many pictures have been put in, ever. Nought at the end of a
+    /// recording means the file is black, and that is said.
+    var puts: Int { lock.lock(); defer { lock.unlock() }; return putCount }
+    /// Pictures pushed out of the queue before the recorder took them.
+    var dropped: Int { lock.lock(); defer { lock.unlock() }; return droppedCount }
+
+    /// Called by whoever is building the picture. Never blocks for long.
     func put(_ buffer: CVPixelBuffer?) {
         guard let buffer else { return }
         lock.lock()
-        frame = buffer
-        puts += 1
+        sequence += 1
+        frames.append((sequence, buffer))
+        putCount += 1
+        while frames.count > depth {
+            frames.removeFirst()
+            droppedCount += 1
+        }
         lock.unlock()
     }
 
-    func latest() -> CVPixelBuffer? {
+    /// The OLDEST picture waiting, and its sequence number, consumed. (0, nil)
+    /// when nothing new has arrived, which is the only thing that counts as a
+    /// repeat: holding the same object as last time is not the question.
+    func take() -> (seq: Int, buffer: CVPixelBuffer?) {
         lock.lock(); defer { lock.unlock() }
-        return frame
+        guard !frames.isEmpty else { return (0, nil) }
+        let first = frames.removeFirst()
+        return (first.seq, first.buffer)
     }
 
+    /// The newest picture, WITHOUT consuming it, for anything that only looks.
+    func latest() -> CVPixelBuffer? {
+        lock.lock(); defer { lock.unlock() }
+        return frames.last?.buffer
+    }
+
+    /// How many are waiting right now.
+    var waiting: Int { lock.lock(); defer { lock.unlock() }; return frames.count }
+
     func clear() {
-        lock.lock(); frame = nil; lock.unlock()
+        lock.lock(); frames.removeAll(); lock.unlock()
     }
 }
 
@@ -132,17 +190,22 @@ final class VideoRecorder {
     private var stopping = false
     private let lock = NSLock()
 
-    /// Where a frame comes from while this is running.
-    ///
-    /// When a video stream is already live this borrows the identical frame the
-    /// stream is sending, which costs almost nothing and, more importantly,
-    /// does not open the camera a second time: a camera is exclusive and the
-    /// second opener gets nothing.
-    private var borrow: (() -> CVPixelBuffer?)?
-    /// And when nothing is live, this recorder owns the picture itself.
-    private var ownSource: PictureSource?
-    private var ownOverlay: Overlay?
+    /// Where the pictures arrive. Filled by the stream while it is on air, so
+    /// the file carries the identical frames going out, and by the window's
+    /// own picture thread otherwise. Either way both read the ONE shared
+    /// picture (PictureFeed.swift), because a camera has one owner. This
+    /// recorder never opens a picture of its own.
+    private(set) var tap: FrameTap?
     private var lastFrame: CVPixelBuffer?
+    /// Frames of stamp lead paid for the tap's own depth. See
+    /// `C.recordTapLeadFrames`; a variable only so `--check-record-frames`
+    /// can sweep it, which is the only honest way to choose it.
+    var tapLead = C.recordTapLeadFrames
+    /// Why the writer stopped by itself, when it did. A recording with this set
+    /// was NOT saved cleanly and must never be reported as though it were.
+    var failure: String?
+    /// Told once, on the main queue, when the writer fails mid recording.
+    var onFailed: ((String) -> Void)?
 
     // ---------------------------------------------------------------- state ---
 
@@ -161,7 +224,7 @@ final class VideoRecorder {
         guard isRecording else { return "Not recording" }
         var said = "Recording picture and sound, "
             + "\((path as NSString?)?.lastPathComponent ?? ""), "
-            + "\(clock(elapsed)), \(Int(Double(bytesWritten) / 1_048_576.0)) MB"
+            + "\(clock(elapsed)), \(String(format: "%.0f", Double(bytesWritten) / 1_048_576.0)) MB"
         if losingAudio > 0 { said += ". It is losing audio" }
         return said
     }
@@ -177,18 +240,19 @@ final class VideoRecorder {
 
     /// Open the file and begin. The path, or nil with `lastError` set.
     ///
-    /// `borrow` is where a frame comes from when a stream is already live.
-    /// `own` is the pair to build and drive when nothing is.
+    /// `tap` is where the pictures arrive. The picture itself is the caller's
+    /// business and is already open and waited for when this is called, so
+    /// the first frame in the file is a picture rather than black.
     @discardableResult
     func start(taps: Taps, rate: Double, width: Int, height: Int, fps: Int,
-               folder: String?,
-               borrow: (() -> CVPixelBuffer?)?,
-               own: (() -> (PictureSource, Overlay))?) -> String? {
+               folder: String?, tap: FrameTap) -> String? {
         guard !isRecording else { return path }
         self.width = max(2, width)
         self.height = max(2, height)
         self.fps = max(1, fps)
-        self.borrow = borrow
+        self.tap = tap
+        failure = nil
+        lastError = nil
 
         let dir = folder ?? Recorder.defaultFolder()
         do {
@@ -206,17 +270,6 @@ final class VideoRecorder {
             close()
             lastError = "Could not start recording. \(error.localizedDescription)"
             return nil
-        }
-
-        // Only opened when nothing is live, and closed again on stop: a camera
-        // left open is a light on in the room and a device no other program can
-        // have.
-        if borrow == nil, let own {
-            let (source, overlay) = own()
-            source.start()
-            _ = source.waitReady(timeout: C.cameraOpenTimeout)
-            ownSource = source
-            ownOverlay = overlay
         }
 
         let bus = AirBus(sampleRate: rate)
@@ -354,9 +407,31 @@ final class VideoRecorder {
         let scratch = UnsafeMutablePointer<Float>.allocate(capacity: chunk * 2)
         defer { scratch.deallocate() }
 
+        var lastSize = ProcessInfo.processInfo.systemUptime
         while true {
             lock.lock(); let finishing = stopping; lock.unlock()
             guard let bus else { break }
+            // **A writer that has failed says so, once, and stops.** A full disk
+            // or a volume that went away used to leave this loop feeding a dead
+            // writer for the rest of the show, and the file was then reported
+            // as saved (N4). Asked every pass: it is one property read.
+            if let w = writer, w.status == .failed {
+                let why = w.error?.localizedDescription ?? "the file could not be written"
+                lock.lock(); failure = why; lock.unlock()
+                let tell = onFailed
+                DispatchQueue.main.async { tell?(why) }
+                break
+            }
+            // What is on the disk, about once a second, so Command+Shift+B says
+            // how big the file really is rather than nought until the end.
+            let now = ProcessInfo.processInfo.systemUptime
+            if now - lastSize >= 1.0, let path {
+                lastSize = now
+                if let size = try? FileManager.default
+                    .attributesOfItem(atPath: path)[.size] as? Int64 {
+                    bytesWritten = size
+                }
+            }
             let ready = bus.available()
             if ready < chunk {
                 if finishing {
@@ -437,8 +512,13 @@ final class VideoRecorder {
         if let bus, bus.sampleRate > 0 {
             waiting = Double(bus.available()) / bus.sampleRate
         }
-        let lead = min(Int(waiting * Double(fps)), C.recordStampLeadFrames)
-        let due = Int(audioSeconds * Double(fps)) + lead
+        // Plus the handover's own depth. `FrameTap.take` hands over the OLDEST
+        // waiting picture, which is what stops frames being lost, and so the
+        // picture encoded can be one frame older than the newest capture.
+        // `tapLead` pays that back, and it was SWEPT, not reasoned: see
+        // `C.recordTapLeadFrames`.
+        let lead = min(Int(waiting * Double(fps)), C.recordStampLeadFrames) + tapLead
+        let due = max(0, Int(audioSeconds * Double(fps)) + lead)
 
         // A cap, so a long stall cannot become a burst of a thousand frames
         // that starves the audio behind it. Anything beyond the cap is a drop,
@@ -471,17 +551,13 @@ final class VideoRecorder {
     }
 
     private func emitOne(_ adaptor: AVAssetWriterInputPixelBufferAdaptor) {
-        var picture: CVPixelBuffer?
-        if let borrow {
-            picture = borrow()
-        } else if let source = ownSource {
-            if let raw = source.frame(width: width, height: height) {
-                picture = ownOverlay.map {
-                    Pixels.composite(raw, $0, width: width, height: height)
-                } ?? raw
-            }
-        }
-        if picture == nil || picture === lastFrame {
+        // TAKE, not latest. Each picture is written once, in order, so the file
+        // carries the motion that was captured rather than every fourth frame
+        // twice and every fourth frame not at all.
+        var picture = tap?.take().buffer
+        if picture == nil {
+            // Genuine starvation: nothing new has arrived, so the last frame is
+            // repeated, which is what keeps the timeline from stalling.
             picture = lastFrame ?? blackFrame()
             repeated += 1
         } else {
@@ -528,12 +604,8 @@ final class VideoRecorder {
         audioInput = nil
         adaptor = nil
         audioFormat = nil
-        ownSource?.close()
-        ownSource = nil
-        ownOverlay = nil
         lastFrame = nil
         black = nil
-        borrow = nil
     }
 
     /// Finish the file. Returns where it is, or nil if it never started.
@@ -555,12 +627,20 @@ final class VideoRecorder {
     }
 
     /// What happened, as a sentence, for the line said when it stops.
+    ///
+    /// **A recording whose writer failed is not "saved"** (N4). It used to be
+    /// reported exactly as a clean one, size and all, because nothing here
+    /// read `lastError`.
     func report() -> String {
+        if let why = failure ?? lastError {
+            return "The picture recording stopped. \(why)"
+                + (why.hasSuffix(".") ? "" : ".")
+        }
         let whole = Int(elapsed)
         let h = whole / 3600, m = (whole % 3600) / 60, s = whole % 60
         let length = h > 0 ? "\(h) hours \(m) minutes" : "\(m) minutes \(s) seconds"
         var said = ["Recording saved as \((path as NSString?)?.lastPathComponent ?? ""), "
-            + "\(length), \(Int(Double(bytesWritten) / 1_048_576.0)) megabytes"]
+            + "\(length), \(VideoRecorder.sizePhrase(bytesWritten))"]
         if losingAudio > 0 {
             said.append("It lost audio \(losingAudio) times, so there are gaps in it")
         }
@@ -568,7 +648,41 @@ final class VideoRecorder {
             said.append("\(droppedPictures) frames of picture were skipped to keep "
                 + "the sound in step")
         }
+        said.append(contentsOf: VideoRecorder.pictureReport(
+            puts: tap?.puts ?? 0, framesSent: framesSent, repeated: repeated))
         if let line = cue?.describe(), !line.isEmpty { said.append(line) }
         return said.joined(separator: ". ") + "."
+    }
+
+    /// A size said the way a person would say it (W381-44).
+    ///
+    /// A short recording is not "0 megabytes". Whole megabytes from ten, one
+    /// decimal from a tenth, kilobytes below that: Windows' three tiers, with
+    /// its rounding, which for `%.0f` is the C library's and matches Python's.
+    static func sizePhrase(_ bytes: Int64) -> String {
+        let size = Double(bytes) / (1024.0 * 1024.0)
+        if size >= 10 { return String(format: "%.0f megabytes", size) }
+        if size >= 0.1 { return String(format: "%.1f megabytes", size) }
+        return String(format: "%.0f kilobytes", Double(bytes) / 1024.0)
+    }
+
+    /// What the PICTURE of the file turned out to be. Numbers, not hope
+    /// (W381-45).
+    ///
+    /// A recording whose tap received nothing at all is a black file, and
+    /// `emitOne` writes black and advances with every count correct. A blind
+    /// presenter cannot see a black rectangle, so this is the only thing that
+    /// will ever tell them.
+    static func pictureReport(puts: Int, framesSent: Int, repeated: Int) -> [String] {
+        if puts == 0 {
+            return ["NO PICTURE ever arrived, so the file is black. "
+                    + "Check your picture with Option+Shift+V"]
+        }
+        guard framesSent > 0, repeated > 0 else { return [] }
+        let share = Double(repeated) / Double(framesSent)
+        guard share >= C.recordStillShare else { return [] }
+        let percent = Int((share * 100).rounded(.toNearestOrEven))
+        return ["The picture repeated for \(percent) per cent of it, so it is close "
+                + "to a still"]
     }
 }

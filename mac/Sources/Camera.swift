@@ -113,11 +113,22 @@ final class CameraSource: NSObject, PictureSource, AVCaptureVideoDataOutputSampl
     private var scaled: CVPixelBuffer?
     private var scaledKey: String?
     private(set) var error = ""
-    private(set) var framesRead = 0
+    private var frameCount = 0
     private(set) var width = 0
     private(set) var height = 0
     private let ready = DispatchSemaphore(value: 0)
     private var signalled = false
+    /// A start is under way, so a retry arriving at the same moment does not
+    /// open the device twice.
+    private var opening = false
+    /// The observers for a session that dies underneath us. See `lost`.
+    private var watchers: [NSObjectProtocol] = []
+
+    /// How many real frames have arrived. Nought means still opening.
+    var framesRead: Int? { lock.lock(); defer { lock.unlock() }; return frameCount }
+    /// Whether a capture session is held. For the checks, which must never
+    /// open a real camera: they drive `lost` and read this.
+    var holdsSession: Bool { lock.lock(); defer { lock.unlock() }; return session != nil }
 
     var moving: Bool { true }
     var now: () -> Double = { ProcessInfo.processInfo.systemUptime }
@@ -133,8 +144,10 @@ final class CameraSource: NSObject, PictureSource, AVCaptureVideoDataOutputSampl
 
     func start() {
         lock.lock()
-        if session != nil { lock.unlock(); return }
+        if session != nil || opening { lock.unlock(); return }
+        opening = true
         lock.unlock()
+        defer { lock.lock(); opening = false; lock.unlock() }
 
         // **ASK, do not just look.** Checking the status prompts nobody and
         // registers nothing, so an app that only checks never appears in
@@ -206,17 +219,73 @@ final class CameraSource: NSObject, PictureSource, AVCaptureVideoDataOutputSampl
         made.commitConfiguration()
 
         lock.lock(); session = made; lock.unlock()
+        watch(made, device: picked)
         // startRunning blocks while the device warms up, which is why it is
         // not on the caller's thread.
         queue.async { made.startRunning() }
     }
 
+    /// Hear the session die, rather than finding out from the silence.
+    ///
+    /// **A camera that is unplugged, or reset, or taken away mid show used to
+    /// stay dead for the rest of it** (W381-32): `start()` returned early
+    /// because a session still existed, so the fallback's retry asked a corpse
+    /// for a frame every five seconds. Now a runtime error or a disconnect
+    /// lets the session go, so the next `start()` builds a new one, and the
+    /// fallback's retry is what calls it.
+    private func watch(_ made: AVCaptureSession, device: AVCaptureDevice) {
+        let centre = NotificationCenter.default
+        let died = centre.addObserver(forName: AVCaptureSession.runtimeErrorNotification,
+                                      object: made, queue: nil) { [weak self] note in
+            let why = (note.userInfo?[AVCaptureSessionErrorKey] as? NSError)?
+                .localizedDescription ?? "the camera stopped"
+            self?.lost(Cameras.explain(why, device: self?.device ?? ""))
+        }
+        let unplugged = centre.addObserver(forName: AVCaptureDevice.wasDisconnectedNotification,
+                                           object: device, queue: nil) { [weak self] _ in
+            self?.lost(Cameras.explain("not connected", device: self?.device ?? ""))
+        }
+        lock.lock(); watchers = [died, unplugged]; lock.unlock()
+    }
+
+    /// The session has gone. Let go of it, so `start()` can build another.
+    /// Safe to call on a source that never started.
+    func lost(_ why: String) {
+        lock.lock()
+        let dead = session
+        session = nil
+        latest = nil
+        scaled = nil
+        scaledKey = nil
+        error = why
+        let old = watchers
+        watchers = []
+        lock.unlock()
+        for w in old { NotificationCenter.default.removeObserver(w) }
+        if let dead { queue.async { dead.stopRunning() } }
+    }
+
     /// Wait for a real first frame. Measured on Windows at 0.58 seconds from
     /// open to first frame; the timeout is generous and still short enough
     /// that a presenter is not left wondering.
+    ///
+    /// **Any number of callers may wait, and every one is answered.** It was a
+    /// semaphore signalled once, so the first waiter took the signal and every
+    /// later one waited out the whole timeout for a camera that had been
+    /// running for minutes. With one shared picture there are several: the
+    /// recording, its picture thread, a preview, Command+Shift+F.
     func waitReady(timeout: Double = C.cameraOpenTimeout) -> Bool {
-        if !error.isEmpty { return false }
-        return ready.wait(timeout: .now() + timeout) == .success
+        lock.lock()
+        let answered = frameCount > 0, failed = !error.isEmpty
+        lock.unlock()
+        if answered { return true }
+        if failed { return false }
+        if ready.wait(timeout: .now() + timeout) == .success {
+            // Put it back for whoever is waiting next.
+            ready.signal()
+        }
+        lock.lock(); defer { lock.unlock() }
+        return frameCount > 0
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
@@ -225,7 +294,7 @@ final class CameraSource: NSObject, PictureSource, AVCaptureVideoDataOutputSampl
         lock.lock()
         latest = buffer
         latestAt = now()
-        framesRead += 1
+        frameCount += 1
         width = CVPixelBufferGetWidth(buffer)
         height = CVPixelBufferGetHeight(buffer)
         error = ""
@@ -283,7 +352,7 @@ final class CameraSource: NSObject, PictureSource, AVCaptureVideoDataOutputSampl
     func describe() -> String {
         lock.lock(); defer { lock.unlock() }
         if !error.isEmpty { return "a camera that could not be opened" }
-        if framesRead == 0 { return "a camera that is still starting" }
+        if frameCount == 0 { return "a camera that is still starting" }
         return "\(device) at \(Cameras.describeSize(width, height))"
     }
 
@@ -306,7 +375,10 @@ final class CameraSource: NSObject, PictureSource, AVCaptureVideoDataOutputSampl
         latest = nil
         scaled = nil
         scaledKey = nil
+        let old = watchers
+        watchers = []
         lock.unlock()
+        for w in old { NotificationCenter.default.removeObserver(w) }
         running?.stopRunning()
     }
 }

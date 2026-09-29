@@ -674,10 +674,7 @@ extension MainWindow {
         let folderField = text(board.recordFolder ?? Recorder.defaultFolder(),
                                "Where recordings go")
         recordBox.addArrangedSubview(field("Where recordings go", folderField))
-        recordBox.addArrangedSubview(note(
-            "A recording is the same mix that goes on air: every sound card, the running "
-            + "order, the microphone if it is on air. Never your preview and never the beep "
-            + "before a track ends. It does not need you to be on air."))
+        recordBox.addArrangedSubview(note(VideoPrefs.recordingNote))
         add(tabs, "Recording", recordBox)
 
         // ---------------------------------------------------------- keyboard --
@@ -1282,6 +1279,17 @@ final class SettingsCategories: NSObject, NSTableViewDataSource, NSTableViewDele
 /// The Video streaming page's decisions, as plain functions so each can be
 /// asserted without a window.
 enum VideoPrefs {
+
+    /// The Recording page's note (W381-49). It names the picture key, because
+    /// a presenter who records video looks here first and the picture lives
+    /// on another page.
+    static let recordingNote =
+        "A recording is the same mix that goes on air: every sound card, the running "
+        + "order, the microphone if it is on air. Never your preview and never the beep "
+        + "before a track ends. It does not need you to be on air. "
+        + "Command+Shift+R records the picture as well, to one MP4. Which picture that "
+        + "is, and its size, are on the Video streaming page, and Option+Shift+V "
+        + "changes it from anywhere."
 
     enum KeyAction: Equatable { case leave, store, forget }
 

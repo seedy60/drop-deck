@@ -154,6 +154,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         main?.saveForClose()
+        // Quitting finishes both recordings too, not only closing the window
+        // (N2). Once only: whichever comes first does it.
+        main?.closeDownRecordingsAndPicture()
         if let monitor { NSEvent.removeMonitor(monitor) }
     }
 

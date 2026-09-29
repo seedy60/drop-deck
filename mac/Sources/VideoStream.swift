@@ -69,8 +69,16 @@ final class VideoStreamer {
     private(set) var framesSent = 0
     private(set) var liveSince: Date?
     private var encoder: VideoEncoder?
-    private var source: PictureSource?
-    private var wantedSource: PictureSource?
+    /// The ONE shared picture (PictureFeed.swift). The window takes the
+    /// stream's hold on it and hands it in; this reads frames and never opens
+    /// or closes anything, so coming off air cannot take a recording's camera
+    /// with it (W381-37), and a picture change reaches the stream and a
+    /// recording at once.
+    private var feed: PictureFeed?
+    /// Where a recording collects the frames this is sending, overlay and all,
+    /// so one camera serves both. Held here rather than anywhere per
+    /// connection, so a reconnect cannot drop it.
+    private var frameTap: FrameTap?
     private var overlay = Overlay()
     /// Watches what actually goes out, for a picture that has gone black.
     private let health = HealthWatcher()
@@ -103,7 +111,8 @@ final class VideoStreamer {
     // ------------------------------------------------------------ going on ---
 
     @discardableResult
-    func start(group: MixerGroup, settings: VideoStreamSettings) -> Bool {
+    func start(group: MixerGroup, settings: VideoStreamSettings,
+               picture: PictureFeed? = nil) -> Bool {
         guard !isOn else { return true }
         guard !settings.host.isEmpty else {
             set(.failed, "there is no video platform set up yet")
@@ -114,6 +123,7 @@ final class VideoStreamer {
             return false
         }
         self.settings = settings
+        lock.lock(); feed = picture; lock.unlock()
         let rate = group.sampleRate
         let bus = AirBus(sampleRate: rate)
         self.bus = bus
@@ -159,10 +169,10 @@ final class VideoStreamer {
         stopping = true
         let open = client
         client = nil
-        let picture = source
-        let waiting = wantedSource
-        source = nil
-        wantedSource = nil
+        // LET GO, do not close: the window releases the stream's hold, and
+        // the feed shuts the device only when the LAST holder lets go.
+        feed = nil
+        frameTap = nil
         lock.unlock()
         // Hung up first, so a worker inside connect() is woken by the close
         // rather than finishing the conversation and going live after it.
@@ -171,8 +181,6 @@ final class VideoStreamer {
         thread = nil
         if let bus { group.removeAirBus(bus) }
         bus = nil
-        picture?.close()
-        waiting?.close()
         encoder?.close()
         encoder = nil
         startedAt = nil
@@ -180,37 +188,13 @@ final class VideoStreamer {
         applyState(.off, "")
     }
 
-    /// Change what is going out, without dropping the stream.
-    ///
-    /// The new source is built and STARTED here and picked up by the pump on
-    /// its next turn, so nothing that blocks happens on the thread carrying
-    /// the audio.
-    /// Returns what went wrong, or "" when it did not. The caller says so:
-    /// a switcher that reports success whatever happened is a switcher that
-    /// leaves somebody broadcasting a card and believing otherwise.
-    @discardableResult
-    func setPicture(_ picture: PictureSettings) -> String {
-        let made = Picture.build(picture, onFallback: { [weak self] text in
-            self?.say(text)
-        })
-        made.start()
-        let ready = made.waitReady(timeout: C.cameraOpenTimeout)
-        made.setTitle(currentTitle)
-        lock.lock()
-        // Off air by the time it opened, a refusal having come back first:
-        // closed rather than left holding the camera for nobody.
-        let wanted = state != .off && state != .failed && !stopping
-        if wanted { wantedSource = made }
-        lock.unlock()
-        if !wanted { made.close(); return "" }
-        if ready { return "" }
-        // A card cannot fail and never reports one, so an error here is the
-        // real source saying it could not open.
-        let trouble = made.error
-        return trouble.isEmpty
-            ? "\((C.pictureLabels[picture.picture] ?? picture.picture).lowercased()) "
-              + "did not start" : trouble
+    /// Where a recording collects the frames this sends. Nil to stop.
+    func setFrameTap(_ tap: FrameTap?) {
+        lock.lock(); frameTap = tap; lock.unlock()
     }
+
+    /// Whether this is filling a recording's tap right now.
+    var fillsTap: Bool { lock.lock(); defer { lock.unlock() }; return frameTap != nil }
 
     func setOverlay(_ settings: OverlaySettings) {
         overlay.apply(settings)
@@ -219,10 +203,8 @@ final class VideoStreamer {
     func setTitle(_ title: String) {
         currentTitle = title
         overlay.setTitle(title)
-        lock.lock()
-        source?.setTitle(title)
-        wantedSource?.setTitle(title)
-        lock.unlock()
+        lock.lock(); let picture = feed; lock.unlock()
+        picture?.setTitle(title)
     }
 
     /// The frame going out right now, for the shot check.
@@ -231,7 +213,7 @@ final class VideoStreamer {
     /// answered about what viewers can see rather than about a fresh grab
     /// taken while the presenter was moving.
     func currentFrame() -> CVPixelBuffer? {
-        lock.lock(); let picture = source; lock.unlock()
+        lock.lock(); let picture = feed; lock.unlock()
         guard let picture else { return nil }
         guard let frame = picture.frame(width: settings.width,
                                         height: settings.height) else { return nil }
@@ -241,8 +223,9 @@ final class VideoStreamer {
 
     /// What is on the screen, in words.
     func describePicture() -> String {
-        lock.lock(); let picture = source; lock.unlock()
-        return picture?.describe() ?? "nothing yet"
+        lock.lock(); let picture = feed; lock.unlock()
+        let said = picture?.describe() ?? ""
+        return said.isEmpty ? "nothing yet" : said
     }
 
     /// What the stream is doing, for Command+Shift+B.
@@ -269,7 +252,8 @@ final class VideoStreamer {
                 liveFor: since.map { -$0.timeIntervalSinceNow } ?? 0, mediaBytes: sent) {
                 line += ", " + nothing
             }
-            if let source { line += ", showing \(source.describe())" }
+            let showing = describePicture()
+            if showing != "nothing yet" { line += ", showing \(showing)" }
             let picture = health.describe()
             if picture != "the picture looks fine" { line += ". " + picture }
             return line
@@ -300,6 +284,7 @@ final class VideoStreamer {
         encoder = video
 
         var sequenceSent = false
+        var seenBuilds = 0
         var backoff = 1.0
         var live: RTMPClient?
         var lastAudio = ProcessInfo.processInfo.systemUptime
@@ -379,20 +364,16 @@ final class VideoStreamer {
                 break
             }
 
-            // The picture is swapped here rather than under the caller, so the
-            // old one is closed on this thread and never while it is being read.
+            // A new picture under the feed starts the watchers afresh and
+            // sends a keyframe, so a viewer joining sees the new one at once.
             lock.lock()
-            if let wanted = wantedSource {
-                let old = source
-                source = wanted
-                wantedSource = nil
-                lock.unlock()
-                old?.close()
+            let built = feed?.builds ?? 0
+            lock.unlock()
+            if built != seenBuilds {
+                seenBuilds = built
                 health.reset()
                 cameraHealth.reset()
                 video.forceKeyframe()
-            } else {
-                lock.unlock()
             }
 
             let ready = bus.available()
@@ -470,7 +451,7 @@ final class VideoStreamer {
     /// How many frames should exist by now, capped.
     private func pumpVideo(client: RTMPClient, video: VideoEncoder,
                            milliseconds: Int, sequenceSent: inout Bool) -> Bool {
-        lock.lock(); let picture = source; lock.unlock()
+        lock.lock(); let picture = feed; let tap = frameTap; lock.unlock()
         guard let picture else { return true }
 
         let wanted = milliseconds * settings.fps / 1000
@@ -490,16 +471,17 @@ final class VideoStreamer {
             // the source handed back.
             let shown = Pixels.composite(frame, overlay, width: settings.width,
                                          height: settings.height)
+            // The recording, when it is taking this stream's frames: the
+            // identical picture going out, overlay and all.
+            tap?.put(shown)
             health.look(buffer: shown, moving: picture.moving)
             // And the camera on its own, when there is one. A camera that has
             // stopped delivering is caught by staleness in CameraSource; this
             // catches the other kind, where frames keep arriving and they are
             // all the same picture.
-            if let camera = VideoStreamer.cameraFrame(picture) {
+            if let camera = picture.latest() {
                 cameraHealth.look(buffer: camera, moving: true)
-            }
-            if framer.due(), let camera = VideoStreamer.cameraFrame(picture) {
-                framer.look(camera)
+                if framer.due() { framer.look(camera) }
             }
             let at = videoFrames * 1000 / settings.fps
             video.encode(shown, milliseconds: at)
@@ -531,12 +513,7 @@ final class VideoStreamer {
     /// presenter a quarter of the width in the corner, and a face detector
     /// given that would report a shot nobody is actually in.
     static func cameraFrame(_ source: PictureSource) -> CVPixelBuffer? {
-        if let camera = source as? CameraSource { return camera.latestFrame() }
-        if let split = source as? SplitSource { return split.latestFrame() }
-        if let fallback = source as? FallbackSource {
-            return cameraFrame(fallback.primary)
-        }
-        return nil
+        PictureFeed.cameraFrame(source)
     }
 
     /// An AAC packet from the app's encoder is one or more ADTS frames, and
@@ -603,12 +580,10 @@ final class VideoStreamer {
     private func releaseAfterFailure(_ run: Int, bus used: AirBus) {
         lock.lock()
         let same = run == generation
-        let picture = same ? source : nil
-        let waiting = same ? wantedSource : nil
-        if same { source = nil; wantedSource = nil }
+        // The picture is let go of by the window, which holds the stream's
+        // claim on the feed and hears the failure through onState.
+        if same { feed = nil; frameTap = nil }
         lock.unlock()
-        picture?.close()
-        waiting?.close()
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             // The bus THIS run used, whatever has happened since: a Command B

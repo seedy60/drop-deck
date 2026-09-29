@@ -120,7 +120,12 @@ extension MainWindow {
     func toggleStream() {
         if streamer.isOn || videoStreamer.isOn {
             if streamer.isOn { streamer.stop(group: group) }
-            if videoStreamer.isOn { videoStreamer.stop(group: group) }
+            if videoStreamer.isOn {
+                videoStreamer.stop(group: group)
+                // Let go of the picture, never close it: a recording may be
+                // holding the same one, and it now fills its own frames.
+                releaseStreamPicture()
+            }
             speaker.announceState("Off air")
             updateStatusLine()
             updateAirMenu()
@@ -202,26 +207,32 @@ extension MainWindow {
                 var line = "On air to \(StreamServers.serverLabel(self.board.videoServer))"
                 if self.mic.isOpen, let warning = self.micOffAirNote { line += ". \(warning)" }
                 self.speaker.announceState(line)
-            case .failed: self.speaker.announceState("Could not go on air. \(detail)")
+            case .failed:
+                self.speaker.announceState("Could not go on air. \(detail)")
+                // A run that ended itself lets go of the picture too.
+                self.releaseStreamPicture()
             case .retrying: self.speaker.announceState("Off air, trying again. \(detail)")
             default: break
             }
+            // WHO FILLS A RECORDING'S FRAMES depends on whether the stream is
+            // really on air, so it is decided again on every change of state.
+            self.syncRecordPicture()
         }
         // The picture and the health of it are said out loud as they happen,
         // because there is no preview to glance at.
         videoStreamer.onSay = { [weak self] text in self?.speaker.announce(text) }
         mic.onAir = board.stream.sendMic
-        guard videoStreamer.start(group: group, settings: videoStreamSettings()) else {
+        // The stream's hold on the ONE picture. It opens on the feed's own
+        // queue, so a camera opening does not hold the keyboard, and the card
+        // stands in for the half second it takes (W381-31).
+        let picture = takeStreamPicture()
+        guard videoStreamer.start(group: group, settings: videoStreamSettings(),
+                                  picture: picture) else {
+            releaseStreamPicture()
             speaker.announceState("Could not go on air. \(videoStreamer.detail)")
             return
         }
-        // Built after the connection is asked for, on its own queue, so a
-        // camera opening does not hold the keyboard.
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-            self.videoStreamer.setPicture(self.pictureSettings())
-            self.videoStreamer.setTitle(self.nowPlayingTitle)
-        }
+        videoStreamer.setTitle(nowPlayingTitle)
         speaker.announceState("Connecting to "
                             + StreamServers.serverLabel(board.videoServer))
         updateStatusLine()
@@ -234,8 +245,18 @@ extension MainWindow {
         // set up for YouTube and nothing else answered "Off air, and no server
         // is set up yet" while Command B would have gone live perfectly well.
         // It is the one question this key exists to answer.
-        if videoStreamer.isOn { speaker.announceAnswer(videoStreamer.statusLine()); return }
-        if streamer.isOn { speaker.announceAnswer(streamer.statusLine()); return }
+        // And a picture recording, when there is one, in the same answer
+        // (W381-13): "am I recording" and "am I on air" are the same question
+        // asked in a hurry.
+        let taping = recordingLine()
+        if videoStreamer.isOn {
+            speaker.announceAnswer(MainWindow.withSentence(videoStreamer.statusLine(), taping))
+            return
+        }
+        if streamer.isOn {
+            speaker.announceAnswer(MainWindow.withSentence(streamer.statusLine(), taping))
+            return
+        }
         // **Off air, this answers with the pre-flight rather than a bare "Off
         // air".** It is the one question this key exists to answer, and a
         // board set up for a video platform and nothing else used to be told
@@ -245,7 +266,15 @@ extension MainWindow {
         var line = "Off air. Command B would go to \(report.summary())"
         let trouble = (report.stops + report.warnings).map { $0.text }
         if !trouble.isEmpty { line += ". " + trouble.joined(separator: ". ") }
-        speaker.announceAnswer(line)
+        speaker.announceAnswer(MainWindow.withSentence(line, taping))
+    }
+
+    /// One more sentence on the end of a line, with the full stop between
+    /// them that a screen reader needs to pause.
+    static func withSentence(_ line: String, _ more: String) -> String {
+        guard !more.isEmpty else { return line }
+        let ends = line.hasSuffix(".") || line.isEmpty
+        return line + (ends ? " " : ". ") + more
     }
 
     /// Command Shift A. Who is listening, which has to handle the awkward case

@@ -9,50 +9,79 @@ import AppKit
 extension MainWindow {
 
     /// Command+Shift+R. The picture and the sound, into one file.
+    ///
+    /// The picture is the APP's, whatever Command+B is pointed at, and it is
+    /// the one shared feed (PictureFeed.swift): the recording takes a hold on
+    /// it rather than opening a camera of its own, so a recording and a stream
+    /// never open the same device twice.
+    ///
+    /// **The picture first, and waited for, off the main thread.** The
+    /// recorder's timeline begins the moment it starts and writes black until
+    /// a picture arrives, so the recorder is only started once the picture is
+    /// ready. Windows blocks the key for that; here the wait is on another
+    /// thread, because a camera opened on the main one can wait two minutes
+    /// for a permission answer that has to arrive on the main one.
     func toggleVideoRecording() {
+        if videoRecordingStarting {
+            speaker.announceState("The picture recording is still starting")
+            return
+        }
         if videoRecorder.isRecording {
-            videoRecorder.stop(taps: group.taps)
-            group.syncTaps()
-            speaker.announceState(videoRecorder.report())
-            updateStatusLine()
+            finishVideoRecording(quiet: false)
             return
         }
-        // Two recorders at once is legal and two recorders on one file is not,
-        // so they are simply two files. The audio one is untouched by this.
-        let live = videoStreamer.isOn
-        let borrow: (() -> CVPixelBuffer?)? = live
-            ? { [weak self] in self?.videoStreamer.currentFrame() }
-            : nil
-        let own: (() -> (PictureSource, Overlay))? = live ? nil : { [weak self] in
-            guard let self else { return (Picture.build(PictureSettings()), Overlay()) }
-            let source = Picture.build(self.pictureSettings(), onFallback: { [weak self] text in
-                // The same sentence the stream would say. A source that fills
-                // a canvas rather than failing is the whole reason anything
-                // says this: nothing downstream will.
-                DispatchQueue.main.async { self?.speaker.announce(text) }
-            })
-            let overlay = Overlay(settings: self.overlaySettings())
-            overlay.setTitle(self.nowPlayingTitle)
-            return (source, overlay)
+        // Said about the picture as it is NOW, before anything opens.
+        let warnings = pictureWarnings()
+        videoRecordingStarting = true
+        recordOverlay.apply(overlaySettings())
+        recordOverlay.setTitle(nowPlayingTitle)
+        let feed = pictureFeed
+        feed.acquire(PictureFeed.forRecording)
+        updateStatusLine()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            _ = feed.waitReady(timeout: C.cameraOpenTimeout)
+            DispatchQueue.main.async { self?.beginVideoRecording(warnings: warnings) }
         }
-        guard let path = videoRecorder.start(
-            taps: group.taps, rate: group.sampleRate,
-            width: board.videoWidth, height: board.videoHeight, fps: board.videoFPS,
-            folder: board.recordFolder, borrow: borrow, own: own) else {
-            speaker.announceState("Recording the picture would not start. "
-                + (videoRecorder.lastError ?? "no reason given"))
+    }
+
+    /// The picture is open. Start the file.
+    private func beginVideoRecording(warnings: String) {
+        videoRecordingStarting = false
+        guard !closedDown else {
+            pictureFeed.release(PictureFeed.forRecording)
             return
         }
+        let tap = FrameTap()
+        // Told BEFORE it starts, so nothing it says in its first moments is
+        // lost: losing audio, and a writer that fails.
         videoRecorder.onState = { [weak self] line in
             DispatchQueue.main.async { self?.speaker.announce(line) }
         }
+        videoRecorder.onFailed = { [weak self] why in self?.pictureRecordingFailed(why) }
+        guard let path = videoRecorder.start(
+            taps: group.taps, rate: group.sampleRate,
+            width: board.videoWidth, height: board.videoHeight, fps: board.videoFPS,
+            folder: board.recordFolder, tap: tap) else {
+            // The hold was taken before the recorder, so it is handed back, or
+            // the camera light stays on for a recording that never happened.
+            pictureFeed.release(PictureFeed.forRecording)
+            speaker.announceState("Recording the picture would not start. "
+                + (videoRecorder.lastError ?? "no reason given"))
+            updateStatusLine()
+            return
+        }
+        recordTap = tap
         group.syncTaps()
+        syncRecordPicture()
         var line = "Recording the picture and the sound to "
-            + "\((path as NSString).lastPathComponent)"
-        if !live { line += ", taking the picture that would go out" }
-        if let note = whatIsReallyInTheFile() { line += ". \(note)" }
+            + "\((path as NSString).lastPathComponent)."
+        if let note = whatIsReallyInTheFile() { line += " \(note)" }
+        line += pictureInTheRecording() + warnings
         speaker.announceState(line)
         updateStatusLine()
+        // The menu item's words follow: this is later than the key press that
+        // refreshed it, because the picture was opened first.
+        updateAirMenu()
     }
 
     /// What is really in a recording, said when one starts.
