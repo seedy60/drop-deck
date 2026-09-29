@@ -71,6 +71,32 @@ if CommandLine.arguments.contains("--check-updates") {
     exit(result.info != nil ? 0 : 1)
 }
 
+// Check my stream key, from the command line, against the board and the key
+// the app really uses. Nothing is broadcast: the check stops at the answer to
+// publish. The key is never printed, only what the platform said about it.
+// Run it from a Developer ID signed build, or the keychain asks first.
+if CommandLine.arguments.contains("--check-stream-key") {
+    let path = Board.defaultBoardPath()
+    guard let board = Board.load(path) else {
+        print("could not read \(path)")
+        exit(2)
+    }
+    let key = Secrets.fetchVideoKey(server: board.videoServer, host: board.videoHost,
+                                    stationName: board.stream.name)
+    let result = StreamKeyCheck.verify(host: board.videoHost, key: key,
+                                       server: board.videoServer)
+    print("platform  : \(board.videoServer)")
+    print("outcome   : \(result.outcome)")
+    print("stage     : \(result.stage.map { "\($0)" } ?? "none")")
+    print("said      : \(result.serverSaid)")
+    print("detail    : \(result.detail)")
+    print("sent      : \(result.sent.joined(separator: ", "))")
+    print("tags sent : \(result.tagsSent)")
+    print("seconds   : \(String(format: "%.2f", result.seconds))")
+    print("verdict   : \(StreamKeyCheck.verdict(result, server: board.videoServer, key: key))")
+    exit(result.ok ? 0 : 1)
+}
+
 // The release script's rehearsal: verify a staged manifest with the key baked
 // into THIS build, before anything is uploaded. Signing with a key the app does
 // not carry is the exact failure that produces a silent outage.
