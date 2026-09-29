@@ -1,5 +1,111 @@
 # Changelog
 
+## 3.8.4 for Mac, 29 September 2026
+
+**Level with Windows again: your stream key can be checked before a show, each
+destination has its own key, going live says only what is true, and the camera
+can finally be switched on.**
+
+The Mac was four Windows releases behind, 3.8.0 against 3.8.4. It has all of
+3.8.1 to 3.8.4 now, and most of what Windows fixed in those turned out to be
+wrong on the Mac as well.
+
+### Check my stream key
+
+On the Video streaming page. It asks YouTube or Facebook whether your key is
+right and repeats what they said, in about a second. Measured with a real
+YouTube key on 29 September 2026: accepted in just over half a second.
+
+**Nothing is broadcast and nothing is posted.** It stops the moment the
+platform answers, before a single frame of picture or sample of sound, so it
+cannot put you on the air, cannot notify anybody and leaves nothing on your
+channel. The Mac sends even less than Windows here: not one message after the
+question is asked. On YouTube it asks you first anyway. If the key is accepted
+and your channel still shows nothing, it names the usual reason, auto start
+switched off.
+
+### Command+B for video, Option+Shift+B for radio
+
+One key each, and each is a toggle for its own destination. The summary before
+going live is always for the place you meant. Pressing the key for the place
+you are not on tells you where you really are and does nothing else.
+
+There is a **Channel name** box on the Video streaming page, so your radio
+station is no longer printed as the name of your YouTube channel. It is
+optional, and left empty the summary simply says YouTube Live.
+
+### Going live, and saying so honestly
+
+- **The reason Command+B will not go is the first thing you hear**, not the
+  summary of where it would have gone.
+- **A key the platform refuses stops the broadcast whenever it happens**, not
+  only on the first try. A radio server saying the mount is still busy, which
+  is what a dropped connection leaves behind for a moment, is tried again
+  rather than ending the show.
+- **A stream that nothing is reaching says so and stops**, and
+  `Command+Shift+B` says when nothing has left the machine.
+- **A picture that will not start is said out loud**, and going live says one
+  sentence instead of two that cut each other off.
+- **A stream key kept in the board file is kept for its own platform**, so a
+  YouTube key is never offered to Facebook.
+
+### The picture belongs to the app
+
+It used to belong to wherever Command+B was pointed, so a radio board could
+not choose a picture for a recording. Now there is one picture, shared by the
+stream, the recording, the shot check and the framing watcher, so there is one
+camera and one screen capture however many of them are looking. Changing the
+picture reaches a recording that is already running.
+
+**A recording keeps more of what the camera saw.** Measured with numbered
+frames decoded back out of the file: 6.7 to 7.8 per cent of frames were being
+lost, now 1.0 to 2.4, and the picture sits within about 6 to 19 milliseconds of
+the sound.
+
+### The camera could never have worked
+
+**macOS never asked about the camera, and never listed Drop Deck under Camera
+in System Settings**, whatever you did. The app was missing the one permission
+a signed Mac app must declare before macOS will even ask. It has it now, and
+the self test reads the app's own signature to make sure it stays there.
+
+### The microphone key can never simply do nothing
+
+- **`Option+Shift+M` opens and closes the microphone as well**, for when
+  another program has taken `Command+M`.
+- **If the microphone will not open, it says why** in plain words: unplugged,
+  held by another program, refused by the privacy settings, or the audio system
+  not running.
+- **If it opens and nothing arrives**, not even background noise, it says so a
+  couple of seconds later.
+- A chosen microphone that is not plugged in is said out loud and the system
+  default is used for now, with your choice kept.
+
+### Your board
+
+- **Drop Deck reopens the board you last had open**, not board.json every time.
+- **A board changed on disk while Drop Deck is open is never saved over.**
+  Anything you had changed on screen is kept beside it under a new name.
+- **A board that will not load is copied aside and you are told**, rather than
+  being replaced by the demo.
+
+### And the rest
+
+- **Test the cable**, on the send window, plays a tone down your cable for two
+  seconds, listens to the other end and says what came back.
+- **A program you are capturing comes back by itself** when you quit it and
+  open it again, and you are told when it goes and when it returns.
+- **How a song is named** is a choice on the Streaming page: Title by Artist,
+  as before, or Artist - Title.
+- **The running order said "Ticked to play" on every row**, ticked or not.
+  Each row's box is called Play now and says ticked or not ticked as its value.
+- **Faults are written to an error log beside your board** instead of
+  vanishing, and Help, Submit feedback says where one happened, never what it
+  was about.
+- **Every window is now read the way VoiceOver reads it**, by a check that runs
+  with every build: 422 controls, and it refuses a build with a single one that
+  has no spoken name.
+
 ## 3.8.4 for Windows, 20 September 2026
 
 **Your stream key can be checked before a show, going live never claims more
