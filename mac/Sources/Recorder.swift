@@ -38,6 +38,18 @@ final class Recorder {
     var losingAudio: Int { max(0, (bus?.dropped ?? 0) - droppedAtStart) }
 
     private var bus: AirBus?
+    /// The taps this recording's bus was added to, so a recording that fails
+    /// on its own can take the bus back out (N3).
+    private weak var taps: Taps?
+    /// Set by the writer when the FILE refused, rather than somebody pressing
+    /// stop. Read once, where the writer ends.
+    private var failed = false
+    /// Told, on the main queue, when the recording stops by itself because
+    /// the file could not be written: the sentence to say. **Nothing said so
+    /// until 3.8.4** (N3): the recording simply stopped, the menu still said
+    /// Stop recording, and the bus stayed in the taps for the rest of the
+    /// session, because `stop()` returned at its first guard.
+    var onFailed: ((String) -> Void)?
     private var file: AVAudioFile?
     // MP3 does not go through AVAudioFile, which cannot write one. It is LAME
     // and a file handle, and the two paths meet again in `write`.
@@ -171,6 +183,8 @@ final class Recorder {
 
         let bus = AirBus(sampleRate: rate)
         self.bus = bus
+        self.taps = taps
+        failed = false
         taps.add(bus)
         path = destination
         framesWritten = 0
@@ -218,8 +232,66 @@ final class Recorder {
         lock.lock()
         self.file = nil
         isRecording = false
+        let broke = failed
         lock.unlock()
+        if broke { writerFailed() }
     }
+
+    /// The writer stopped because the file refused. Let go of the bus and
+    /// say so, on the main queue, once.
+    func writerFailed() {
+        let finish = { [weak self] in
+            // Stop pressed at the same moment has already finished the file
+            // and said so; this has nothing left to add.
+            guard let self, self.path != nil || self.bus != nil else { return }
+            if let bus = self.bus { self.taps?.remove(bus) }
+            self.bus = nil
+            self.thread = nil
+            let name = (self.path as NSString?)?.lastPathComponent ?? "the recording"
+            self.path = nil
+            self.cue = nil
+            var why = self.lastError ?? ""
+            if why.hasPrefix("The recording stopped. ") {
+                why = String(why.dropFirst("The recording stopped. ".count))
+            }
+            self.onFailed?(Recorder.failedLine(name: name, why: why))
+        }
+        if Thread.isMainThread { finish() } else { DispatchQueue.main.async(execute: finish) }
+    }
+
+    /// What is said when a sound recording stops by itself. What is already
+    /// in the file stays there, which is worth knowing mid show.
+    static func failedLine(name: String, why: String) -> String {
+        let reason = why.trimmingCharacters(in: .whitespaces)
+        let said = reason.isEmpty ? "" : (reason.hasSuffix(".") ? reason : reason + ".") + " "
+        return "The recording to \(name) has stopped by itself. \(said)What was "
+            + "recorded before that is still in the file."
+    }
+
+    /// For the self test: behave exactly as the writer does when the file
+    /// refuses, with no file to break.
+    func failForTesting(_ why: String) {
+        lock.lock()
+        lastError = why
+        failed = true
+        isRecording = false
+        lock.unlock()
+        writerFailed()
+    }
+
+    /// For the self test: a recording in progress, as far as the bus and the
+    /// taps can tell, with nothing written anywhere.
+    func pretendRecording(taps: Taps, rate: Double, path: String) {
+        let bus = AirBus(sampleRate: rate)
+        self.bus = bus
+        self.taps = taps
+        self.path = path
+        taps.add(bus)
+        isRecording = true
+    }
+
+    /// Whether this recording's bus is still in the taps. For the self test.
+    var holdsBus: Bool { bus != nil }
 
     /// Whatever LAME is still holding, and then the Info tag over the
     /// placeholder it left at the very start of the file.
@@ -256,7 +328,7 @@ final class Recorder {
             if let bytes = encoder.encode(buffer) { handle.write(bytes) }
             if let problem = encoder.lastError {
                 lastError = "The recording stopped. \(problem)"
-                lock.lock(); stopping = true; lock.unlock()
+                lock.lock(); stopping = true; failed = true; lock.unlock()
                 return
             }
             framesWritten += frames
@@ -268,7 +340,7 @@ final class Recorder {
             framesWritten += frames
         } catch {
             lastError = "The recording stopped. \(error.localizedDescription)"
-            lock.lock(); stopping = true; lock.unlock()
+            lock.lock(); stopping = true; failed = true; lock.unlock()
         }
     }
 

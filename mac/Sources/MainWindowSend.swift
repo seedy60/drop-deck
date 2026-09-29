@@ -18,6 +18,13 @@ extension MainWindow {
     /// Is the show going out of a sound card to another program.
     var sending: Bool { send?.isRunning == true }
 
+    /// On air anywhere, or recording anything: when a test tone must not go
+    /// down a cable, because somebody would hear it.
+    var liveOrRecording: Bool {
+        streamer.isOn || videoStreamer.isOn || recorder.isRecording
+            || videoRecorder.isRecording
+    }
+
     /// Point the mixers at the send, or at nothing.
     ///
     /// Every start and stop goes through here rather than setting the tap
@@ -39,24 +46,26 @@ extension MainWindow {
         // never a silent fall back to the speakers. On Windows, with no virtual
         // cable on the machine, the send used to pick a loudspeaker and call
         // that success.
+        //
+        // **A failure never touches `board.sendOn`** (W380-06). That is what
+        // the user ASKED for, and it is saved with the board: switching it off
+        // here meant one launch without the cable wrote "no send" to disk, and
+        // the send never came back when the cable did. `sendFailed` says why
+        // instead, in Windows' words, and the startup line reads it.
         if let uid = board.sendDeviceUID, AudioDevices.deviceID(forUID: uid) == nil {
-            board.sendOn = false
-            if !quiet {
-                speaker.announce("\(board.sendDeviceName ?? "That sound card") is not "
-                    + "here any more, so the send is off.")
-            }
+            sendFailed = MainWindow.sendMissingLine(board.sendDeviceName)
+            if !quiet { speaker.announce(sendFailed) }
             return false
         }
         let opened = Send(deviceUID: board.sendDeviceUID, gainDB: board.sendGainDB)
         guard opened.isRunning else {
             opened.close()
-            board.sendOn = false
-            if !quiet {
-                speaker.announce("The send could not be opened. "
-                    + (opened.lastError ?? "No reason was given."))
-            }
+            sendFailed = "The send could not be opened. "
+                + (opened.lastError ?? "No reason was given.")
+            if !quiet { speaker.announce(sendFailed) }
             return false
         }
+        sendFailed = ""
         send = opened
         board.sendOn = true
         // The confidence feed is an EXTRA on the source group, which is what
@@ -69,6 +78,39 @@ extension MainWindow {
         syncSend()
         updateStatusLine()
         return true
+    }
+
+    /// The card the send goes out of is not plugged in. Windows' sentence;
+    /// "by itself" is made true here by `retrySend`, which Windows has not got.
+    static func sendMissingLine(_ name: String?) -> String {
+        "\(name ?? "That sound card") is not here at the moment, so the show is not "
+            + "going to another program. It will start again by itself when the card "
+            + "is back."
+    }
+
+    /// The card a wanted send goes out of has come back: start the send again,
+    /// and say so. Asked on the slow retry tick, and only while a send the
+    /// board wants is not running because its card was missing.
+    func retrySend() {
+        guard MainWindow.sendShouldRetry(wanted: board.sendOn, running: sending,
+                                         failed: sendFailed,
+                                         cardPresent: board.sendDeviceUID.map {
+                                             AudioDevices.deviceID(forUID: $0) != nil } ?? true)
+        else { return }
+        if startSend(quiet: true) {
+            speaker.announce("\(board.sendDeviceName ?? "The sound card") is back, so the "
+                + "show is going to another program again.", interrupt: false)
+        }
+    }
+
+    /// Whether to try a wanted send again: only when it is wanted, is not
+    /// running, failed for want of its card, and the card is here now. A send
+    /// that failed for any other reason is not retried every three seconds.
+    static func sendShouldRetry(wanted: Bool, running: Bool, failed: String,
+                                cardPresent: Bool) -> Bool {
+        wanted && !running && !failed.isEmpty
+            && failed.hasSuffix("It will start again by itself when the card is back.")
+            && cardPresent
     }
 
     func stopSend(quiet: Bool = false) {
@@ -93,6 +135,7 @@ extension MainWindow {
     func toggleSend() {
         if sending {
             board.sendOn = false
+            sendFailed = ""
             touch()
             stopSend()
             return
@@ -101,7 +144,9 @@ extension MainWindow {
     }
 
     func showSendSetup() {
-        let panel = SendPanel(board: board, sources: sourceGroup.all.map(\.config))
+        let panel = SendPanel(board: board, sources: sourceGroup.all.map(\.config),
+                              speaker: speaker,
+                              busy: { [weak self] in self?.liveOrRecording ?? false })
         guard panel.run(over: window) else { return }
         panel.apply(to: board)
         touch()
@@ -267,6 +312,15 @@ extension MainWindow {
                 + "another program on this machine."
         }
         var parts = [send.report()]
+        // The one sentence everybody setting up a call needs and nobody is
+        // told (W380-03). On a Mac a cable is one device with one name, so the
+        // far end is the same name, and a card with no input side has no far
+        // end to name at all.
+        if let uid = send.deviceUID, let id = AudioDevices.deviceID(forUID: uid),
+           let info = AudioDevices.info(for: id),
+           let line = MainWindow.farEndLine(name: info.name, inputChannels: info.inputChannels) {
+            parts.append(line)
+        }
         if !board.stream.sendMic {
             // The same rule as the mix minus sentence below: something that is
             // NOT in the send must never be described as though it were.
@@ -288,6 +342,12 @@ extension MainWindow {
         let (ok, why) = group.keepingUp()
         if !ok { parts.append("Your output is not keeping up: \(why).") }
         return parts.joined(separator: " ")
+    }
+
+    /// Windows' `SendDialog._describe` sentence, for a device that is its
+    /// own far end. nil for one with no input side.
+    static func farEndLine(name: String, inputChannels: Int) -> String? {
+        inputChannels >= 1 ? "In the other program, choose \(name) as its input device." : nil
     }
 
     /// Is there really something by that name to leave out.

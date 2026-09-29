@@ -244,6 +244,20 @@ extension MainWindow {
             + "Turn it off only when something else is putting your voice on the air."))
         let titlesBox = check("Send what is playing", board.stream.sendTitles)
         streamBox.addArrangedSubview(titlesBox)
+        // How a track with an artist is written, wherever it is named: the
+        // station's title, the card, the window and what is said as it starts.
+        // Tyler asked for the choice, 20 September 2026. See TitleFormat.
+        let titleFormatPopup = NSPopUpButton()
+        for key in TitleFormat.all {
+            titleFormatPopup.addItem(withTitle: TitleFormat.labels[key] ?? key)
+        }
+        titleFormatPopup.selectItem(at: TitleFormat.all.firstIndex(of: board.titleFormat) ?? 0)
+        titleFormatPopup.setAccessibilityLabel("How a song is named")
+        streamBox.addArrangedSubview(field("How a song is named", titleFormatPopup))
+        streamBox.addArrangedSubview(note(
+            "Used for what your station shows as playing, the card, the window's title "
+            + "and what is said as a song starts. A song with no artist is named by its "
+            + "title either way."))
 
         // More than one station, because Tony runs two and retyping an address
         // and a password to move between them is the friction that stops you
@@ -942,6 +956,8 @@ extension MainWindow {
         board.stream.isPublic = publicBox.state == .on
         board.stream.sendMic = micAirBox.state == .on
         board.stream.sendTitles = titlesBox.state == .on
+        board.titleFormat = TitleFormat.all[
+            max(0, min(TitleFormat.all.count - 1, titleFormatPopup.indexOfSelectedItem))]
         mic.onAir = board.stream.sendMic
 
         board.recordFormat = C.recordFormatKeys[max(0, formatPopup.indexOfSelectedItem)]
@@ -994,6 +1010,13 @@ extension MainWindow {
         }
         if schemeChanged { refreshAllPads() }
         playlistView.refresh(rowsChanged: false)
+        // Send what is playing, or how a song is named, may have changed: the
+        // station, the card and the window follow now rather than at the next
+        // song, as they do on Windows.
+        titlesFollowTrack()
+        if player.isPlaying, let track = player.currentTrack {
+            window?.title = "\(track.named(board.titleFormat)) - \(C.appName)"
+        }
         updateStatusLine()
         touch()
 

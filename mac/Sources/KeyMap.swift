@@ -327,7 +327,13 @@ enum KeyMap {
         .playlistGotoPlaying: [Binding("l", [.command, .shift])],
 
         // On air
-        .micToggle:     [Binding("m", [.command])],
+        // Option Shift M is a second way in, Windows 3.8.3's Alt+Shift+M: a
+        // key another program takes for the whole machine never reaches the
+        // app, and nothing tells either of them (W383-03). An alias rather
+        // than a second menu item, because a menu showing two keys for one
+        // thing reads as two commands.
+        .micToggle:     [Binding("m", [.command]),
+                         Binding("m", [.option, .shift], primary: false)],
         .micSettings:   [Binding("m", [.command, .shift])],
         // One key per destination (W382-07). Command B is the video
         // platform; Option Shift B is the radio station, which is Windows'
@@ -550,5 +556,32 @@ enum KeyMap {
             keys.insert(fixed)
         }
         return keys.sorted()
+    }
+
+    /// Every modified key this window answers to, by `identity`, with the
+    /// words a sentence names it by ("Command M"). Derived, never listed, so a
+    /// key added next month is checked too: the command bindings with every
+    /// alias, the Windows Control letters and the digit map for the scheme in
+    /// force. Bare keys are left out because a global hotkey always needs a
+    /// modifier, so nothing bare can ever clash with one.
+    static func modifiedKeys() -> [String: String] {
+        var out: [String: String] = [:]
+        func add(_ key: String, _ mods: NSEvent.ModifierFlags) {
+            guard !mods.intersection([.command, .option, .control, .shift]).isEmpty
+            else { return }
+            out[identity(key: key, mods: mods)] = spell(key: key, mods: mods)
+                .replacingOccurrences(of: "+", with: " ")
+        }
+        for (_, list) in bindings { for b in list { add(b.key, b.mods) } }
+        for (letter, _) in windowsAliases { add(letter, [.control]) }
+        for d in C.digits {
+            let digit = String(d)
+            add(digit, [.shift])
+            add(digit, bank2Mods)
+            add(digit, bank2Mods.union(.shift))
+            add(digit, bank3Mods)
+            add(digit, bank3Mods.union(.shift))
+        }
+        return out
     }
 }

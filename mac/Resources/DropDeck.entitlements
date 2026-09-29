@@ -7,6 +7,14 @@
 	     board on the first launch after an update. -->
 	<key>com.apple.security.device.audio-input</key>
 	<true/>
+	<!-- The camera, for a picture that is a camera or the screen with the
+	     camera in a corner. Under the hardened runtime an app WITHOUT this is
+	     never listed in System Settings, Privacy and Security, Camera, however
+	     many times it asks, so it can never be granted: Raymond, in-app
+	     reports 38 and 43. The usage string in Info.plist is not enough on its
+	     own. SelfTest reads this back out of the signed bundle. -->
+	<key>com.apple.security.device.camera</key>
+	<true/>
 	<!-- The hardened runtime blocks loading unsigned Audio Units into the
 	     process. Tony's plugin folder is full of them, so hosting a plugin
 	     needs this. -->

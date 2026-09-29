@@ -200,3 +200,64 @@ final class GlobalHotkeys {
     /// How many are live right now.
     var count: Int { registered.count }
 }
+
+/// A pad's global hotkey on one of the app's own keys (W383-02).
+///
+/// While global hotkeys are on, macOS hands that combination to the pad from
+/// everywhere, this window included, so the key's usual job here never
+/// happens: a global hotkey on Command M plays a sound and the microphone key
+/// does nothing. The hotkey window warns at the time; this says it again at
+/// every start, because by then nobody remembers.
+enum HotkeyClash {
+
+    /// The characters and modifiers a combination is in `KeyMap`'s terms, or
+    /// nil for a key the map could never bind.
+    static func mapKey(_ combination: HotkeyCombination) -> (String, NSEvent.ModifierFlags)? {
+        let name = HotkeyCombination.name(for: combination.keyCode)
+        var key: String?
+        if name.count == 1 {
+            key = name.lowercased()
+        } else if name.hasPrefix("F"), let n = Int(name.dropFirst()), n >= 1, n <= 20 {
+            key = String(UnicodeScalar(NSF1FunctionKey + n - 1)!)
+        } else {
+            let named: [String: String] = [
+                "Space": " ", "Return": "\r", "Tab": "\t", "Delete": "\u{8}",
+                "Escape": "\u{1B}",
+                "ForwardDelete": String(UnicodeScalar(NSDeleteFunctionKey)!),
+                "Home": String(UnicodeScalar(NSHomeFunctionKey)!),
+                "End": String(UnicodeScalar(NSEndFunctionKey)!),
+                "Up": String(UnicodeScalar(NSUpArrowFunctionKey)!),
+                "Down": String(UnicodeScalar(NSDownArrowFunctionKey)!),
+                "Left": String(UnicodeScalar(NSLeftArrowFunctionKey)!),
+                "Right": String(UnicodeScalar(NSRightArrowFunctionKey)!),
+            ]
+            key = named[name]
+        }
+        guard let key else { return nil }
+        var mods: NSEvent.ModifierFlags = []
+        if combination.modifiers & UInt32(controlKey) != 0 { mods.insert(.control) }
+        if combination.modifiers & UInt32(optionKey) != 0 { mods.insert(.option) }
+        if combination.modifiers & UInt32(cmdKey) != 0 { mods.insert(.command) }
+        if combination.modifiers & UInt32(shiftKey) != 0 { mods.insert(.shift) }
+        return (key, mods)
+    }
+
+    /// One sentence per clash, in Windows' words with the Mac's keys.
+    /// `hotkeys` are the ones REALLY registered: one macOS refused belongs to
+    /// somebody else, and calling it ours would say a false sentence.
+    static func lines(hotkeys: [(HotkeyCombination, String)],
+                      appKeys: [String: String] = KeyMap.modifiedKeys()) -> [String] {
+        var out: [String] = []
+        var said = Set<String>()
+        for (combination, name) in hotkeys {
+            guard let (key, mods) = mapKey(combination) else { continue }
+            let id = KeyMap.identity(key: key, mods: mods)
+            guard let label = appKeys[id], !said.contains(id) else { continue }
+            said.insert(id)
+            out.append("\(label) is also the global hotkey for \(name), so while global "
+                + "hotkeys are on it plays that sound instead. Command G turns global "
+                + "hotkeys off")
+        }
+        return out
+    }
+}

@@ -31,6 +31,9 @@ protocol PlaylistViewDelegate: AnyObject {
     func playlistPlayFromHere(_ row: Int)
     func playlistSegueTo(_ row: Int)
     func playlistToggleTick(_ row: Int)
+    /// The tick itself clicked, or pressed with VoiceOver: the check box has
+    /// already said its new state, so this only writes it down.
+    func playlistTickClicked(_ row: Int)
     func playlistRemove(_ row: Int)
     func playlistMove(_ row: Int, by offset: Int)
     func playlistMoveToEdge(_ row: Int, top: Bool)
@@ -42,6 +45,44 @@ protocol PlaylistViewDelegate: AnyObject {
     func playlistRowMenu(_ row: Int, at point: NSPoint, in view: NSView)
     /// Files, folders or a playlist file dropped on the list. nil means the end.
     func playlistDropped(_ paths: [String], at row: Int?)
+}
+
+/// The tick on one row of the running order.
+///
+/// **The state travels in the VALUE, and the label never states it.** Until
+/// 3.8.4 every tick was labelled "Ticked to play", so VoiceOver said "Ticked
+/// to play" on every row, ticked or not, arrowing or after Space: a label is
+/// read first and read as the answer, and whether the value that followed it
+/// said "unchecked" was lost under it (Siena, 9 September 2026). The label is
+/// now the column's name and nothing more, the value is the tick, and the
+/// value description says it in the app's own words, so a row reads "Play,
+/// not ticked" when it is not.
+final class TickBox: NSButton {
+
+    /// Never "ticked" or "unticked": a label that sounds like a state is heard
+    /// as one.
+    static let label = "Play"
+
+    static func said(_ ticked: Bool) -> String { ticked ? "ticked" : "not ticked" }
+
+    convenience init(target: AnyObject?, action: Selector?) {
+        self.init(checkboxWithTitle: "", target: target, action: action)
+        setAccessibilityLabel(TickBox.label)
+    }
+
+    override func accessibilityLabel() -> String? { TickBox.label }
+    override func accessibilityValue() -> Any? { NSNumber(value: state == .on ? 1 : 0) }
+    override func accessibilityValueDescription() -> String? { TickBox.said(state == .on) }
+
+    /// Change the tick from the model, and tell VoiceOver the VALUE moved.
+    /// Nothing else about the control is touched: the row a screen reader is
+    /// standing on is never relabelled.
+    func show(_ ticked: Bool) {
+        let wanted: NSControl.StateValue = ticked ? .on : .off
+        guard state != wanted else { return }
+        state = wanted
+        NSAccessibility.post(element: self, notification: .valueChanged)
+    }
 }
 
 final class PlaylistTable: NSTableView {
@@ -380,10 +421,9 @@ final class PlaylistView: NSView, NSTableViewDataSource, NSTableViewDelegate {
             return f
         }
         if id.rawValue == Column.tick.rawValue {
-            let box = NSButton(checkboxWithTitle: "", target: self, action: #selector(tickClicked(_:)))
+            let box = TickBox(target: self, action: #selector(tickClicked(_:)))
             box.tag = row
             box.state = playlist.tracks[row].enabled ? .on : .off
-            box.setAccessibilityLabel("Ticked to play")
             return box
         }
         let f = NSTextField(labelWithString: "")
@@ -394,9 +434,8 @@ final class PlaylistView: NSView, NSTableViewDataSource, NSTableViewDelegate {
     private func apply(cell: NSView, column: NSTableColumn, row: Int) {
         guard row < playlist.count else { return }
         let track = playlist.tracks[row]
-        if let box = cell as? NSButton {
-            let wanted: NSControl.StateValue = track.enabled ? .on : .off
-            if box.state != wanted { box.state = wanted }
+        if let box = cell as? TickBox {
+            box.show(track.enabled)
             box.tag = row
             return
         }
@@ -464,7 +503,28 @@ final class PlaylistView: NSView, NSTableViewDataSource, NSTableViewDelegate {
     // --------------------------------------------------------------- actions ---
 
     @objc private func tickClicked(_ sender: NSButton) {
-        delegate?.playlistToggleTick(sender.tag)
+        delegate?.playlistTickClicked(sender.tag)
+    }
+
+    /// The tick cell a row is showing, made if need be. For the self test,
+    /// which asks it what VoiceOver would be told.
+    func tickCell(row: Int) -> TickBox? {
+        guard let column = table.tableColumns.first(where: {
+            $0.identifier.rawValue == Column.tick.rawValue }) else { return nil }
+        return tableView(table, viewFor: column, row: row) as? TickBox
+    }
+
+    /// Press Space on a row, the way the keyboard does. For the self test.
+    func pressSpace(row: Int) {
+        delegate?.playlistToggleTick(row)
+    }
+
+    /// What Space says. The tick is in the table rather than focused, so
+    /// VoiceOver says nothing of its own when Space changes it, and a key
+    /// that changes something you cannot see and says nothing is a key you
+    /// have to go and check.
+    static func tickSentence(name: String, ticked: Bool) -> String {
+        ticked ? "Ticked, \(name) will play" : "Unticked, \(name) will be skipped"
     }
     @objc private func crossfadeCommitted() {
         delegate?.playlistCrossfadeChanged(crossfadeField.doubleValue)

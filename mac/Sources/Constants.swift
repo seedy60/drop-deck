@@ -245,6 +245,13 @@ enum C {
     /// the two streams will ever drift apart in and small enough to be
     /// inaudible.
     static let micRingFrames = 12000
+    /// How long after the microphone opens it is asked whether anything at
+    /// all has arrived from it. Windows' `MIC_SIGNAL_CHECK_MS`, 2500.
+    static let micSignalCheckSeconds = 2.5
+    /// How long a captured program is given after it opens again before it is
+    /// captured and said to be back, so a program shutting down and starting
+    /// cannot say "back" and then "closed". Windows' `SOURCE_SETTLE_SECONDS`.
+    static let sourceSettleSeconds = 4.0
 
     // ----------------------------------------------------------- the air ---
     //

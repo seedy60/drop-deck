@@ -47,23 +47,28 @@ extension MainWindow: PlaylistViewDelegate {
             // The title IS rewritten freely: a title is not focused, so writing
             // it interrupts nothing, and it is what a screen reader reads when
             // you come back to the window.
-            self.window?.title = "\(track.displayName) - \(C.appName)"
+            // Named in the board's title format, as Windows names it with
+            // `display_name`: the title and the artist, not the title alone.
+            let named = track.named(self.board.titleFormat)
+            self.window?.title = "\(named) - \(C.appName)"
             self.playlistView.onAirRow = row
             let length = formatDuration(track.duration)
             self.speaker.announcePlayback(
-                length.isEmpty ? track.displayName : "\(track.displayName), \(length)")
+                length.isEmpty ? named : "\(named), \(length)")
             self.playlistView.refresh(rowsChanged: false)
             // The track list beside any recording, and the cue sheet window if
             // one is open. Pads are deliberately not in a track list.
             self.trackWentOut(track)
-            // The card and the words on top follow the track, on the air and
-            // in a picture recording alike.
-            self.pictureFollowsTrack()
+            // The station's title, the card and the words on top follow the
+            // track, on the air and in a picture recording alike.
+            self.titlesFollowTrack()
         }
         player.onStopped = { [weak self] in
             guard let self else { return }
             self.window?.title = C.appName
             self.playlistView.onAirRow = nil
+            // Nothing is playing, so nothing is said to be.
+            self.titlesFollowTrack()
             self.speaker.announce("Playlist stopped")
         }
         player.onStarting = { [weak self] in
@@ -134,16 +139,31 @@ extension MainWindow: PlaylistViewDelegate {
         }
     }
 
+    /// Space on a row. **Said, on the state channel**: the table has the
+    /// focus rather than the tick, so VoiceOver says nothing of its own when
+    /// the tick changes, and the note this used to write assumed it had.
     func playlistToggleTick(_ row: Int) {
-        guard board.playlist.tracks.indices.contains(row) else { return }
+        guard let track = toggleTick(row) else { return }
+        speaker.announceState(PlaylistView.tickSentence(name: track.displayName,
+                                                        ticked: track.enabled))
+    }
+
+    /// The tick clicked or pressed with VoiceOver. The check box has already
+    /// said "checked" or "unchecked", so the app only writes down what that
+    /// means.
+    func playlistTickClicked(_ row: Int) {
+        guard let track = toggleTick(row) else { return }
+        speaker.note(track.enabled ? "\(track.displayName) will play"
+                                   : "\(track.displayName) will be skipped")
+    }
+
+    private func toggleTick(_ row: Int) -> Track? {
+        guard board.playlist.tracks.indices.contains(row) else { return nil }
         let track = board.playlist.tracks[row]
         track.enabled.toggle()
         playlistView.refresh(rowsChanged: false)
-        // The check box itself has already said "checked" or "not checked", so
-        // the app only writes down what that means.
-        speaker.note(track.enabled ? "\(track.displayName) will play"
-                                   : "\(track.displayName) will be skipped")
         touch()
+        return track
     }
 
     func playlistRemove(_ row: Int) {

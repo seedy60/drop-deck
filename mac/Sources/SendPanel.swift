@@ -19,27 +19,44 @@ final class SendPanel: NSObject {
     private var minusPopup: NSPopUpButton!
     private var gainSlider: NSSlider!
     private var hearBox: NSButton!
+    /// Test the cable (W380-01), and the four lines the verdict goes in.
+    private(set) var testButton: NSButton!
+    private(set) var verdict: NSTextField!
+    /// **A flag, never a disabled button.** Disabling the button with the
+    /// focus hands the focus to the next control, silently, and a second press
+    /// is refused with a spoken line instead (W384-32).
+    let testFlag = WorkFlag()
+
+    private let speaker: Speaker?
+    /// True while the show is on air or recording, when a tone must not go
+    /// down a cable somebody may be listening to.
+    private let busy: () -> Bool
+    /// The measurement itself. The real one plays a tone and records; the
+    /// self test hands in one that answers at once, so the BUTTON is what is
+    /// tested, which is where Windows' fault was.
+    private let tester: (String, String) -> CableTest.Result
 
     private var outputs: [AudioDeviceInfo] = []
+    private let givenOutputs: [AudioDeviceInfo]?
     /// What the minus popup offers, in the order it offers it. Index 0 is
     /// "nothing", so a choice is never an index into the source list.
     private var minusNames: [String] = []
 
-    init(board: Board, sources: [SourceConfig]) {
+    init(board: Board, sources: [SourceConfig], speaker: Speaker? = nil,
+         busy: @escaping () -> Bool = { false },
+         outputs: [AudioDeviceInfo]? = nil,
+         tester: @escaping (String, String) -> CableTest.Result = {
+             CableTest.run(uid: $0, name: $1) }) {
         self.board = board
         self.sources = sources
+        self.speaker = speaker
+        self.busy = busy
+        self.givenOutputs = outputs
+        self.tester = tester
         super.init()
     }
 
     func run(over parent: NSWindow?) -> Bool {
-        // **Drop Deck Audio goes first**, when it is there. It is the answer to
-        // the question this window asks, and a list sorted by whatever order
-        // Core Audio happened to enumerate in makes somebody arrow past it.
-        // Everything else keeps the order it came in.
-        let all = AudioDevices.outputs()
-        outputs = all.filter { $0.uid == VirtualDevice.uid }
-            + all.filter { $0.uid != VirtualDevice.uid }
-
         let alert = NSAlert()
         alert.messageText = "Send this show to another program"
         alert.informativeText = """
@@ -55,12 +72,27 @@ final class SendPanel: NSObject {
             """
         alert.addButton(withTitle: "OK")
         alert.addButton(withTitle: "Cancel")
+        alert.accessoryView = makeAccessory()
+        alert.window.initialFirstResponder = onBox
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    /// Everything under the paragraph. Built apart from `run` so the self
+    /// test can press the real Test the cable button with no window up.
+    func makeAccessory() -> NSView {
+        // **Drop Deck Audio goes first**, when it is there. It is the answer to
+        // the question this window asks, and a list sorted by whatever order
+        // Core Audio happened to enumerate in makes somebody arrow past it.
+        // Everything else keeps the order it came in.
+        let all = givenOutputs ?? AudioDevices.outputs()
+        outputs = all.filter { $0.uid == VirtualDevice.uid }
+            + all.filter { $0.uid != VirtualDevice.uid }
 
         let box = NSStackView()
         box.orientation = .vertical
         box.alignment = .leading
         box.spacing = 8
-        box.frame = NSRect(x: 0, y: 0, width: 520, height: 300)
+        box.frame = NSRect(x: 0, y: 0, width: 520, height: 380)
 
         onBox = NSButton(checkboxWithTitle: "Send this show to another program",
                          target: nil, action: nil)
@@ -142,12 +174,73 @@ final class SendPanel: NSObject {
                 + "set up. Any other virtual cable works here too."))
         }
 
+        // **The one control here that proves anything.** Everything above it
+        // is a setting, and a setting that looks right is exactly what the
+        // 3.6.0 fault on Windows looked like: a perfectly healthy stream with
+        // seven per cent of the audio never reaching the far end.
+        testButton = NSButton(title: "Test the cable", target: self,
+                              action: #selector(testPressed))
+        testButton.bezelStyle = .rounded
+        testButton.setAccessibilityLabel("Test the cable")
+        box.addArrangedSubview(testButton)
+        // Four lines, because the verdict is a real paragraph and a label that
+        // clips it loses the half that says what to do.
+        verdict = NSTextField(wrappingLabelWithString: "")
+        verdict.preferredMaxLayoutWidth = 500
+        verdict.setAccessibilityLabel("What the cable test found")
+        verdict.heightAnchor.constraint(greaterThanOrEqualToConstant: 64).isActive = true
+        box.addArrangedSubview(verdict)
+
         box.addArrangedSubview(note("Command+Shift+O says whether it is arriving "
             + "cleanly. Command+Shift+W reads out where everything is going."))
+        return box
+    }
 
-        alert.accessoryView = box
-        alert.window.initialFirstResponder = onBox
-        return alert.runModal() == .alertFirstButtonReturn
+    /// Choose an output in the popup, for the self test.
+    func chooseOutput(at index: Int) { devicePopup.selectItem(at: index) }
+
+    // ------------------------------------------------------ the cable test ---
+
+    /// Send a tone down the cable and say what came back. On a thread,
+    /// because it takes two seconds of real time and a window that stops
+    /// answering for two seconds is a window a screen reader user believes
+    /// has crashed. Windows' `SendDialog._on_test`.
+    @objc func testPressed() {
+        guard !testFlag.running else {
+            say("Still testing the cable. It takes two seconds.")
+            return
+        }
+        if busy() {
+            say(CableTest.notWhileLive)
+            return
+        }
+        let chosen = devicePopup.indexOfSelectedItem
+        guard chosen >= 1, chosen <= outputs.count else {
+            say(CableTest.choose)
+            return
+        }
+        let device = outputs[chosen - 1]
+        guard testFlag.begin() else { return }
+        say(CableTest.testing(device.name))
+        let run = tester
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = run(device.uid, device.name)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.testFlag.end()
+                self.say(result.said.isEmpty
+                         ? "The cable could not be tested. No reason was given."
+                         : result.said)
+            }
+        }
+    }
+
+    /// Put a sentence on the page AND speak it: a label changing is not
+    /// something VoiceOver reports, so a verdict written silently would be a
+    /// verdict nobody knew had arrived.
+    private func say(_ words: String) {
+        verdict?.stringValue = words
+        speaker?.announceAnswer(words)
     }
 
     /// Nothing is written to the board until OK, and then all of it at once.

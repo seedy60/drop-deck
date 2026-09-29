@@ -48,10 +48,10 @@ final class Speaker {
 
     /// What you cannot otherwise know: a missing file, a key the system
     /// refused, a number you asked for. Silent only at "none".
-    func announce(_ text: String) {
+    func announce(_ text: String, interrupt: Bool = true) {
         note(text)
         guard level != C.speechNone else { return }
-        say(text)
+        say(text, interrupt: interrupt)
     }
 
     /// A state you have just changed and cannot see: ducking, the microphone,
@@ -68,10 +68,10 @@ final class Speaker {
 
     /// A confirmation of something you just did, or a hint you have read
     /// before. Silent below "all".
-    func announceHelp(_ text: String) {
+    func announceHelp(_ text: String, interrupt: Bool = true) {
         note(text)
         guard level == C.speechAll else { return }
-        say(text)
+        say(text, interrupt: interrupt)
     }
 
     /// The name of a sound you can hear anyway. Silent below "all", and off
@@ -112,7 +112,17 @@ final class Speaker {
 
     /// Interrupting is the default: during a live show the thing you just did
     /// matters more than the thing you did a second ago.
-    private func say(_ text: String) {
+    ///
+    /// **A line nobody asked for waits its turn** (W383-15). A timer's line, a
+    /// program closing or coming back, a send coming back, arrives at a moment
+    /// nobody chose, perhaps half way through VoiceOver reading something the
+    /// presenter is listening to; it is queued behind that rather than cutting
+    /// it off. Windows passes `interrupt=False` for the same lines.
+    static func priority(interrupt: Bool) -> NSAccessibilityPriorityLevel {
+        interrupt ? .high : .medium
+    }
+
+    private func say(_ text: String, interrupt: Bool = true) {
         guard !text.isEmpty else { return }
         let post = { [weak self] in
             guard let self else { return }
@@ -125,7 +135,7 @@ final class Speaker {
                 notification: .announcementRequested,
                 userInfo: [
                     .announcement: text,
-                    .priority: NSAccessibilityPriorityLevel.high.rawValue,
+                    .priority: Speaker.priority(interrupt: interrupt).rawValue,
                 ])
         }
         if Thread.isMainThread { post() } else { DispatchQueue.main.async(execute: post) }

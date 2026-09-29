@@ -123,6 +123,14 @@ final class MicInput {
     private(set) var lastError: String?
     var deviceUID: String? { input.deviceUID }
     var deviceName: String? { input.deviceName }
+    /// What the opening really got back, for the sentence and for feedback.
+    var lastStatus: OSStatus? { input.lastStatus }
+    /// Which opening this is, and what has arrived since it (W383-10).
+    var openings: Int { input.openings }
+    var blocksSeen: Int { input.blocksSeen }
+    var signalSeen: Bool { input.signalSeen }
+    var failedReads: Int { input.failedReads }
+    var lastReadStatus: OSStatus { input.lastReadStatus }
 
     var gainDB: Float = C.defaultMicGainDB
     var channel: MicChannel = .mix

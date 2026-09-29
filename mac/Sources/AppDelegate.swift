@@ -118,20 +118,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// air. Asking here means the answer is settled while nobody is waiting.
     ///
     /// It asks ONLY for what the board needs and ONLY when macOS has never
-    /// been asked, so it happens once and it never nags. A board pointed at a
-    /// radio station with a card for a picture is asked nothing at all, which
-    /// is most boards.
+    /// been asked, so it happens once and it never nags. A board with a card
+    /// for a picture is asked nothing at all, which is most boards.
+    ///
+    /// **Whatever the board is pointed at.** It used to ask only when Command
+    /// B went to the video platform, and a recording carries the picture too
+    /// (W381), so a radio board recording its camera met the system dialog in
+    /// the middle of the show. See `Permissions.wantedAtLaunch`.
     private func askForWhatTheBoardNeeds() {
-        guard main.board.liveTo == C.liveToVideo else { return }
-        var wanted: [Permission] = []
-        if C.pictureNeedsCamera.contains(main.board.picture),
-           Permissions.state(.camera) == .neverAsked {
-            wanted.append(.camera)
-        }
-        if C.pictureNeedsScreen.contains(main.board.picture),
-           Permissions.state(.screen) == .neverAsked {
-            wanted.append(.screen)
-        }
+        let wanted = Permissions.wantedAtLaunch(picture: main.board.picture,
+                                                camera: Permissions.state(.camera),
+                                                screen: Permissions.state(.screen))
         guard !wanted.isEmpty else { return }
 
         let names = wanted.map { $0.label.lowercased() }

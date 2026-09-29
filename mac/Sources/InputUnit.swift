@@ -23,8 +23,33 @@ final class InputUnit {
     private(set) var channels: UInt32 = 2
     private(set) var isOpen = false
     private(set) var lastError: String?
+    /// The device this unit really has open. Written only once an opening
+    /// has SUCCEEDED (N9, W383-11): it used to be written before the first
+    /// call to Core Audio, so a failed opening left a name behind that the
+    /// microphone key then reported, and saved, as the one in use.
     private(set) var deviceUID: String?
     private(set) var deviceName: String?
+    /// The last OSStatus an opening got back, for `MicDiag.explain` and for a
+    /// feedback report. nil after a success, and nil when there was no device
+    /// to open at all.
+    private(set) var lastStatus: OSStatus?
+
+    /// Counted on the audio thread, read on the main one a moment after
+    /// opening (W383-10). Plain counters: a torn read of one of these is at
+    /// worst a check that runs again at the next opening.
+    ///
+    /// Which opening this is, so a check scheduled for one opening never
+    /// reports on the next.
+    private(set) var openings = 0
+    /// Capture callbacks that arrived since the last opening.
+    private(set) var blocksSeen = 0
+    /// Callbacks where the render itself failed, which used to be dropped
+    /// without a trace (N8).
+    private(set) var failedReads = 0
+    private(set) var lastReadStatus: OSStatus = noErr
+    /// Any raw sample other than exact zero since the last opening, measured
+    /// BEFORE any gain.
+    private(set) var signalSeen = false
 
     private var unit: AudioUnit?
     private var bufferList: UnsafeMutableAudioBufferListPointer?
@@ -40,14 +65,16 @@ final class InputUnit {
     func open(deviceUID uid: String?) -> Bool {
         guard !isOpen else { return true }
         lastError = nil
+        lastStatus = nil
 
         guard var deviceID = uid.flatMap(AudioDevices.deviceID(forUID:))
                 ?? AudioDevices.defaultInput() else {
             lastError = "There is no input device on this Mac"
             return false
         }
-        deviceUID = AudioDevices.info(for: deviceID)?.uid ?? uid
-        deviceName = AudioDevices.info(for: deviceID)?.name
+        // Read now, written only on success, at the end.
+        let openingUID = AudioDevices.info(for: deviceID)?.uid ?? uid
+        let openingName = AudioDevices.info(for: deviceID)?.name
 
         var desc = AudioComponentDescription(
             componentType: kAudioUnitType_Output,
@@ -59,32 +86,42 @@ final class InputUnit {
             return false
         }
         var u: AudioUnit?
-        guard AudioComponentInstanceNew(comp, &u) == noErr, let unit = u else {
+        let made = AudioComponentInstanceNew(comp, &u)
+        guard made == noErr, let unit = u else {
             lastError = "Could not open that input"
+            lastStatus = made == noErr ? kAudioHardwareUnspecifiedError : made
             return false
         }
 
+        // Every step keeps what Core Audio said, so the reason a person hears
+        // is the real one (W383-07) rather than a fixed phrase.
+        var status: OSStatus = noErr
         func fail(_ message: String) -> Bool {
             lastError = message
+            lastStatus = status == noErr ? kAudioHardwareUnspecifiedError : status
             AudioComponentInstanceDispose(unit)
             self.unit = nil
             return false
+        }
+        func ok(_ result: OSStatus) -> Bool {
+            status = result
+            return result == noErr
         }
 
         // Input on element 1, output off on element 0. An AUHAL that is not
         // told this captures nothing at all, silently.
         var on: UInt32 = 1, off: UInt32 = 0
-        guard AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO,
-                                   kAudioUnitScope_Input, 1, &on,
-                                   UInt32(MemoryLayout<UInt32>.size)) == noErr,
-              AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO,
-                                   kAudioUnitScope_Output, 0, &off,
-                                   UInt32(MemoryLayout<UInt32>.size)) == noErr
+        guard ok(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO,
+                                      kAudioUnitScope_Input, 1, &on,
+                                      UInt32(MemoryLayout<UInt32>.size))),
+              ok(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO,
+                                      kAudioUnitScope_Output, 0, &off,
+                                      UInt32(MemoryLayout<UInt32>.size)))
         else { return fail("That input would not open for capture") }
 
-        guard AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
-                                   kAudioUnitScope_Global, 0, &deviceID,
-                                   UInt32(MemoryLayout<AudioDeviceID>.size)) == noErr
+        guard ok(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
+                                      kAudioUnitScope_Global, 0, &deviceID,
+                                      UInt32(MemoryLayout<AudioDeviceID>.size)))
         else { return fail("That input would not open") }
 
         // Take the rate the device really offers and convert afterwards. Asking
@@ -106,21 +143,20 @@ final class InputUnit {
             mBytesPerFrame: 4 * channels,
             mChannelsPerFrame: channels,
             mBitsPerChannel: 32, mReserved: 0)
-        guard AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat,
-                                   kAudioUnitScope_Output, 1, &format,
-                                   UInt32(MemoryLayout<AudioStreamBasicDescription>.size))
-                == noErr
+        guard ok(AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat,
+                                      kAudioUnitScope_Output, 1, &format,
+                                      UInt32(MemoryLayout<AudioStreamBasicDescription>.size)))
         else { return fail("That input would not give float audio") }
 
         var callback = AURenderCallbackStruct(
             inputProc: inputUnitCallback,
             inputProcRefCon: Unmanaged.passUnretained(self).toOpaque())
-        guard AudioUnitSetProperty(unit, kAudioOutputUnitProperty_SetInputCallback,
-                                   kAudioUnitScope_Global, 0, &callback,
-                                   UInt32(MemoryLayout<AURenderCallbackStruct>.size)) == noErr
+        guard ok(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_SetInputCallback,
+                                      kAudioUnitScope_Global, 0, &callback,
+                                      UInt32(MemoryLayout<AURenderCallbackStruct>.size)))
         else { return fail("The capture callback would not attach") }
 
-        guard AudioUnitInitialize(unit) == noErr else {
+        guard ok(AudioUnitInitialize(unit)) else {
             return fail("That input would not start")
         }
 
@@ -130,7 +166,13 @@ final class InputUnit {
         list[0].mData = nil
         bufferList = list
 
-        guard AudioOutputUnitStart(unit) == noErr else {
+        // Counted from zero for this opening BEFORE it starts, so the first
+        // callback is never lost to a reset that lands after it.
+        blocksSeen = 0
+        failedReads = 0
+        lastReadStatus = noErr
+        signalSeen = false
+        guard ok(AudioOutputUnitStart(unit)) else {
             AudioUnitUninitialize(unit)
             if let l = bufferList { free(l.unsafeMutablePointer) }
             bufferList = nil
@@ -138,6 +180,9 @@ final class InputUnit {
         }
 
         self.unit = unit
+        deviceUID = openingUID
+        deviceName = openingName
+        openings += 1
         isOpen = true
         return true
     }
@@ -166,8 +211,18 @@ final class InputUnit {
         list[0].mNumberChannels = channels
         list[0].mDataByteSize = UInt32(n * Int(channels) * 4)
         list[0].mData = UnsafeMutableRawPointer(raw)
-        guard AudioUnitRender(unit, flags, timestamp, bus, frames,
-                              list.unsafeMutablePointer) == noErr else { return }
+        blocksSeen += 1
+        let rendered = AudioUnitRender(unit, flags, timestamp, bus, frames,
+                                       list.unsafeMutablePointer)
+        guard rendered == noErr else {
+            // Counted rather than dropped in silence (N8): a microphone whose
+            // every read fails sends nothing, and this is how that is told
+            // apart from one that is simply quiet.
+            failedReads += 1
+            lastReadStatus = rendered
+            return
+        }
+        if !signalSeen, MicDiag.hasSignal(raw, count: n * Int(channels)) { signalSeen = true }
         onCapture?(raw, n, channels)
     }
 }

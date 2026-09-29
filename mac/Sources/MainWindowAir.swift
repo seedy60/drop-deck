@@ -30,7 +30,16 @@ extension MainWindow {
 
     // ---------------------------------------------------------- microphone ---
 
-    /// Command M. The only thing in this app that ever opens a microphone.
+    /// Command M, and Option Shift M. The only thing in this app that ever
+    /// opens a microphone.
+    ///
+    /// **This key must never do nothing** (Windows 3.8.3, Mashal). Every way
+    /// it can fail is said in words: the privacy settings are asked BEFORE
+    /// anything opens, because a refused microphone opens perfectly well on a
+    /// Mac and sends silence (W383-06); a failure is said in plain words from
+    /// the real OSStatus (W383-07); the chosen microphone being unplugged is
+    /// said and never saved over (W383-09); and a moment after opening, exact
+    /// silence is noticed and said (W383-10).
     func toggleMic() {
         if mic.isOpen {
             mic.close()
@@ -38,6 +47,32 @@ extension MainWindow {
             updateStatusLine()
             return
         }
+        switch MicDiag.privacy(Permissions.state(.microphone)) {
+        case .refuse(let said):
+            speaker.announceState(MicDiag.failureLine(reason: said, missing: nil))
+        case .ask:
+            // macOS has never been asked. Ask, and open in the answer: the
+            // keypress is still what opens it, a moment later.
+            speaker.announceState("macOS is asking first whether Drop Deck may use "
+                                  + "the microphone")
+            Permissions.ask(.microphone) { [weak self] state, _ in
+                guard let self else { return }
+                if state == .allowed {
+                    self.openMic()
+                } else {
+                    self.speaker.announceState(MicDiag.failureLine(
+                        reason: MicDiag.privacySentence(state) ?? MicDiag.privacyBlocked,
+                        missing: nil))
+                }
+                self.updateAirMenu()
+            }
+        case .open:
+            openMic()
+        }
+    }
+
+    private func openMic() {
+        guard !mic.isOpen else { return }
         mic.gainDB = board.micGainDB
         mic.channel = board.micChannel
         mic.monitorWanted = board.micMonitor
@@ -50,18 +85,40 @@ extension MainWindow {
                 mic.chain.set(key, 0)
             }
         }
-        guard mic.open(deviceUID: board.micDeviceUID, outputRate: group.sampleRate) else {
-            speaker.announceState("The microphone would not open. "
-                                  + (mic.lastError ?? "no reason given"))
+        // A chosen microphone that is not plugged in today: the system default
+        // is opened instead and that is SAID. The board is not touched, so the
+        // real one comes back the moment it is plugged in again.
+        let missing = MicDiag.missing(chosenUID: board.micDeviceUID,
+                                      chosenName: board.micDeviceName,
+                                      isPresent: { AudioDevices.deviceID(forUID: $0) != nil })
+        guard mic.open(deviceUID: missing == nil ? board.micDeviceUID : nil,
+                       outputRate: group.sampleRate) else {
+            speaker.announceState(MicDiag.failureLine(reason: MicDiag.explain(mic.lastStatus),
+                                                      missing: missing))
+            updateAirMenu()
             return
         }
-        board.micDeviceUID = mic.deviceUID
-        board.micDeviceName = mic.deviceName
         var line = "Microphone on, \(mic.deviceName ?? "default input"). Music ducked"
+        if let missing { line += MicDiag.fellBack(missing) }
         if let warning = micOffAirNote { line += ". \(warning)" }
         speaker.announceState(line)
         updateStatusLine()
-        touch()
+        updateAirMenu()
+        // A microphone that opens is not yet a microphone that works.
+        let opening = mic.openings
+        DispatchQueue.main.asyncAfter(deadline: .now() + C.micSignalCheckSeconds) {
+            [weak self] in self?.checkMicSignal(opening)
+        }
+    }
+
+    /// A moment after opening: is macOS sending anything at all? Said once
+    /// per opening, and only when it is true. See `MicDiag.silenceLine`.
+    func checkMicSignal(_ opening: Int) {
+        guard mic.isOpen, mic.openings == opening else { return }
+        if let line = MicDiag.silenceLine(signal: mic.signalSeen, blocks: mic.blocksSeen,
+                                          privacy: Permissions.state(.microphone)) {
+            speaker.announce(line)
+        }
     }
 
     func micSummary() -> String {
@@ -230,6 +287,9 @@ extension MainWindow {
             }
         }
         mic.onAir = board.stream.sendMic
+        // What is playing, held before the connection so it is sent the
+        // moment the station takes us.
+        streamer.nowPlaying(nowPlayingTitle)
         _ = streamer.start(group: group, settings: board.stream)
         speaker.announceState("Connecting to \(board.stream.host)")
         updateStatusLine()
@@ -448,7 +508,11 @@ extension MainWindow {
                              + "Option Shift S adds a source")
             return
         }
-        let panel = SourceControlPanel(group: sourceGroup, mic: mic, speaker: speaker)
+        let panel = SourceControlPanel(group: sourceGroup, mic: mic, speaker: speaker) {
+            [weak self] id in
+            guard let self else { return false }
+            return self.removeSource(id: id)
+        }
         panel.run(over: window)
         // The names may have changed, so put them back on the board.
         for source in sourceGroup.all {
@@ -457,6 +521,22 @@ extension MainWindow {
             }
         }
         touch()
+    }
+
+    /// One source out of the show and off the board, the way Option Shift S
+    /// removes one, and everything that was reading it put right. Saved on
+    /// the spot, because a removal that waits for the window to close is one a
+    /// crash undoes.
+    @discardableResult
+    func removeSource(id: String) -> Bool {
+        guard sourceGroup.forget(id: id, on: board) else { return false }
+        // A send leaving this one out now leaves out nothing, which
+        // `sendReport` says; the taps follow what is still on.
+        syncSend()
+        group.syncTaps()
+        touch()
+        updateStatusLine()
+        return true
     }
 
     /// Option Command M. Every extra source at once, off and back on.

@@ -495,11 +495,17 @@ final class SourceControlPanel: NSObject {
     private var renameButton: NSButton!
     private var removeButton: NSButton!
     private var alert: NSAlert!
+    /// Removes one source from the show and from the board, by id. The window
+    /// hands this in, because the board and what has to be rewired after it
+    /// are the window's; the panel only decides WHICH.
+    private let forget: (String) -> Bool
 
-    init(group: SourceGroup, mic: MicInput, speaker: Speaker) {
+    init(group: SourceGroup, mic: MicInput, speaker: Speaker,
+         forget: @escaping (String) -> Bool) {
         self.group = group
         self.mic = mic
         self.speaker = speaker
+        self.forget = forget
         super.init()
     }
 
@@ -733,9 +739,13 @@ final class SourceControlPanel: NSObject {
             return
         }
         let row = max(0, table.selectedRow)
-        if let source = group.source(id: entry.id) {
-            source.stop()
-            source.config.onAir = false
+        // Really removed: out of the show and off the board. It used to stop
+        // the capture and say "Removed" while the source stayed in this list
+        // and in the board file (in-app reports 36 and 37).
+        guard forget(entry.id) else {
+            speaker.announceAnswer("\(entry.label) could not be found to remove")
+            refresh()
+            return
         }
         speaker.announceAnswer("Removed \(entry.label)")
         table.reloadData()

@@ -777,9 +777,10 @@ final class Streamer {
                 applyState(.live, settings.host, generation: run)
                 liveSince = Date()
                 lastAudio = ProcessInfo.processInfo.systemUptime
-                if settings.sendTitles && !currentTitle.isEmpty {
-                    pushMetadata(currentTitle)
-                }
+                // Whatever is playing, again on every new connection: a
+                // server that dropped us has forgotten the title too.
+                lock.lock(); let title = currentTitle; lock.unlock()
+                if !title.isEmpty { pushMetadata(title) }
             }
 
             let ready = bus.available()
@@ -1033,35 +1034,80 @@ final class Streamer {
 
     /// What is playing, sent to the server's admin door rather than in band.
     /// AAC has nowhere to carry it, which is exactly how Icecast expects it.
+    ///
+    /// **The window decides whether a title is wanted**, and hands "" when it
+    /// is not: `MainWindow.titlesFollowTrack` reads the board's Send what is
+    /// playing every time, as Windows' `_push_stream_title` does, so the box
+    /// can be changed mid show. The settings snapshot taken at go live used to
+    /// decide instead, and could not hear the change. An empty title is held
+    /// and never sent, so a reconnect does not put a finished song back.
+    ///
+    /// Until 3.8.4 nothing called this at all (analysis N1): no title ever left
+    /// the Mac once it was live.
     func nowPlaying(_ title: String) {
+        lock.lock()
+        let changed = title != currentTitle
         currentTitle = title
-        guard isOn, settings.sendTitles, !title.isEmpty else { return }
+        lock.unlock()
+        guard changed, isOn, !title.isEmpty else { return }
         pushMetadata(title)
     }
 
-    private func pushMetadata(_ title: String) {
+    /// Where a title update goes, in Windows' shape for each server
+    /// (`streamout.IcecastSink.metadata_url` and `ShoutcastSink.metadata_url`).
+    ///
+    /// Icecast takes it at /admin/metadata with the source's own password;
+    /// SHOUTcast at admin.cgi with the password in the address. Every value is
+    /// escaped by hand: URLComponents leaves "&" and "+" alone in a query, so
+    /// "Tom & Jerry" would have arrived as "Tom ".
+    static func metadataURL(_ settings: StreamSettings, title: String) -> URL? {
+        guard !settings.host.isEmpty, !title.isEmpty else { return nil }
         let mount = settings.mount.hasPrefix("/") ? settings.mount : "/" + settings.mount
-        var components = URLComponents()
-        components.scheme = "http"
-        components.host = settings.host
-        components.port = settings.port
-        components.path = "/admin/metadata"
-        components.queryItems = [
-            URLQueryItem(name: "mode", value: "updinfo"),
-            URLQueryItem(name: "mount", value: mount),
-            URLQueryItem(name: "song", value: title),
-        ]
-        guard let url = components.url else { return }
+        let pairs: [(String, String)]
+        let path: String
+        if settings.server == C.streamServerShoutcast {
+            path = "/admin.cgi"
+            pairs = [("pass", settings.password), ("mode", "updinfo"), ("song", title)]
+        } else {
+            path = "/admin/metadata"
+            pairs = [("mount", mount), ("mode", "updinfo"), ("song", title),
+                     ("charset", "UTF-8")]
+        }
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        let query = pairs.map { key, value in
+            "\(key)=\(value.addingPercentEncoding(withAllowedCharacters: allowed) ?? "")"
+        }.joined(separator: "&")
+        return URL(string: "http://\(settings.host):\(settings.port)\(path)?\(query)")
+    }
+
+    private func pushMetadata(_ title: String) {
+        guard let url = Streamer.metadataURL(settings, title: title) else { return }
         var request = URLRequest(url: url)
         request.timeoutInterval = 5
-        let credentials = "\(settings.user):\(settings.password)"
-        let auth = Data(credentials.utf8).base64EncodedString()
-        request.setValue("Basic \(auth)", forHTTPHeaderField: "Authorization")
-        // Nothing is done with the answer. A station that refuses a title
-        // update is still a station taking the audio, and taking the show off
-        // air over a metadata refusal would be absurd.
-        URLSession.shared.dataTask(with: request).resume()
+        request.setValue("\(C.appName)/\(C.appVersion)", forHTTPHeaderField: "User-Agent")
+        if settings.server != C.streamServerShoutcast {
+            let credentials = "\(settings.user):\(settings.password)"
+            let auth = Data(credentials.utf8).base64EncodedString()
+            request.setValue("Basic \(auth)", forHTTPHeaderField: "Authorization")
+        }
+        // Nothing is done with the answer beyond counting it. A station that
+        // refuses a title update is still a station taking the audio, and
+        // taking the show off air over a metadata refusal would be absurd.
+        URLSession.shared.dataTask(with: request) { [weak self] _, response, _ in
+            let ok = ((response as? HTTPURLResponse)?.statusCode ?? 0) / 100 == 2
+            guard let self else { return }
+            self.lock.lock()
+            self.titlesSent += 1
+            if ok { self.titlesAccepted += 1 }
+            self.lock.unlock()
+        }.resume()
     }
+
+    /// Title updates sent this session, and how many the server said yes to.
+    /// For `--check-titles`, and for anybody asking why a title did not show.
+    private(set) var titlesSent = 0
+    private(set) var titlesAccepted = 0
 
     /// The line Command Shift B reads out.
     func statusLine() -> String {

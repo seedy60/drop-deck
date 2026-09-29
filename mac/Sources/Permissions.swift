@@ -38,6 +38,7 @@
 import Foundation
 import AVFoundation
 import CoreGraphics
+import Security
 import AppKit
 
 enum Permission: String, CaseIterable {
@@ -132,6 +133,47 @@ enum Permissions {
             // rather than reading.
             return CGPreflightScreenCaptureAccess() ? .allowed : .neverAsked
         }
+    }
+
+    /// What to ask for at launch: whatever the chosen PICTURE needs and
+    /// macOS has never been asked about.
+    ///
+    /// Not gated on where Command B goes. The picture belongs to the app
+    /// rather than to the destination (W381): a recording takes it too, so a
+    /// board pointed at a radio station with a camera for its picture wants
+    /// the camera just as much as a video board does, and the moment to meet
+    /// the system's question is now, not with a recording running.
+    static func wantedAtLaunch(picture: String, camera: PermissionState,
+                               screen: PermissionState) -> [Permission] {
+        var wanted: [Permission] = []
+        if C.pictureNeedsCamera.contains(picture), camera == .neverAsked {
+            wanted.append(.camera)
+        }
+        if C.pictureNeedsScreen.contains(picture), screen == .neverAsked {
+            wanted.append(.screen)
+        }
+        return wanted
+    }
+
+    /// The entitlements the RUNNING, signed copy carries, read back out of its
+    /// own signature. Empty when it is not signed at all.
+    ///
+    /// The one way to know the camera can ever be granted: under the hardened
+    /// runtime an app without `com.apple.security.device.camera` is never
+    /// listed under Privacy and Security, Camera, however often it asks, and
+    /// nothing anywhere says why (Raymond, in-app reports 38 and 43).
+    static func signedEntitlements() -> [String: Any] {
+        var code: SecCode?
+        guard SecCodeCopySelf([], &code) == errSecSuccess, let code else { return [:] }
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess,
+              let staticCode else { return [:] }
+        var info: CFDictionary?
+        guard SecCodeCopySigningInformation(
+                staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &info)
+                == errSecSuccess,
+              let dict = info as? [String: Any] else { return [:] }
+        return dict[kSecCodeInfoEntitlementsDict as String] as? [String: Any] ?? [:]
     }
 
     /// Ask for one, and say what happened.

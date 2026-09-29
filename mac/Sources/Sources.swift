@@ -800,13 +800,35 @@ final class SourceGroup: AudioSource {
     /// Logic after going on air should not have to know to go back into a
     /// dialog. Only the failed ones are touched, so a running capture is never
     /// interrupted by the retry.
-    func retryFailed(outputRate: Double) -> [String] {
-        var cameOn: [String] = []
+    ///
+    /// **Called OFF the main thread** (W383-27): opening a capture is a round
+    /// trip to coreaudiod and holding the window for it is a frozen
+    /// soundboard mid show. `skip` is the programs that have just been opened
+    /// again and are being given time to settle, which `MainWindow` starts and
+    /// announces itself. A source replaced while it was being started is
+    /// stopped again, so nothing is left capturing for nobody.
+    func retryFailed(outputRate: Double, skip: Set<String> = []) -> [RunningSource] {
+        var cameOn: [RunningSource] = []
         for source in all where !source.isRunning {
             guard source.config.onAir || source.config.monitor else { continue }
-            if source.start(outputRate: outputRate) { cameOn.append(source.config.name) }
+            if let bundle = source.config.bundleID, skip.contains(bundle) { continue }
+            guard source.start(outputRate: outputRate) else { continue }
+            (source as? BaseSource)?.syncDelay()
+            if all.contains(where: { $0 === source }) {
+                cameOn.append(source)
+            } else {
+                source.stop()
+            }
         }
         return cameOn
+    }
+
+    /// The wanted program sources capturing one program, by bundle id.
+    func sources(forBundle bundle: String) -> [RunningSource] {
+        all.filter { source in
+            source.config.isProcess && source.config.bundleID == bundle
+                && (source.config.onAir || source.config.monitor)
+        }
     }
 
     /// Put stand-in members in without opening a single device.
@@ -817,6 +839,45 @@ final class SourceGroup: AudioSource {
     /// sound card in it.
     func useForTesting(_ members: [RunningSource]) {
         lock.lock(); sources = members; lock.unlock()
+    }
+
+    /// Take one source out of the show for good: out of the sum, stopped, and
+    /// no longer soloed. Returns it, or nil when there is nothing by that id.
+    ///
+    /// Out of the list BEFORE it is stopped, so the audio thread never reads
+    /// a capture that is being torn down underneath it.
+    @discardableResult
+    func remove(id: String) -> RunningSource? {
+        lock.lock()
+        guard let at = sources.firstIndex(where: { $0.config.id == id }) else {
+            lock.unlock()
+            return nil
+        }
+        let gone = sources.remove(at: at)
+        lock.unlock()
+        if soloed == id { soloed = nil }
+        gone.stop()
+        return gone
+    }
+
+    /// Remove a source from the running show AND from the board, which is what
+    /// Remove in the source control window promises: "It stops going out and
+    /// its settings are forgotten."
+    ///
+    /// **Until 3.8.4 it did only the first half of the first half.** It
+    /// stopped the capture, took it off air and said "Removed", and the source
+    /// stayed in the list and on the board, so it came straight back at the
+    /// next start (in-app reports 36 and 37: FaceTime and TeamTalk that would
+    /// not go away). The Sources window, Option Shift S, always worked,
+    /// because it rewrites `board.sources` and rebuilds the group; this does
+    /// the same two things for one source. Windows' `_remove` does exactly
+    /// this pair too.
+    @discardableResult
+    func forget(id: String, on board: Board) -> Bool {
+        let removed = remove(id: id) != nil
+        let before = board.sources.count
+        board.sources.removeAll { $0.id == id }
+        return removed || board.sources.count != before
     }
 
     func stopAll() {
@@ -930,6 +991,54 @@ final class SourceGroup: AudioSource {
             for i in 0..<(frames * 2) { out[i] += scratch[i] }
         }
     }
+}
+
+/// What is said when a captured program closes and comes back (W383-27), in
+/// Windows' words (`ui._watch_program_sources`).
+enum ProgramWords {
+
+    /// Whether the source is simply named after its program, so a sentence
+    /// need not say the same word twice.
+    static func own(program: String, sourceName: String) -> Bool {
+        sourceName.trimmingCharacters(in: .whitespaces).lowercased()
+            == program.trimmingCharacters(in: .whitespaces).lowercased()
+    }
+
+    static func closed(program: String, sourceName: String) -> String {
+        own(program: program, sourceName: sourceName)
+            ? "\(program) closed, so it is silent until it opens again"
+            : "\(program) closed, so \(sourceName) is silent until it opens again"
+    }
+
+    static func back(program: String, sourceName: String) -> String {
+        own(program: program, sourceName: sourceName)
+            ? "\(program) is back"
+            : "\(program) is back, so \(sourceName) is on again"
+    }
+
+    /// The retry's line. **"On the air" only for what is on the air** (N5):
+    /// a source you only hear yourself is not on the air, and it used to be
+    /// called so.
+    static func cameOn(onAir: [String], monitored: [String]) -> [String] {
+        var lines: [String] = []
+        if !onAir.isEmpty {
+            lines.append(onAir.count == 1 ? "\(onAir[0]) is on the air now"
+                         : "\(onAir.joined(separator: ", ")) are on the air now")
+        }
+        if !monitored.isEmpty {
+            lines.append(monitored.count == 1
+                ? "\(monitored[0]) is running now, in your ears only"
+                : "\(monitored.joined(separator: ", ")) are running now, in your ears only")
+        }
+        return lines
+    }
+
+    /// **Below macOS 26 a capture of a program that has quit is stopped**, so
+    /// the retry can start a new one on the new process. It used to stay
+    /// "running" on the dead process and was never retried, so the program
+    /// went out as silence while passing every check. From macOS 26 the tap
+    /// names the program by bundle id and restores itself, so it is left alone.
+    static func stopWhenProgramQuits(macOS26: Bool) -> Bool { !macOS26 }
 }
 
 /// The monitor half, handed to the mixer separately so the two sums cannot be

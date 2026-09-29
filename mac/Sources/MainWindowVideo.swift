@@ -12,14 +12,41 @@ extension MainWindow {
 
     /// What is playing, the way a listener would be told it.
     ///
-    /// The card and the lower third both want this and they must agree, so it
-    /// is asked for in one place rather than assembled twice.
+    /// The card, the lower third and the stream's metadata all want this and
+    /// they must agree, so it is asked for in one place rather than assembled
+    /// three times. See `titleToSend`.
     var nowPlayingTitle: String {
-        guard let track = player?.currentTrack else { return "" }
-        let artist = (track.artist ?? "").trimmingCharacters(in: .whitespaces)
-        let title = (track.title ?? "").trimmingCharacters(in: .whitespaces)
-        if !artist.isEmpty && !title.isEmpty { return "\(artist) - \(title)" }
-        return title.isEmpty ? track.displayName : title
+        MainWindow.titleToSend(player?.isPlaying == true ? player?.currentTrack : nil,
+                               format: board.titleFormat, send: board.stream.sendTitles)
+    }
+
+    /// The title that leaves the machine, or nothing.
+    ///
+    /// **Nothing when Send what is playing is off**, for the card and the
+    /// words on the picture as much as for the station's metadata, because
+    /// that is what Windows does: its card follows the track only through
+    /// `_push_stream_title`, which returns at once when `stream_titles` is
+    /// off. And nothing when nothing is playing, as Windows'
+    /// `_now_playing_title` says, so a stopped running order does not leave a
+    /// finished song on the card.
+    ///
+    /// Written in the board's title format (`TitleFormat`). The card used to
+    /// say "Artist - Title" whatever the board said, while the window said the
+    /// title alone.
+    static func titleToSend(_ track: Track?, format: String, send: Bool) -> String {
+        guard send, let track else { return "" }
+        return track.named(format)
+    }
+
+    /// A new track, a stopped running order, or a changed setting: the
+    /// station's metadata, the card and the words on the picture all follow.
+    ///
+    /// The metadata half was never wired at all until 3.8.4 (analysis N1):
+    /// `Streamer.nowPlaying` had no caller, so no title ever reached a
+    /// station from a Mac.
+    func titlesFollowTrack() {
+        streamer.nowPlaying(nowPlayingTitle)
+        pictureFollowsTrack()
     }
 
     // ------------------------------------------------------ the settings ---

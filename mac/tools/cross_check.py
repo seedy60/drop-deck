@@ -96,6 +96,9 @@ SOURCES = {
                   "Secrets.swift", "Overlay.swift", "Picture.swift",
                   "Camera.swift", "Screen.swift", "Permissions.swift",
                   "ShotCheck.swift"],
+    # Test the cable: the verdict half only, which opens nothing. The half
+    # that plays the tone is CableTestRun.swift and is not compiled here.
+    "cabletest": ["CableTest.swift"],
     # The board pulls in most of the model, but none of the interface.
     "boardvideo": ["Constants.swift", "KeyMap.swift", "Colours.swift",
                    "Secrets.swift", "ShotCheck.swift", "Board.swift",
@@ -110,7 +113,7 @@ SOURCES = {
                    "AppUpdate.swift", "StreamServers.swift", "Preflight.swift",
                    "Health.swift", "StreamHelp.swift", "Overlay.swift",
                    "Picture.swift", "Camera.swift", "Screen.swift",
-                   "Permissions.swift"],
+                   "Permissions.swift", "MicDiag.swift"],
 }
 
 #: Differences that are CORRECT, declared one at a time with the reason.
@@ -146,6 +149,11 @@ EXPECTED = {
     "preflight": [
         ("Ctrl+M", "Command+M",
          "the microphone key. KeyMap moved it: VoiceOver owns Control+Option"),
+    ],
+    "cabletest": [
+        ("muted in the Windows volume mixer.", "muted in Audio MIDI Setup.",
+         "where a cable's far end is muted. A Mac has no volume mixer; Audio MIDI "
+         "Setup is where a device's input and output levels and mutes live"),
     ],
     # Longest first, so "Control Shift B" is not eaten by "Control B".
     "streamhelp": [

@@ -14,6 +14,12 @@ if let at = CommandLine.arguments.firstIndex(of: "--streamtest") {
     exit(StreamTest.run(Array(CommandLine.arguments.dropFirst(at + 1))))
 }
 
+// Track titles reaching a station, against a server on this machine. See
+// TitleCheck and mac/tools/check_titles.py.
+if let at = CommandLine.arguments.firstIndex(of: "--check-titles") {
+    exit(TitleCheck.run(Array(CommandLine.arguments.dropFirst(at + 1))))
+}
+
 // Are the extra sources really on the air, or only configured to be? A source
 // delivering silence sounds exactly like one that works, from where the
 // presenter is sitting.
@@ -141,7 +147,13 @@ if let at = CommandLine.arguments.firstIndex(of: "--verify-manifest"),
 // somebody reading both by ear.
 UserDefaults.standard.register(defaults: ["NSMenuShouldUpdateSettingsTitle": false])
 
-let app = NSApplication.shared
+// Our own NSApplication, so an exception AppKit catches inside a key or a
+// menu action is written to errors.log instead of vanishing (W383-05). It has
+// to be the FIRST thing to ask for the shared application, or AppKit makes a
+// plain one and this is never used; Info.plist names it as NSPrincipalClass
+// for the same reason.
+let app = DropDeckApplication.shared
+ErrorLog.install()
 app.setActivationPolicy(.regular)
 let delegate = AppDelegate()
 app.delegate = delegate

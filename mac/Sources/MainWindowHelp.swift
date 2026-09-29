@@ -36,6 +36,54 @@ extension MainWindow {
 
     /// Settings and counts only. Never a name, never a path.
     func feedbackDiagnostics() -> [String: Any] {
+        var info = basicDiagnostics()
+        info.merge(MainWindow.micDiagnostics(
+            chosenUID: board.micDeviceUID,
+            present: { AudioDevices.deviceID(forUID: $0) != nil },
+            open: mic?.isOpen ?? false, lastStatus: mic?.lastStatus,
+            lastError: mic?.lastError, signal: mic?.signalSeen ?? false,
+            failedReads: mic?.failedReads ?? 0,
+            privacy: Permissions.state(.microphone))) { _, new in new }
+        // What went wrong this session, as "where: Kind", never a message
+        // (W383-05), and whether macOS has crash reports for this app.
+        info["recent_errors"] = ErrorLog.recent().joined(separator: "; ").isEmpty
+            ? "none" : ErrorLog.recent().joined(separator: "; ")
+        info["crash_reports_this_week"] = ErrorLog.recentCrashReports()
+        info["global_hotkey_clashes"] = ownHotkeyClashes().count
+        info["send_wanted"] = board.sendOn
+        info["send_failed"] = board.sendOn && !sending
+        return info
+    }
+
+    /// The microphone, for a feedback report (W383-13). Settings and plain
+    /// words only: never a device's name. Enough to tell a dead key from a
+    /// refused microphone from a muted one, which is the question Mashal's
+    /// report on Windows could not answer.
+    static func micDiagnostics(chosenUID: String?, present: (String) -> Bool,
+                               open: Bool, lastStatus: OSStatus?, lastError: String?,
+                               signal: Bool, failedReads: Int,
+                               privacy: PermissionState) -> [String: Any] {
+        var info: [String: Any] = [:]
+        let chosen = !(chosenUID ?? "").isEmpty
+        info["mic_chosen"] = chosen
+        if let uid = chosenUID, chosen { info["mic_found"] = present(uid) }
+        if lastError != nil {
+            info["mic_problem"] = MicDiag.explain(lastStatus)
+            info["mic_error_codes"] = lastStatus.map(MicDiag.code) ?? "no device"
+        }
+        if open {
+            info["mic_sound_arriving"] = signal
+            info["mic_failed_reads"] = failedReads
+        }
+        info["mic_privacy"] = privacy.rawValue
+        // Windows asks RegisterHotKey which of its keys another program
+        // holds. macOS has no such question to ask, so this says so rather
+        // than reporting "none" as though it had looked.
+        info["keys_taken_elsewhere"] = "cannot be asked on a Mac"
+        return info
+    }
+
+    private func basicDiagnostics() -> [String: Any] {
         [
             "sounds_assigned": board.assignedTotal,
             "sounds_missing": board.missingSlots.count,

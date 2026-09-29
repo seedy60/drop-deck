@@ -42,6 +42,12 @@ final class MainWindow: NSWindowController, NSWindowDelegate {
     /// Nil until Option+Shift+O sets one up. It is not a mode on the streamer:
     /// it does not need anything to be live and it has a bus of its own.
     var send: Send?
+    /// Why the send the board asks for is not running, in Windows' words, or
+    /// nothing. **`board.sendOn` is INTENT and a failure never clears it**
+    /// (W380-06): it used to be switched off here and saved with the board, so
+    /// one launch with the cable missing wrote "no send" to disk for good.
+    /// `sending` answers the other question, whether one is running.
+    var sendFailed = ""
     /// The video half. A second streamer rather than a mode on the first,
     /// because Icecast and RTMP divide the work differently: one makes bytes
     /// and something else owns the socket, the other is a session that owns
@@ -79,6 +85,16 @@ final class MainWindow: NSWindowController, NSWindowDelegate {
 
     private var refreshTimer: Timer?
     private var sourceRetryTimer: Timer?
+    /// Where source captures are opened, closed and retried: never the main
+    /// thread, and one at a time (W383-27).
+    let sourceWork = DispatchQueue(label: "dropdeck-source-work", qos: .userInitiated)
+    /// A retry is under way on `sourceWork`, so the next tick does not queue
+    /// another behind it.
+    var sourcesRetrying = false
+    /// Programs just opened again, being given `C.sourceSettleSeconds` before
+    /// they are captured, so the retry leaves them alone meanwhile.
+    var programsSettling = Set<String>()
+    var programObservers: [NSObjectProtocol] = []
     private var saveTimer: Timer?
 
     /// Which banks have already had their hint read out. Once per bank per
@@ -182,12 +198,17 @@ final class MainWindow: NSWindowController, NSWindowDelegate {
         // Only the failed ones are touched, so nothing running is disturbed.
         sourceRetryTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) {
             [weak self] _ in
+            self?.retrySources()
+            self?.retrySend()
+        }
+        watchPrograms()
+        // A sound recording whose file refused mid write stops by itself; it
+        // is said, and the programme bus it held is let go (N3).
+        recorder.onFailed = { [weak self] line in
             guard let self else { return }
-            let cameOn = self.sourceGroup.retryFailed(outputRate: self.group.sampleRate)
-            guard !cameOn.isEmpty else { return }
-            self.speaker.announceHelp(cameOn.count == 1
-                ? "\(cameOn[0]) is on the air now"
-                : "\(cameOn.joined(separator: ", ")) are on the air now")
+            self.group.syncTaps()
+            self.speaker.announceState(line)
+            self.updateAirMenu()
             self.updateStatusLine()
         }
         updateStatusLine()
@@ -219,22 +240,12 @@ final class MainWindow: NSWindowController, NSWindowDelegate {
         for m in group.mixers.values { m.playlistMonitorOnly = board.playlistMonitorOnly }
         announceSourceTrouble(
             sourceGroup.replace(with: board.sources, outputRate: group.sampleRate))
-        // A send the board says was on comes back on, and IS ANNOUNCED. A
-        // board file deciding that this machine is handing its whole show to
-        // another program is not something to discover later, so it is said out
-        // loud at startup rather than left to be noticed.
-        if board.sendOn {
-            if startSend(quiet: true) {
-                speaker.announce("This board turns on a send: the whole show is "
-                    + "going to \(send?.describe() ?? "another program") for another "
-                    + "program to pick up. Option+Shift+O changes it, "
-                    + "Command+Shift+O says how it is doing.")
-            } else {
-                speaker.announce("This board turns on a send to "
-                    + "\(board.sendDeviceName ?? "another program") and it would not "
-                    + "open, so nothing is being sent.")
-            }
-        }
+        // A send the board says was on comes back on, quietly here, and the
+        // startup line says so either way: a board file deciding that this
+        // machine is handing its whole show to another program is not
+        // something to discover later, and neither is a send that would not
+        // start.
+        if board.sendOn { startSend(quiet: true) }
         if board.globalHotkeysOn { armGlobalHotkeys(announce: false) }
         group.warmCache(board)
         updateStatusLine()
@@ -436,6 +447,13 @@ final class MainWindow: NSWindowController, NSWindowDelegate {
             parts += BoardFiles.startupParts(
                 note: self.startupBoardNote, loadedDemo: self.loadedDemo,
                 assigned: assigned, boardName: BoardFiles.boardName(self.board.path))
+            // Our own global hotkeys on the app's own keys (W383-02), after
+            // the name and count, in Windows' order (W383-25). The Mac cannot
+            // ask which keys ANOTHER program holds the way Windows asks
+            // RegisterHotKey, so that half of W383-01 is Option Shift M and
+            // Help, Check the keyboard instead.
+            let clashes = self.ownHotkeyClashes()
+            parts += clashes
             let missing = self.board.slots.filter { $0.isMissing }.count
             if missing > 0 {
                 parts.append("\(missing) file\(missing == 1 ? "" : "s") missing. Use File, relink missing sounds")
@@ -443,13 +461,49 @@ final class MainWindow: NSWindowController, NSWindowDelegate {
             if !self.group.isRunning {
                 parts.append("Audio could not start. \(self.group.lastError ?? "no reason given")")
             }
+            let send = MainWindow.startupSendLine(wanted: self.board.sendOn,
+                                                  running: self.send?.describe(),
+                                                  failed: self.sendFailed)
+            if let send { parts.append(send) }
             let line = parts.joined(separator: ". ")
-            if missing > 0 || !self.group.isRunning || !self.startupBoardNote.isEmpty {
+            let wrong = missing > 0 || !self.group.isRunning || !self.startupBoardNote.isEmpty
+                || !clashes.isEmpty || send != nil
+            if wrong {
                 self.speaker.announce(line)
             } else {
                 self.speaker.announceHelp(line)
             }
         }
+    }
+
+    /// What the startup line says about the send, or nothing when the board
+    /// wants none. Both kinds are said on the essential channel: a board
+    /// quietly handing the show to another program, and a send the board
+    /// asked for and did not get, are both things to hear rather than find.
+    static func startupSendLine(wanted: Bool, running: String?, failed: String) -> String? {
+        guard wanted else { return nil }
+        if let running {
+            return "Sending your whole show to \(running) for another program to pick up"
+        }
+        return failed.isEmpty
+            ? "The send could not start, so nothing is going to another program. "
+              + "Option+Shift+O to set it up again"
+            : failed
+    }
+
+    /// Our own global hotkeys that sit on one of this window's keys, as the
+    /// sentences the startup line says. Only the ones macOS really gave us.
+    func ownHotkeyClashes() -> [String] {
+        guard hotkeys.enabled else { return [] }
+        let refused = Set(hotkeys.refused)
+        var list: [(HotkeyCombination, String)] = []
+        for slot in board.slots {
+            guard let text = slot.globalHotkey, !text.isEmpty,
+                  let combination = HotkeyCombination.parse(text),
+                  !refused.contains(combination.label) else { continue }
+            list.append((combination, slot.displayName))
+        }
+        return HotkeyClash.lines(hotkeys: list)
     }
 
     // -------------------------------------------------------------- playing ---
@@ -652,7 +706,7 @@ final class MainWindow: NSWindowController, NSWindowDelegate {
         var parts: [String] = []
         if player.isPlaying, let track = player.currentTrack {
             var line = "Playlist, \(player.index + 1) of \(board.playlist.count), "
-                     + track.displayName
+                     + track.named(board.titleFormat)
             if let left = player.remaining {
                 line += ", \(formatDuration(left)) left"
             }

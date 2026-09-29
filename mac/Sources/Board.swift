@@ -113,6 +113,10 @@ final class Board {
     /// this build acts on it.
     var askBeforeLive = true
 
+    /// How a track is named where a listener hears or sees it: see
+    /// `TitleFormat`. A Mac first key, `stream_title_format`.
+    var titleFormat = TitleFormat.defaultFormat
+
     var videoServer = "youtube"
     var videoHost = C.rtmpIngest["youtube"] ?? ""
     /// What the VIDEO platform's channel is called, which is not the radio
@@ -411,6 +415,7 @@ final class Board {
         d["stream_public"] = stream.isPublic
         d["stream_mic"] = stream.sendMic
         d["stream_titles"] = stream.sendTitles
+        d["stream_title_format"] = titleFormat
         d["stream_stations"] = streamStations
         // The device NAME in the Windows shape, so that copy can still match
         // on it and so a board is readable by a person.
@@ -677,7 +682,7 @@ final class Board {
             "stream_user", "stream_password", "stream_format", "stream_bitrate",
             "stream_name", "stream_description", "stream_genre", "stream_url",
             "stream_stats_url", "stream_public", "stream_mic", "stream_titles",
-            "stream_stations",
+            "stream_title_format", "stream_stations",
             "ask_before_live",
             "video_server", "video_host", "video_name", "video_key", "live_to",
             "picture", "picture_file", "picture_clock", "camera", "screen",
@@ -796,6 +801,7 @@ final class Board {
         b.stream.isPublic = dict["stream_public"] as? Bool ?? false
         b.stream.sendMic = dict["stream_mic"] as? Bool ?? true
         b.stream.sendTitles = dict["stream_titles"] as? Bool ?? true
+        b.titleFormat = TitleFormat.clean(dict["stream_title_format"])
         b.streamStations = cleanStations(dict["stream_stations"])
 
         // ------------------------------------------------------- the video ---
@@ -1203,6 +1209,7 @@ final class Board {
         voiceOn = other.voiceOn
         voiceSettings = other.voiceSettings
         stream = other.stream
+        titleFormat = other.titleFormat
         streamStations = other.streamStations
         playlistMonitorOnly = other.playlistMonitorOnly
         sources = other.sources

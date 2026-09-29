@@ -36,6 +36,7 @@ final class KeyboardCheckPanel: NSObject {
         ("Escape", "stop everything"),
         ("Option Space", "stop the last sound"),
         ("Command M", "the microphone"),
+        ("Option Shift M", "the microphone, the second key"),
         ("Command R", "recording"),
         ("Command B", "go live on video"),
         ("Option Shift B", "go live on radio"),

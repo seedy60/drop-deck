@@ -40,7 +40,7 @@
 	<key>NSMicrophoneUsageDescription</key>
 	<string>TG Drop Deck opens your microphone only when you press the microphone key, so your voice can go into the mix, the recording and the stream.</string>
 	<key>NSPrincipalClass</key>
-	<string>NSApplication</string>
+	<string>DropDeckApplication</string>
 	<key>NSSupportsAutomaticTermination</key>
 	<false/>
 </dict>

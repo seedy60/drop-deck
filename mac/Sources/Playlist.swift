@@ -20,6 +20,51 @@
 
 import Foundation
 
+/// How a track with an artist is written when it is named: in the window's
+/// title, the line said as it starts, Command L, the stream's metadata and the
+/// card. Tyler, 20 September 2026, and an in-app report on Windows on 12
+/// September: "artist - title, title by artist".
+///
+/// **The default is Windows' wording, exactly**: `playlist.Track.display_name`
+/// says "%s by %s", and that is what a Windows station sends as its title. The
+/// other is the order most stations and players use, "Garth Brooks - The
+/// Dance", with a plain hyphen.
+///
+/// **A Mac first feature.** The key is `stream_title_format`; a Windows copy
+/// that saves the board today does not know it and drops it (its `to_dict`
+/// writes only the keys it knows), so the board goes back to the default the
+/// next time Windows saves it. The .cue track list is untouched on purpose:
+/// it has PERFORMER and TITLE as separate fields, so there is nothing to order.
+enum TitleFormat {
+    static let titleByArtist = "title_by_artist"
+    static let artistTitle = "artist_title"
+    static let all = [titleByArtist, artistTitle]
+    static let defaultFormat = titleByArtist
+
+    /// What the popup on the Streaming page says, with an example, because
+    /// "Title by Artist" alone does not say which of the two words is which.
+    static let labels: [String: String] = [
+        titleByArtist: "Title by Artist, as in The Dance by Garth Brooks",
+        artistTitle: "Artist - Title, as in Garth Brooks - The Dance",
+    ]
+
+    /// A value off a board file, or the default for anything it is not.
+    static func clean(_ value: Any?) -> String {
+        guard let text = value as? String, all.contains(text) else { return defaultFormat }
+        return text
+    }
+
+    static func name(title: String?, artist: String?, fallback: String,
+                     format: String) -> String {
+        let t = (title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let a = (artist ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !t.isEmpty && !a.isEmpty {
+            return format == artistTitle ? "\(a) - \(t)" : "\(t) by \(a)"
+        }
+        return t.isEmpty ? fallback : t
+    }
+}
+
 final class Track {
     var filepath: String
     var title: String?
@@ -46,6 +91,14 @@ final class Track {
         if let t = title, !t.isEmpty { return t }
         let base = (filepath as NSString).lastPathComponent
         return (base as NSString).deletingPathExtension
+    }
+
+    /// The track as a listener is told it: title and artist in the board's
+    /// chosen order (`board.stream_title_format`), or the title or file name
+    /// alone when there is no artist. See `TitleFormat`.
+    func named(_ format: String) -> String {
+        TitleFormat.name(title: title, artist: artist, fallback: displayName,
+                         format: format)
     }
 
     /// Where the music stops, as opposed to where the file does.

@@ -445,12 +445,28 @@ enum KeyboardHelp {
 
         THE MICROPHONE
           Command M                     Microphone on and off
+          Option Shift M                The same, for when another program has
+                                        taken Command M for itself
           Command Shift M               Microphone settings
 
-          Nothing opens your microphone but you pressing Command M. While it is
-          open the beds and the playlist duck out of the way and come back when
-          you close it. It ducks by BEING OPEN, not by how loud you are: a gate
-          that opens on your voice clips the first syllable of every sentence.
+          Nothing opens your microphone but you pressing Command M or Option
+          Shift M. While it is open the beds and the playlist duck out of the
+          way and come back when you close it. It ducks by BEING OPEN, not by
+          how loud you are: a gate that opens on your voice clips the first
+          syllable of every sentence.
+
+          IF COMMAND M DOES NOTHING AT ALL, another program has probably taken
+          the key before Drop Deck can hear it. Option Shift M still works, and
+          so does Microphone on in the On air menu. Help, Check the keyboard
+          lists every key that really reaches Drop Deck, so you can see which
+          one is being taken.
+
+          If the microphone will not open, Drop Deck says why. If macOS privacy
+          settings are refusing it, it says so before opening anything. If it
+          opens but nothing arrives, not even background noise, it says that
+          too: that is what a privacy refusal or a muted input looks like from
+          here. A chosen microphone that is not plugged in is said, the system
+          default is used for now, and your choice is kept for when it is back.
 
         PROCESSING YOUR VOICE
           Preferences, Voice. A gate, a high pass filter, a three band
