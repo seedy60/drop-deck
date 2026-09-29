@@ -143,13 +143,24 @@ enum Permissions {
     /// board pointed at a radio station with a camera for its picture wants
     /// the camera just as much as a video board does, and the moment to meet
     /// the system's question is now, not with a recording running.
+    ///
+    /// **The screen is different, and asked at most ONCE** (audit 2, finding
+    /// 1). macOS will not say whether it has been asked: a refusal, a switch
+    /// never turned on and a question never put all answer "not allowed", so
+    /// `state` calls every one of them never asked, and every launch said
+    /// "macOS is about to ask" and showed the system's screen dialog again.
+    /// So the app remembers, per signing identity, that it has asked
+    /// (`ScreenAsked`), and asks at launch only when the board is really set
+    /// up to send a picture (`screenUsed`), not merely has a screen chosen.
     static func wantedAtLaunch(picture: String, camera: PermissionState,
-                               screen: PermissionState) -> [Permission] {
+                               screen: PermissionState, screenAskedBefore: Bool,
+                               screenUsed: Bool) -> [Permission] {
         var wanted: [Permission] = []
         if C.pictureNeedsCamera.contains(picture), camera == .neverAsked {
             wanted.append(.camera)
         }
-        if C.pictureNeedsScreen.contains(picture), screen == .neverAsked {
+        if C.pictureNeedsScreen.contains(picture), screen == .neverAsked,
+           !screenAskedBefore, screenUsed {
             wanted.append(.screen)
         }
         return wanted
@@ -207,6 +218,9 @@ enum Permissions {
                  + "and Security.")
             return
         }
+
+        // The screen cannot say it was asked, so this remembers it did.
+        if which == .screen { ScreenAsked.remember() }
 
         switch which {
         case .microphone, .camera:
@@ -273,5 +287,45 @@ enum Permissions {
     private static func finishText(_ done: @escaping (String) -> Void, _ said: String) {
         if Thread.isMainThread { done(said) }
         else { DispatchQueue.main.async { done(said) } }
+    }
+}
+
+/// That the screen has been asked for, remembered, because macOS will not say
+/// (audit 2, finding 1). Per signing identity, because that is what macOS
+/// files the answer against: the team for a Developer ID build, which keeps
+/// its answer from one release to the next, and the code hash for an ad hoc
+/// one, which is a new app to macOS every build.
+enum ScreenAsked {
+    static let prefix = "screenAskedAtLaunch."
+
+    /// Who this copy is, to macOS's privacy settings.
+    static func identity() -> String {
+        var code: SecCode?
+        var staticCode: SecStaticCode?
+        var info: CFDictionary?
+        if SecCodeCopySelf([], &code) == errSecSuccess, let code,
+           SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode,
+           SecCodeCopySigningInformation(staticCode,
+                                         SecCSFlags(rawValue: kSecCSSigningInformation),
+                                         &info) == errSecSuccess,
+           let dict = info as? [String: Any] {
+            if let team = dict[kSecCodeInfoTeamIdentifier as String] as? String, !team.isEmpty {
+                return "team:" + team
+            }
+            if let hash = dict[kSecCodeInfoUnique as String] as? Data, !hash.isEmpty {
+                return "cdhash:" + hash.map { String(format: "%02x", $0) }.joined()
+            }
+        }
+        return "version:" + C.appVersion
+    }
+
+    static func asked(defaults: UserDefaults = .standard,
+                      identity: String = ScreenAsked.identity()) -> Bool {
+        defaults.bool(forKey: prefix + identity)
+    }
+
+    static func remember(defaults: UserDefaults = .standard,
+                         identity: String = ScreenAsked.identity()) {
+        defaults.set(true, forKey: prefix + identity)
     }
 }

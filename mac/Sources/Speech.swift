@@ -122,8 +122,14 @@ final class Speaker {
         interrupt ? .high : .medium
     }
 
+    /// Told every line that is really spoken, and whether it interrupts. For
+    /// the checks, which hold the call sites to queueing what nobody asked
+    /// for (audit 2, finding 8).
+    var spoken: ((String, Bool) -> Void)?
+
     private func say(_ text: String, interrupt: Bool = true) {
         guard !text.isEmpty else { return }
+        spoken?(text, interrupt)
         let post = { [weak self] in
             guard let self else { return }
             let now = Date()

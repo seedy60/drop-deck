@@ -28,9 +28,16 @@ final class SendPanel: NSObject {
     let testFlag = WorkFlag()
 
     private let speaker: Speaker?
-    /// True while the show is on air or recording, when a tone must not go
-    /// down a cable somebody may be listening to.
-    private let busy: () -> Bool
+    /// Why a tone must not go down a cable right now, or nil when it may: on
+    /// air, recording, or SENDING, when somebody may be listening to it. The
+    /// app hands in `MainWindow.cableTestRefusal` over its real streamers,
+    /// recorders and send (audit 2, finding 3).
+    private let refusal: () -> String?
+    /// The microphone's privacy state, and how to ask for it. Listening to a
+    /// cable is recording an input, which macOS guards exactly as it guards a
+    /// microphone (audit 2, finding 2). A check hands in stand ins.
+    private let privacy: () -> PermissionState
+    private let askPrivacy: (@escaping (PermissionState) -> Void) -> Void
     /// The measurement itself. The real one plays a tone and records; the
     /// self test hands in one that answers at once, so the BUTTON is what is
     /// tested, which is where Windows' fault was.
@@ -43,14 +50,19 @@ final class SendPanel: NSObject {
     private var minusNames: [String] = []
 
     init(board: Board, sources: [SourceConfig], speaker: Speaker? = nil,
-         busy: @escaping () -> Bool = { false },
+         refusal: @escaping () -> String?,
          outputs: [AudioDeviceInfo]? = nil,
+         privacy: @escaping () -> PermissionState = { Permissions.state(.microphone) },
+         askPrivacy: @escaping (@escaping (PermissionState) -> Void) -> Void = { answered in
+             Permissions.ask(.microphone) { state, _ in answered(state) } },
          tester: @escaping (String, String) -> CableTest.Result = {
              CableTest.run(uid: $0, name: $1) }) {
         self.board = board
         self.sources = sources
         self.speaker = speaker
-        self.busy = busy
+        self.refusal = refusal
+        self.privacy = privacy
+        self.askPrivacy = askPrivacy
         self.givenOutputs = outputs
         self.tester = tester
         super.init()
@@ -210,8 +222,8 @@ final class SendPanel: NSObject {
             say("Still testing the cable. It takes two seconds.")
             return
         }
-        if busy() {
-            say(CableTest.notWhileLive)
+        if let no = refusal() {
+            say(no)
             return
         }
         let chosen = devicePopup.indexOfSelectedItem
@@ -220,6 +232,41 @@ final class SendPanel: NSObject {
             return
         }
         let device = outputs[chosen - 1]
+        // **The microphone's privacy first** (audit 2, finding 2). A refused
+        // one captures zeros, which came back as "nothing came back, the
+        // cable is broken"; a never asked one put the system prompt up in the
+        // middle of the two second capture. Refused is said; never asked is
+        // asked, and the test runs in the answer, as the microphone key does.
+        switch MicDiag.privacy(privacy()) {
+        case .refuse(let said):
+            say(CableTest.privacyFirst + said)
+            return
+        case .ask:
+            guard testFlag.begin() else { return }
+            say(CableTest.askingFirst)
+            askPrivacy { [weak self] state in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.testFlag.end()
+                    if state == .allowed {
+                        self.runTest(device)
+                    } else {
+                        self.say(CableTest.privacyFirst
+                                 + (MicDiag.privacySentence(state) ?? MicDiag.privacyBlocked))
+                    }
+                }
+            }
+            return
+        case .open:
+            runTest(device)
+        }
+    }
+
+    private func runTest(_ device: AudioDeviceInfo) {
+        if let no = refusal() {
+            say(no)
+            return
+        }
         guard testFlag.begin() else { return }
         say(CableTest.testing(device.name))
         let run = tester

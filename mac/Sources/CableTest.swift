@@ -170,6 +170,16 @@ enum CableTest {
     static let choose = "Choose an output first, and then I can test it."
     static let notWhileLive = "Not while you are on air or recording. This puts a tone "
         + "down the cable, which everybody listening would hear."
+    /// Windows' sentence, for the case Windows missed (audit 2, finding 3): a
+    /// send feeding a call with nothing on air and nothing recording.
+    static let notWhileSending = "Not while you are sending the show to another program. "
+        + "This puts a tone down the cable, which everybody listening would hear."
+    /// Before the privacy sentence: why a CABLE test is asking about the
+    /// microphone at all.
+    static let privacyFirst = "Testing the cable listens to it, which macOS treats as "
+        + "using the microphone. "
+    static let askingFirst = "macOS is asking first whether Drop Deck may use the "
+        + "microphone, which testing the cable needs"
 
     static func testing(_ name: String) -> String { "Testing \(name). Two seconds." }
 

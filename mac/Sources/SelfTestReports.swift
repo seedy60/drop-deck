@@ -36,6 +36,7 @@ extension SelfTest {
         testCableButton()
         testProgramSources()
         testRecordingFailure()
+        testAuditTwo()
     }
 
     // ------------------------------------------------------------ the camera ---
@@ -56,16 +57,56 @@ extension SelfTest {
         check("a camera picture asks for the camera at launch, whatever Command B "
               + "points at",
               Permissions.wantedAtLaunch(picture: C.pictureCamera, camera: .neverAsked,
-                                         screen: .allowed) == [.camera])
+                                         screen: .allowed, screenAskedBefore: false,
+                                         screenUsed: true) == [.camera])
         check("so does the screen with the camera in a corner",
               Permissions.wantedAtLaunch(picture: C.pictureSplit, camera: .neverAsked,
-                                         screen: .allowed) == [.camera])
+                                         screen: .allowed, screenAskedBefore: false,
+                                         screenUsed: true) == [.camera])
         check("a card asks for nothing",
               Permissions.wantedAtLaunch(picture: C.pictureCard, camera: .neverAsked,
-                                         screen: .neverAsked).isEmpty)
+                                         screen: .neverAsked, screenAskedBefore: false,
+                                         screenUsed: true).isEmpty)
         check("and nothing already answered is asked again",
               Permissions.wantedAtLaunch(picture: C.pictureCamera, camera: .refused,
-                                         screen: .neverAsked).isEmpty)
+                                         screen: .neverAsked, screenAskedBefore: false,
+                                         screenUsed: true).isEmpty)
+
+        // Audit 2, finding 1: the screen, which macOS cannot say it has asked.
+        check("a video board's screen is asked for the first time",
+              Permissions.wantedAtLaunch(picture: C.pictureScreen, camera: .allowed,
+                                         screen: .neverAsked, screenAskedBefore: false,
+                                         screenUsed: true) == [.screen])
+        check("and never again once this signed copy has asked, whatever macOS says",
+              Permissions.wantedAtLaunch(picture: C.pictureScreen, camera: .allowed,
+                                         screen: .neverAsked, screenAskedBefore: true,
+                                         screenUsed: true).isEmpty)
+        check("a screen shown to be refused is not asked for",
+              Permissions.wantedAtLaunch(picture: C.pictureSplit, camera: .allowed,
+                                         screen: .refused, screenAskedBefore: false,
+                                         screenUsed: true).isEmpty)
+        check("a radio board with a screen chosen and nothing to send it to is not asked",
+              Permissions.wantedAtLaunch(picture: C.pictureScreen, camera: .allowed,
+                                         screen: .neverAsked, screenAskedBefore: false,
+                                         screenUsed: false).isEmpty)
+        check("the split still asks for its camera when the screen is not wanted",
+              Permissions.wantedAtLaunch(picture: C.pictureSplit, camera: .neverAsked,
+                                         screen: .neverAsked, screenAskedBefore: true,
+                                         screenUsed: true) == [.camera])
+        let suite = "app.tgstudios.dropdeck.selftest.screenasked"
+        if let scratch = UserDefaults(suiteName: suite) {
+            scratch.removePersistentDomain(forName: suite)
+            let me = "team:SELFTEST"
+            let before = ScreenAsked.asked(defaults: scratch, identity: me)
+            ScreenAsked.remember(defaults: scratch, identity: me)
+            check("asking is remembered for this signing identity",
+                  !before && ScreenAsked.asked(defaults: scratch, identity: me))
+            check("and not for another, which macOS treats as a different app",
+                  !ScreenAsked.asked(defaults: scratch, identity: "cdhash:00"))
+            scratch.removePersistentDomain(forName: suite)
+        }
+        check("this copy knows who it is", !ScreenAsked.identity().isEmpty
+              && !ScreenAsked.identity().hasPrefix("version:"), ScreenAsked.identity())
     }
 
     // ------------------------------------------------------- source control ---
@@ -477,8 +518,9 @@ extension SelfTest {
                                    outputChannels: 2, inputChannels: 2)
         var live = false
         var asked: [String] = []
-        let panel = SendPanel(board: board, sources: [], speaker: nil, busy: { live },
-                              outputs: [fake], tester: { uid, name in
+        let panel = SendPanel(board: board, sources: [], speaker: nil,
+                              refusal: { live ? CableTest.notWhileLive : nil },
+                              outputs: [fake], privacy: { .allowed }, tester: { uid, name in
                                   asked.append(uid)
                                   Thread.sleep(forTimeInterval: 0.3)
                                   return CableTest.Result(ok: true, said: "Verdict for \(name)")
@@ -573,5 +615,212 @@ extension SelfTest {
         check("its bus is out of the taps", taps.isEmpty && !recorder.holdsBus)
         check("and it is not recording", !recorder.isRecording)
         check("stop afterwards has nothing to finish", recorder.stop(taps: taps) == nil)
+    }
+
+    // ------------------------------------------------------------ audit 2 ---
+
+    private func testAuditTwo() {
+        out.append("")
+        out.append("After the second audit of 3.8.4")
+        let board = Board()
+        let fake = AudioDeviceInfo(id: 0, uid: "self-test-cable", name: "Pretend Cable",
+                                   outputChannels: 2, inputChannels: 2)
+
+        // Finding 3, on the REAL refusal over the real streamers, recorders
+        // and a send.
+        let radio = Streamer(), video = VideoStreamer()
+        let recorder = Recorder(), pictures = VideoRecorder()
+        var sending = false
+        let refusal = {
+            MainWindow.cableTestRefusal(streamer: radio, videoStreamer: video,
+                                        recorder: recorder, videoRecorder: pictures,
+                                        sending: sending)
+        }
+        check("nothing going anywhere, the cable may be tested", refusal() == nil)
+        sending = true
+        check("a send feeding a call refuses, in Windows' style",
+              refusal() == CableTest.notWhileSending, refusal() ?? "nil")
+        var tested: [String] = []
+        let panel = SendPanel(board: board, sources: [], speaker: nil, refusal: refusal,
+                              outputs: [fake], privacy: { .allowed },
+                              tester: { uid, _ in tested.append(uid)
+                                  return CableTest.Result(ok: true, said: "fine") })
+        _ = panel.makeAccessory()
+        panel.chooseOutput(at: 1)
+        panel.testButton.performClick(nil)
+        check("and the button says so and puts no tone down the cable",
+              panel.verdict.stringValue == CableTest.notWhileSending && tested.isEmpty)
+        sending = false
+        radio.applyState(.live, "x")
+        check("on air, it is Windows' own sentence", refusal() == CableTest.notWhileLive)
+        radio.applyState(.off, "")
+
+        // Finding 2: the microphone's privacy, before anything opens.
+        var state: PermissionState = .refused
+        var answer: ((PermissionState) -> Void)?
+        let guarded = SendPanel(board: board, sources: [], speaker: nil, refusal: { nil },
+                                outputs: [fake], privacy: { state },
+                                askPrivacy: { answer = $0 },
+                                tester: { uid, _ in tested.append(uid)
+                                    return CableTest.Result(ok: true, said: "tested") })
+        _ = guarded.makeAccessory()
+        guarded.chooseOutput(at: 1)
+        guarded.testButton.performClick(nil)
+        check("refused, it says the privacy sentence and captures nothing",
+              guarded.verdict.stringValue == CableTest.privacyFirst + MicDiag.privacyBlocked
+                && tested.isEmpty, guarded.verdict.stringValue)
+        state = .neverAsked
+        guarded.testButton.performClick(nil)
+        check("never asked, it asks first and tests nothing yet",
+              answer != nil && tested.isEmpty
+                && guarded.verdict.stringValue == CableTest.askingFirst)
+        guarded.testButton.performClick(nil)
+        check("a second press while macOS asks is still busy, and asks once",
+              guarded.verdict.stringValue.hasPrefix("Still testing"))
+        answer?(.allowed)
+        let by = Date().addingTimeInterval(3)
+        while tested.isEmpty && Date() < by { RunLoop.main.run(until: Date().addingTimeInterval(0.02)) }
+        while guarded.testFlag.running && Date() < by {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+        }
+        check("allowed, the test runs in the answer", tested == ["self-test-cable"]
+              && guarded.verdict.stringValue == "tested", guarded.verdict.stringValue)
+
+        // Finding 4: an MP3 file that stops taking writes, through the REAL
+        // writer: a handle opened for reading refuses every write, which the
+        // old `write(_:)` turned into an exception that ended the app.
+        let folder = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("dropdeck-selftest-recfail-\(getpid())")
+        try? FileManager.default.removeItem(atPath: folder)
+        let failing = Recorder()
+        failing.openForWriting = { FileHandle(forReadingAtPath: $0) }
+        var said: String?
+        failing.onFailed = { said = $0 }
+        let taps = Taps()
+        let started = failing.start(taps: taps, rate: 48000, format: "mp3", bitrate: 128,
+                                    folder: folder)
+        var tone = [Float](repeating: 0, count: 48000 * 2)
+        for i in 0..<48000 {
+            let v = Float(sin(Double(i) * 2 * .pi * 440 / 48000)) * 0.3
+            tone[i * 2] = v; tone[i * 2 + 1] = v
+        }
+        tone.withUnsafeBufferPointer { raw in
+            taps.write(key: "self-test", samples: raw.baseAddress!, frames: 48000, rate: 48000)
+        }
+        let byFail = Date().addingTimeInterval(4)
+        while said == nil && Date() < byFail {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+        }
+        check("a file that refuses a write stops the recording and says so, and the app lives",
+              started != nil && said?.contains("has stopped by itself. "
+                                                + Recorder.cannotWrite) == true,
+              said ?? "nothing said")
+        check("and it lets go of the bus and is not recording",
+              taps.isEmpty && !failing.isRecording && !failing.holdsBus)
+        try? FileManager.default.removeItem(atPath: folder)
+
+        // Findings 5, 7 and 8, on the real ProgramWatch with stand in sources.
+        var heard: [(String, Bool)] = []
+        let speaker = Speaker()
+        speaker.level = C.speechAll
+        speaker.spoken = { heard.append(($0, $1)) }
+        let group = SourceGroup()
+        let logic = StandInSource(name: "Logic", level: 0.1)
+        logic.config.kind = "process"
+        logic.config.bundleID = "com.apple.logic10"
+        logic.startSetsRunning = true
+        group.useForTesting([logic])
+        let work = DispatchQueue(label: "self-test-source-work")
+        let watch = ProgramWatch(sources: group, work: work, speaker: speaker,
+                                 outputRate: { 48000 }, goingAnywhere: { true },
+                                 changed: {})
+        watch.stopWhenQuits = true
+        func spin(_ seconds: Double) {
+            let until = Date().addingTimeInterval(seconds)
+            while Date() < until { RunLoop.main.run(until: Date().addingTimeInterval(0.02)) }
+        }
+
+        watch.stillRunning = { _ in true }
+        watch.quit(bundle: "com.apple.logic10", name: "Logic Pro")
+        spin(0.1)
+        check("one copy of a program quitting while another runs says nothing and stops nothing",
+              heard.isEmpty && logic.isRunning && logic.stops == 0)
+        watch.stillRunning = { _ in false }
+        watch.quit(bundle: "com.apple.logic10", name: "Logic Pro")
+        spin(0.2)
+        check("the last copy quitting is said, queued, and the capture stopped",
+              heard.count == 1 && heard[0].0.hasPrefix("Logic Pro closed") && !heard[0].1
+                && !logic.isRunning, "\(heard)")
+
+        heard = []
+        watch.settleSeconds = 0.1
+        watch.launched(bundle: "com.apple.logic10", name: "Logic Pro")
+        // A retry queued before the settle began starts it meanwhile, and has
+        // said "on the air now" for it.
+        logic.start(outputRate: 48000)
+        let startsBefore = logic.starts
+        spin(0.5)
+        check("a source a retry already started is not started again, nor said to be back",
+              logic.starts == startsBefore && !heard.contains { $0.0.contains("is back") },
+              "\(heard.map(\.0))")
+
+        logic.stop()
+        heard = []
+        work.async { Thread.sleep(forTimeInterval: 0.4) }
+        watch.launched(bundle: "com.apple.logic10", name: "Logic Pro")
+        spin(0.2)
+        // Removed while it settles: the start is already queued behind the
+        // busy work queue with the old list.
+        _ = group.remove(id: logic.config.id)
+        let stopsAtRemove = logic.stops
+        spin(0.8)
+        check("a source removed while its program settles is stopped again once started",
+              logic.starts > startsBefore && logic.stops > stopsAtRemove && !logic.isRunning,
+              "\(logic.starts) starts, \(logic.stops) stops, running \(logic.isRunning)")
+        check("and is never said to be back", !heard.contains { $0.0.contains("is back") },
+              "\(heard.map(\.0))")
+
+        // Back, for real, is queued too.
+        let again = StandInSource(name: "Logic", level: 0.1)
+        again.config.kind = "process"
+        again.config.bundleID = "com.apple.logic10"
+        again.startSetsRunning = true
+        again.isRunning = false
+        group.useForTesting([again])
+        heard = []
+        watch.launched(bundle: "com.apple.logic10", name: "Logic Pro")
+        spin(0.6)
+        check("a program coming back is said, queued behind what VoiceOver is reading",
+              heard.count == 1 && heard[0].0 == "Logic Pro is back, so Logic is on again"
+                && !heard[0].1, "\(heard)")
+        heard = []
+        watch.sayCameOn([again])
+        check("and so is a source the retry brought on",
+              heard.count == 1 && !heard[0].1, "\(heard)")
+
+        // Finding 6: Remove is never disabled, and refuses the microphone in
+        // words.
+        let control = SourceGroup()
+        let desk = StandInSource(name: "Desk", level: 0.1)
+        control.useForTesting([desk])
+        let owned = Board()
+        owned.sources = [desk.config]
+        var answered: [String] = []
+        let voice = Speaker()
+        voice.status = { answered.append($0) }
+        let sourcePanel = SourceControlPanel(group: control, mic: MicInput(duckBus: DuckBus()),
+                                             speaker: voice) { id in
+            control.forget(id: id, on: owned)
+        }
+        sourcePanel.confirmRemove = { _ in true }
+        sourcePanel.makeControls()
+        sourcePanel.select(row: 1)
+        sourcePanel.removePressed()
+        check("removing the last source leaves Remove enabled, so the focus stays on it",
+              control.all.isEmpty && sourcePanel.removeButton.isEnabled)
+        sourcePanel.removePressed()
+        check("and pressed on the microphone it says why not",
+              answered.last == "The microphone cannot be removed. Command M turns it off.",
+              answered.last ?? "nothing")
     }
 }

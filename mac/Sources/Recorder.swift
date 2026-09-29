@@ -139,6 +139,15 @@ final class Recorder {
         }
     }
 
+    /// How an MP3 file is opened for writing. The app's is the obvious one;
+    /// a check hands in a handle that refuses every write, to drive the real
+    /// writer down its real failure path.
+    var openForWriting: (String) -> FileHandle? = { FileHandle(forWritingAtPath: $0) }
+
+    /// Said when an MP3 file stops taking what is written to it.
+    static let cannotWrite = "The file could not be written. The disk may be full, or it "
+        + "may have been disconnected"
+
     @discardableResult
     func start(taps: Taps, rate: Double, format: String, bitrate: Int,
                folder: String?) -> String? {
@@ -162,7 +171,7 @@ final class Recorder {
                 return nil
             }
             guard FileManager.default.createFile(atPath: destination, contents: nil),
-                  let handle = FileHandle(forWritingAtPath: destination) else {
+                  let handle = openForWriting(destination) else {
                 lastError = "The recording file could not be made."
                 return nil
             }
@@ -211,7 +220,10 @@ final class Recorder {
         var interleaved = [Float](repeating: 0, count: chunk * 2)
 
         while true {
-            lock.lock(); let finishing = stopping; lock.unlock()
+            lock.lock(); let finishing = stopping, broken = failed; lock.unlock()
+            // A file that refused takes nothing more: what is left on the bus
+            // has nowhere to go.
+            if broken { break }
             let ready = bus.available()
             if ready < chunk {
                 // Stopping a recording should not cost the last quarter second
@@ -297,13 +309,19 @@ final class Recorder {
     /// placeholder it left at the very start of the file.
     private func finishMP3() {
         guard let encoder = mp3, let handle = mp3File else { return }
-        if let tail = encoder.flush() { handle.write(tail) }
+        // The THROWING writes, here as in `write` (audit 2, finding 4). The
+        // old `write(_:)` raises an Objective-C exception on a full disk or a
+        // volume that has gone, which nothing in Swift can catch, and it was
+        // raised on the recording's own thread: the app died mid show. At the
+        // end of a file there is nothing left to save, so a refusal here is
+        // simply the end.
+        if let tail = encoder.flush() { try? handle.write(contentsOf: tail) }
         if let tag = encoder.infoTagFrame() {
             // Over the placeholder, not inserted: it is the same size, and
             // seeking back is the whole reason a file can have this and a
             // stream cannot.
             try? handle.seek(toOffset: 0)
-            handle.write(tag)
+            try? handle.write(contentsOf: tag)
         }
         try? handle.close()
         mp3File = nil
@@ -325,7 +343,17 @@ final class Recorder {
             }
         }
         if let encoder = mp3, let handle = mp3File {
-            if let bytes = encoder.encode(buffer) { handle.write(bytes) }
+            if let bytes = encoder.encode(buffer) {
+                do {
+                    try handle.write(contentsOf: bytes)
+                } catch {
+                    // A full disk or a volume that has gone: stop cleanly and
+                    // say so, rather than an exception ending the app.
+                    lastError = "The recording stopped. \(Recorder.cannotWrite)"
+                    lock.lock(); stopping = true; failed = true; lock.unlock()
+                    return
+                }
+            }
             if let problem = encoder.lastError {
                 lastError = "The recording stopped. \(problem)"
                 lock.lock(); stopping = true; failed = true; lock.unlock()

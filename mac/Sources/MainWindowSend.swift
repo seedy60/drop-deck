@@ -18,11 +18,24 @@ extension MainWindow {
     /// Is the show going out of a sound card to another program.
     var sending: Bool { send?.isRunning == true }
 
-    /// On air anywhere, or recording anything: when a test tone must not go
-    /// down a cable, because somebody would hear it.
-    var liveOrRecording: Bool {
-        streamer.isOn || videoStreamer.isOn || recorder.isRecording
-            || videoRecorder.isRecording
+    /// Why Test the cable must not put a tone out now, or nil. Over the real
+    /// streamers, recorders and send.
+    var cableTestRefusal: String? {
+        MainWindow.cableTestRefusal(streamer: streamer, videoStreamer: videoStreamer,
+                                    recorder: recorder, videoRecorder: videoRecorder,
+                                    sending: sending)
+    }
+
+    /// Windows asks on air or recording. **Sending is a third** (audit 2,
+    /// finding 3): a call taking Drop Deck Audio with nothing on air heard two
+    /// seconds of a 1 kHz tone at minus ten.
+    static func cableTestRefusal(streamer: Streamer, videoStreamer: VideoStreamer,
+                                 recorder: Recorder, videoRecorder: VideoRecorder,
+                                 sending: Bool) -> String? {
+        if streamer.isOn || videoStreamer.isOn || recorder.isRecording
+            || videoRecorder.isRecording { return CableTest.notWhileLive }
+        if sending { return CableTest.notWhileSending }
+        return nil
     }
 
     /// Point the mixers at the send, or at nothing.
@@ -146,7 +159,7 @@ extension MainWindow {
     func showSendSetup() {
         let panel = SendPanel(board: board, sources: sourceGroup.all.map(\.config),
                               speaker: speaker,
-                              busy: { [weak self] in self?.liveOrRecording ?? false })
+                              refusal: { [weak self] in self?.cableTestRefusal })
         guard panel.run(over: window) else { return }
         panel.apply(to: board)
         touch()

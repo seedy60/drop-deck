@@ -172,8 +172,15 @@ protocol RunningSource: AnyObject {
     var peak: Float { get }
     @discardableResult func start(outputRate: Double) -> Bool
     func stop()
+    /// Stopped for good: taken out of the show. A start that was already on
+    /// its way, on the sources' work queue, opens nothing after this.
+    func retire()
     func readAir(frames: Int, into out: UnsafeMutablePointer<Float>)
     func readMonitor(frames: Int, into out: UnsafeMutablePointer<Float>)
+}
+
+extension RunningSource {
+    func retire() { stop() }
 }
 
 /// Everything both kinds share: gain, channel choice, rate conversion and the
@@ -217,6 +224,21 @@ class BaseSource: RunningSource {
     deinit { stereo.deallocate(); resampled.deallocate() }
 
     func setError(_ message: String?) { lastError = message }
+
+    /// Held across every start and stop (audit 2, finding 5). Starts run on
+    /// the window's source queue and stops on the main thread, and a program
+    /// capture's tap and aggregate device were changed from both with nothing
+    /// between them, which can leak a tap or destroy one twice. Recursive,
+    /// because `retire` stops inside it.
+    let lifecycle = NSRecursiveLock()
+    /// Taken out of the show. A start refuses once this is set.
+    private(set) var retired = false
+
+    func retire() {
+        lifecycle.lock(); defer { lifecycle.unlock() }
+        retired = true
+        stop()
+    }
 
     /// Start the arriving-audio meter again, for a fresh look at a source.
     func resetMeter() { framesIn = 0; peakIn = 0; sawStereo = false }
@@ -324,6 +346,8 @@ final class DeviceSource: BaseSource {
 
     @discardableResult
     override func start(outputRate: Double) -> Bool {
+        lifecycle.lock(); defer { lifecycle.unlock() }
+        guard !retired else { return false }
         guard !isRunning else { return true }
         self.outputRate = outputRate
         // A named device that is not there is a failure, NOT a reason to open
@@ -348,6 +372,7 @@ final class DeviceSource: BaseSource {
     }
 
     override func stop() {
+        lifecycle.lock(); defer { lifecycle.unlock() }
         input.close()
         monitorRing.clear(); airRing.clear()
     }
@@ -553,6 +578,8 @@ final class ProcessSource: BaseSource {
 
     @discardableResult
     override func start(outputRate: Double) -> Bool {
+        lifecycle.lock(); defer { lifecycle.unlock() }
+        guard !retired else { return false }
         guard !running else { return true }
         guard #available(macOS 14.2, *) else {
             setError("Capturing one program's audio needs macOS 14.2 or later")
@@ -711,6 +738,7 @@ final class ProcessSource: BaseSource {
     }
 
     override func stop() {
+        lifecycle.lock(); defer { lifecycle.unlock() }
         cleanUp()
         monitorRing.clear(); airRing.clear()
     }
@@ -856,7 +884,7 @@ final class SourceGroup: AudioSource {
         let gone = sources.remove(at: at)
         lock.unlock()
         if soloed == id { soloed = nil }
-        gone.stop()
+        gone.retire()
         return gone
     }
 
@@ -882,7 +910,7 @@ final class SourceGroup: AudioSource {
 
     func stopAll() {
         lock.lock(); let list = sources; sources = []; lock.unlock()
-        for source in list { source.stop() }
+        for source in list { source.retire() }
     }
 
     var all: [RunningSource] {

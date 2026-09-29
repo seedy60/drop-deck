@@ -34,7 +34,7 @@ extension MainWindow {
         guard !sourcesRetrying else { return }
         sourcesRetrying = true
         let rate = group.sampleRate
-        let skip = programsSettling
+        let skip = programWatch.settling
         let sources = sourceGroup
         sourceWork.async { [weak self] in
             let cameOn = sources.retryFailed(outputRate: rate, skip: skip)
@@ -42,11 +42,7 @@ extension MainWindow {
                 guard let self else { return }
                 self.sourcesRetrying = false
                 guard !cameOn.isEmpty else { return }
-                let lines = ProgramWords.cameOn(
-                    onAir: cameOn.filter { $0.config.onAir }.map(\.config.name),
-                    monitored: cameOn.filter { !$0.config.onAir }.map(\.config.name))
-                // A timer's line, so it waits for whatever is being read.
-                for line in lines { self.speaker.announceHelp(line, interrupt: false) }
+                self.programWatch.sayCameOn(cameOn)
                 self.updateStatusLine()
             }
         }
@@ -73,66 +69,163 @@ extension MainWindow {
             })
     }
 
-    /// The program's name as a person knows it.
-    private func programName(_ bundle: String, _ name: String?) -> String {
-        let named = (name ?? "").trimmingCharacters(in: .whitespaces)
-        return named.isEmpty ? (bundle.components(separatedBy: ".").last ?? bundle) : named
+    /// The watcher that decides what a program quitting or launching means,
+    /// wired to this window's sources, queue and voice. Made once.
+    func makeProgramWatch() -> ProgramWatch {
+        ProgramWatch(sources: sourceGroup, work: sourceWork, speaker: speaker,
+                     outputRate: { [weak self] in
+                         self?.group.sampleRate ?? C.defaultSampleRate },
+                     goingAnywhere: { [weak self] in self?.goingAnywhere ?? false },
+                     changed: { [weak self] in self?.updateStatusLine() })
     }
 
     /// A captured program has quit.
     func programQuit(bundle: String, name: String?) {
-        let affected = sourceGroup.sources(forBundle: bundle).filter(\.isRunning)
+        programWatch.quit(bundle: bundle, name: name)
+    }
+
+    /// A program some source captures has launched.
+    func programLaunched(bundle: String, name: String?) {
+        programWatch.launched(bundle: bundle, name: name)
+    }
+}
+
+/// What a captured program quitting or launching means, apart from the window
+/// so the checks can drive it with stand in sources (audit 2, findings 5 and 7).
+///
+/// Every start and stop is on `work`. What is said comes back on the main
+/// queue.
+final class ProgramWatch {
+    let sources: SourceGroup
+    let work: DispatchQueue
+    let outputRate: () -> Double
+    /// Programs just opened again, given `settleSeconds` before they are
+    /// captured, so the retry leaves them alone meanwhile.
+    private(set) var settling = Set<String>()
+    var settleSeconds = C.sourceSettleSeconds
+    /// Whether any copy of a program is still running. **One copy quitting is
+    /// not the program closing** (audit 2, finding 7): a second copy opened
+    /// with open -n quitting said "closed" and, below macOS 26, stopped the
+    /// capture of the copy still playing.
+    var stillRunning: (String) -> Bool = { bundle in
+        // The one that quit can still be listed for a moment, marked ended.
+        NSRunningApplication.runningApplications(withBundleIdentifier: bundle)
+            .contains { !$0.isTerminated }
+    }
+    /// Below macOS 26 a dead capture is stopped so the retry can find the new
+    /// process; from 26 the tap follows the program.
+    var stopWhenQuits: Bool = {
+        if #available(macOS 26.0, *) { return ProgramWords.stopWhenProgramQuits(macOS26: true) }
+        return ProgramWords.stopWhenProgramQuits(macOS26: false)
+    }()
+    let speaker: Speaker
+    let goingAnywhere: () -> Bool
+    let changed: () -> Void
+
+    init(sources: SourceGroup, work: DispatchQueue, speaker: Speaker,
+         outputRate: @escaping () -> Double, goingAnywhere: @escaping () -> Bool,
+         changed: @escaping () -> Void) {
+        self.sources = sources
+        self.work = work
+        self.speaker = speaker
+        self.outputRate = outputRate
+        self.goingAnywhere = goingAnywhere
+        self.changed = changed
+    }
+
+    // Every line here is one nobody asked for, so every one is QUEUED behind
+    // whatever VoiceOver is reading (W383-15), never interrupting it.
+
+    /// A program closing: on the essential channel when that source was going
+    /// out live, otherwise a hint.
+    private func sayClosed(_ line: String, onAir: Bool) {
+        if onAir && goingAnywhere() {
+            speaker.announce(line, interrupt: false)
+        } else {
+            speaker.announceHelp(line, interrupt: false)
+        }
+    }
+
+    private func sayBack(_ line: String) {
+        speaker.announceHelp(line, interrupt: false)
+    }
+
+    /// Sources the slow retry brought on, said in words true of them.
+    func sayCameOn(_ cameOn: [RunningSource]) {
+        let lines = ProgramWords.cameOn(
+            onAir: cameOn.filter { $0.config.onAir }.map(\.config.name),
+            monitored: cameOn.filter { !$0.config.onAir }.map(\.config.name))
+        for line in lines { speaker.announceHelp(line, interrupt: false) }
+    }
+
+    /// The program's name as a person knows it.
+    static func name(_ bundle: String, _ name: String?) -> String {
+        let named = (name ?? "").trimmingCharacters(in: .whitespaces)
+        return named.isEmpty ? (bundle.components(separatedBy: ".").last ?? bundle) : named
+    }
+
+    /// A captured program has quit. Main thread.
+    func quit(bundle: String, name: String?) {
+        let affected = sources.sources(forBundle: bundle).filter(\.isRunning)
         guard !affected.isEmpty else { return }
-        programsSettling.remove(bundle)
-        let program = programName(bundle, name)
-        var stop: Bool = true
-        if #available(macOS 26.0, *) { stop = ProgramWords.stopWhenProgramQuits(macOS26: true) }
-        else { stop = ProgramWords.stopWhenProgramQuits(macOS26: false) }
-        if stop {
-            sourceWork.async { for source in affected { source.stop() } }
+        guard !stillRunning(bundle) else { return }
+        settling.remove(bundle)
+        let program = ProgramWatch.name(bundle, name)
+        if stopWhenQuits {
+            work.async { for source in affected { source.stop() } }
         }
-        // Said first, so nothing below can cost the sentence. Queued rather
-        // than interrupting, because a program closing is nobody's keypress;
-        // on the essential channel when that source was going out live.
+        // Said first, so nothing below can cost the sentence.
         for source in affected {
-            let line = ProgramWords.closed(program: program, sourceName: source.config.name)
-            if source.config.onAir && goingAnywhere {
-                speaker.announce(line, interrupt: false)
-            } else {
-                speaker.announceHelp(line, interrupt: false)
-            }
+            sayClosed(ProgramWords.closed(program: program, sourceName: source.config.name),
+                      onAir: source.config.onAir)
         }
-        updateStatusLine()
+        changed()
     }
 
     /// A program some source captures has launched. Give it time to settle,
-    /// capture it if it needs capturing, and say it is back.
-    func programLaunched(bundle: String, name: String?) {
-        guard !sourceGroup.sources(forBundle: bundle).isEmpty else { return }
-        programsSettling.insert(bundle)
-        let program = programName(bundle, name)
-        DispatchQueue.main.asyncAfter(deadline: .now() + C.sourceSettleSeconds) {
-            [weak self] in
-            guard let self, self.programsSettling.contains(bundle) else { return }
-            let wanted = self.sourceGroup.sources(forBundle: bundle)
-            let rate = self.group.sampleRate
-            self.sourceWork.async {
+    /// capture it if it needs capturing, and say it is back. Main thread.
+    func launched(bundle: String, name: String?) {
+        let affected = sources.sources(forBundle: bundle)
+        guard !affected.isEmpty else { return }
+        settling.insert(bundle)
+        let program = ProgramWatch.name(bundle, name)
+        // Which were stopped when it quit. One of those running by the time
+        // the settle ends was started by a retry queued before this, which
+        // has already said it is on the air, so it is not said twice.
+        let stoppedNow = Set(affected.filter { !$0.isRunning }.map { ObjectIdentifier($0) })
+        DispatchQueue.main.asyncAfter(deadline: .now() + settleSeconds) { [weak self] in
+            guard let self, self.settling.contains(bundle) else { return }
+            let wanted = self.sources.sources(forBundle: bundle)
+            let rate = self.outputRate()
+            let group = self.sources
+            self.work.async {
                 var back: [RunningSource] = []
                 for source in wanted {
-                    if source.isRunning || source.start(outputRate: rate) {
-                        (source as? BaseSource)?.syncDelay()
-                        back.append(source)
+                    let wasStopped = stoppedNow.contains(ObjectIdentifier(source))
+                    if source.isRunning {
+                        // Kept running through the quit (macOS 26): back.
+                        // Started by a retry meanwhile: already said.
+                        if !wasStopped { back.append(source) }
+                        continue
                     }
+                    guard source.start(outputRate: rate) else { continue }
+                    // **Removed while it settled** (audit 2, finding 5): a
+                    // Remove, a Sources OK or a File, Open during the four
+                    // seconds. It is stopped again, and never said to be back.
+                    guard group.all.contains(where: { $0 === source }) else {
+                        source.retire()
+                        continue
+                    }
+                    (source as? BaseSource)?.syncDelay()
+                    back.append(source)
                 }
                 DispatchQueue.main.async {
-                    self.programsSettling.remove(bundle)
-                    for source in back {
-                        self.speaker.announceHelp(
-                            ProgramWords.back(program: program,
-                                              sourceName: source.config.name),
-                            interrupt: false)
+                    self.settling.remove(bundle)
+                    for source in back where group.all.contains(where: { $0 === source }) {
+                        self.sayBack(ProgramWords.back(program: program,
+                                                       sourceName: source.config.name))
                     }
-                    self.updateStatusLine()
+                    self.changed()
                 }
             }
         }

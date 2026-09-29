@@ -126,9 +126,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// (W381), so a radio board recording its camera met the system dialog in
     /// the middle of the show. See `Permissions.wantedAtLaunch`.
     private func askForWhatTheBoardNeeds() {
-        let wanted = Permissions.wantedAtLaunch(picture: main.board.picture,
-                                                camera: Permissions.state(.camera),
-                                                screen: Permissions.state(.screen))
+        // The screen only for a board set up to send its picture somewhere,
+        // and only if this signed copy has never asked (audit 2, finding 1).
+        let wanted = Permissions.wantedAtLaunch(
+            picture: main.board.picture, camera: Permissions.state(.camera),
+            screen: Permissions.state(.screen), screenAskedBefore: ScreenAsked.asked(),
+            screenUsed: main.board.liveTo == C.liveToVideo)
         guard !wanted.isEmpty else { return }
 
         let names = wanted.map { $0.label.lowercased() }

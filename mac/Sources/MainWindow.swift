@@ -91,9 +91,8 @@ final class MainWindow: NSWindowController, NSWindowDelegate {
     /// A retry is under way on `sourceWork`, so the next tick does not queue
     /// another behind it.
     var sourcesRetrying = false
-    /// Programs just opened again, being given `C.sourceSettleSeconds` before
-    /// they are captured, so the retry leaves them alone meanwhile.
-    var programsSettling = Set<String>()
+    /// What a captured program quitting or launching means (ProgramWatch).
+    private(set) lazy var programWatch: ProgramWatch = makeProgramWatch()
     var programObservers: [NSObjectProtocol] = []
     private var saveTimer: Timer?
 

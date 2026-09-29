@@ -589,8 +589,24 @@ final class StandInSource: RunningSource {
         self.level = level
     }
 
-    @discardableResult func start(outputRate: Double) -> Bool { true }
-    func stop() {}
+    /// Off by default, so the checks written before it keep their meaning:
+    /// when set, a start really makes it running and a stop really stops it,
+    /// and both are counted.
+    var startSetsRunning = false
+    private let counts = NSLock()
+    private var startCount = 0, stopCount = 0
+    var starts: Int { counts.lock(); defer { counts.unlock() }; return startCount }
+    var stops: Int { counts.lock(); defer { counts.unlock() }; return stopCount }
+
+    @discardableResult func start(outputRate: Double) -> Bool {
+        counts.lock(); startCount += 1; counts.unlock()
+        if startSetsRunning { isRunning = true }
+        return true
+    }
+    func stop() {
+        counts.lock(); stopCount += 1; counts.unlock()
+        if startSetsRunning { isRunning = false }
+    }
 
     /// The same guard `BaseSource.readAir` really applies. Written out rather
     /// than inherited, because a stand-in that answers a steady level cannot

@@ -493,8 +493,19 @@ final class SourceControlPanel: NSObject {
     private var soloBox: NSButton!
     private var doing: NSTextField!
     private var renameButton: NSButton!
-    private var removeButton: NSButton!
+    private(set) var removeButton: NSButton!
     private var alert: NSAlert!
+    /// Asked before a source is removed. The real one is a box; a check
+    /// answers it, so the real Remove path can be driven.
+    var confirmRemove: (String) -> Bool = { label in
+        let confirm = NSAlert()
+        confirm.messageText = "Remove \(label)?"
+        confirm.informativeText = "It stops going out and its settings are forgotten."
+        // The safe answer is the default.
+        confirm.addButton(withTitle: "Cancel")
+        confirm.addButton(withTitle: "Remove")
+        return confirm.runModal() == .alertSecondButtonReturn
+    }
     /// Removes one source from the show and from the board, by id. The window
     /// hands this in, because the board and what has to be rewired after it
     /// are the window's; the panel only decides WHICH.
@@ -522,6 +533,21 @@ final class SourceControlPanel: NSObject {
     }
 
     func run(over parent: NSWindow?) {
+        let alert = makeControls()
+        // The digits are claimed rather than monitored: a second local monitor
+        // raced the window's own and sometimes fired pads instead. The window
+        // is named so a nested rename box takes the keyboard back while it is
+        // up; see ModalKeys.owner for what went wrong without it.
+        ModalKeys.claim({ [weak self] event in self?.handle(event) ?? false },
+                        window: alert.window) {
+            alert.runModal()
+        }
+    }
+
+    /// Everything in the window, built and loaded but not run. Apart from
+    /// `run` so the checks can press the real buttons.
+    @discardableResult
+    func makeControls() -> NSAlert {
         alert = NSAlert()
         alert.messageText = "Source control"
         alert.informativeText = "Up and down choose a source. Tab to the boxes and "
@@ -589,15 +615,13 @@ final class SourceControlPanel: NSObject {
         table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
         alert.window.initialFirstResponder = table
         loadSelection()
+        return alert
+    }
 
-        // The digits are claimed rather than monitored: a second local monitor
-        // raced the window's own and sometimes fired pads instead. The window
-        // is named so a nested rename box takes the keyboard back while it is
-        // up; see ModalKeys.owner for what went wrong without it.
-        ModalKeys.claim({ [weak self] event in self?.handle(event) ?? false },
-                        window: alert.window) {
-            alert.runModal()
-        }
+    /// Select a row, as arrowing to it does. For the checks.
+    func select(row: Int) {
+        table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        loadSelection()
     }
 
     private func handle(_ event: NSEvent) -> Bool {
@@ -654,7 +678,12 @@ final class SourceControlPanel: NSObject {
         soloBox.state = entry.solo ? .on : .off
         mutedBox.isEnabled = !isMic
         renameButton.isEnabled = !isMic
-        removeButton.isEnabled = !isMic
+        // **Remove is never disabled** (audit 2, finding 6). Removing the last
+        // source lands the selection on the microphone with the focus still on
+        // Remove, and disabling the focused button moved the focus somewhere
+        // else in silence (W384-32). It stays, and refuses in words for the
+        // microphone, which `remove` already does.
+        removeButton.isEnabled = true
         // A disabled control leaves the Tab loop, so the reason has to be
         // somewhere a Tab user will pass. Here.
         doing.stringValue = isMic
@@ -688,7 +717,7 @@ final class SourceControlPanel: NSObject {
     }
 
     @objc private func renamePressed() { rename() }
-    @objc private func removePressed() { remove() }
+    @objc func removePressed() { remove() }
 
     private func rename() {
         guard let entry = selected() else { return }
@@ -728,13 +757,7 @@ final class SourceControlPanel: NSObject {
                                  + "Command M turns it off.")
             return
         }
-        let confirm = NSAlert()
-        confirm.messageText = "Remove \(entry.label)?"
-        confirm.informativeText = "It stops going out and its settings are forgotten."
-        // The safe answer is the default.
-        confirm.addButton(withTitle: "Cancel")
-        confirm.addButton(withTitle: "Remove")
-        guard confirm.runModal() == .alertSecondButtonReturn else {
+        guard confirmRemove(entry.label) else {
             speaker.announceAnswer("Kept")
             return
         }
