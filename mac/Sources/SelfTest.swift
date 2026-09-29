@@ -69,6 +69,7 @@ final class SelfTest {
         runBoardFileChecks()
         runTwoKeysChecks()
         runReportsChecks()
+        runAccessibilityChecks()
         testRealDevice()
 
         out.append("")

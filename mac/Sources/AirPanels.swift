@@ -76,7 +76,7 @@ final class HotkeyPanel {
         var response: NSApplication.ModalResponse = .cancel
         ModalKeys.claim({ [weak self] event in self?.capture(event) ?? false },
                         window: alert.window) {
-            response = alert.runModal()
+            response = ModalAudit.run(alert)
         }
 
         switch response {
@@ -340,7 +340,7 @@ final class SourcesPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         }
         loadSelection()
 
-        guard alert.runModal() == .alertFirstButtonReturn else { return false }
+        guard ModalAudit.run(alert) == .alertFirstButtonReturn else { return false }
         board.sources = working
         return true
     }
@@ -540,7 +540,7 @@ final class SourceControlPanel: NSObject {
         // up; see ModalKeys.owner for what went wrong without it.
         ModalKeys.claim({ [weak self] event in self?.handle(event) ?? false },
                         window: alert.window) {
-            alert.runModal()
+            ModalAudit.run(alert)
         }
     }
 

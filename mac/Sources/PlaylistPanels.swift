@@ -94,7 +94,7 @@ final class DropsLibraryPanel: NSObject, NSTableViewDataSource, NSTableViewDeleg
         alert.accessoryView = box
         alert.window.initialFirstResponder = table
         refresh(keep: 0)
-        alert.runModal()
+        ModalAudit.run(alert)
         return changed
     }
 
@@ -234,7 +234,7 @@ final class TrackCrossfadePanel: NSObject {
 
         alert.accessoryView = box
         alert.window.initialFirstResponder = useDefault
-        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        guard ModalAudit.run(alert) == .alertFirstButtonReturn else { return nil }
         if useDefault.state == .on { return .playlistDefault }
         let value = min(C.maxCrossfade, max(0, seconds.doubleValue))
         return .seconds((value * 100).rounded() / 100)

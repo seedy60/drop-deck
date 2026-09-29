@@ -29,7 +29,7 @@ extension MainWindow {
         alert.messageText = title
         alert.informativeText = text
         alert.addButton(withTitle: "OK")
-        alert.runModal()
+        ModalAudit.run(alert)
     }
 
     // --------------------------------------------------------------- feedback ---

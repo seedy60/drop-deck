@@ -45,7 +45,7 @@ extension MainWindow {
         alert.accessoryView = field
         alert.window.initialFirstResponder = field
         field.currentEditor()?.selectAll(nil)
-        let response = alert.runModal()
+        let response = ModalAudit.run(alert)
         guard response == .alertFirstButtonReturn else { return nil }
         return field.stringValue
     }
@@ -78,7 +78,7 @@ extension MainWindow {
         scroll.hasVerticalScroller = true
         alert.accessoryView = scroll
         alert.window.initialFirstResponder = text
-        alert.runModal()
+        ModalAudit.run(alert)
     }
 
     // ------------------------------------------------------------- assigning ---

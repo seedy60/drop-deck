@@ -330,7 +330,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return edit
     }
 
-    private func buildMenus() {
+    /// Internal rather than private so `--check-accessibility` can build and
+    /// read the real menus.
+    func buildMenus() {
         let bar = NSMenu()
 
         // The application menu. macOS owns the first menu and expects About,

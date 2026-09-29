@@ -33,7 +33,7 @@ final class CueSheetWindow: NSObject, NSWindowDelegate,
                             NSTableViewDataSource, NSTableViewDelegate {
 
     private weak var main: MainWindow?
-    private var window: NSWindow!
+    private(set) var window: NSWindow!
     private var table: NSTableView!
     private var clock: NSTextField!
     private var summary: NSTextField!
@@ -53,6 +53,20 @@ final class CueSheetWindow: NSObject, NSWindowDelegate,
     // ----------------------------------------------------------- the window ---
 
     func show() {
+        build()
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(table)
+        if !rows.isEmpty { table.selectRowIndexes([0], byExtendingSelection: false) }
+
+        timer = Timer.scheduledTimer(withTimeInterval: Double(C.cueRefreshMS) / 1000.0,
+                                     repeats: true) { [weak self] _ in
+            self?.refresh()
+        }
+    }
+
+    /// The window and everything in it, filled in but not shown. Apart from
+    /// `show` so the accessibility check can read it without putting it up.
+    func build() {
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 700, height: 420),
             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
@@ -108,14 +122,6 @@ final class CueSheetWindow: NSObject, NSWindowDelegate,
         window.contentView = content
         rebuild(force: true)
         window.center()
-        window.makeKeyAndOrderFront(nil)
-        window.makeFirstResponder(table)
-        if !rows.isEmpty { table.selectRowIndexes([0], byExtendingSelection: false) }
-
-        timer = Timer.scheduledTimer(withTimeInterval: Double(C.cueRefreshMS) / 1000.0,
-                                     repeats: true) { [weak self] _ in
-            self?.refresh()
-        }
     }
 
     func raise() {

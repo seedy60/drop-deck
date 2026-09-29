@@ -127,9 +127,15 @@ final class Speaker {
     /// for (audit 2, finding 8).
     var spoken: ((String, Bool) -> Void)?
 
+    /// Set only by `--check-accessibility`, which builds every window with
+    /// nobody at the keyboard: what the windows would have said still reaches
+    /// `status` and `spoken`, and nothing is posted to VoiceOver.
+    static var muted = false
+
     private func say(_ text: String, interrupt: Bool = true) {
         guard !text.isEmpty else { return }
         spoken?(text, interrupt)
+        guard !Speaker.muted else { return }
         let post = { [weak self] in
             guard let self else { return }
             let now = Date()

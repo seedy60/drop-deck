@@ -115,7 +115,7 @@ final class ChoicePanel: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
         alert.accessoryView = scroll
         alert.window.initialFirstResponder = table
-        guard alert.runModal() == .alertFirstButtonReturn,
+        guard ModalAudit.run(alert) == .alertFirstButtonReturn,
               table.selectedRow >= 0, table.selectedRow < options.count else { return nil }
         return table.selectedRow
     }
@@ -213,7 +213,7 @@ final class FeedbackPanel: NSObject, NSTextViewDelegate {
         alert.window.initialFirstResponder = kind
         refresh()
 
-        guard alert.runModal() == .alertFirstButtonReturn, !text.isEmpty else { return nil }
+        guard ModalAudit.run(alert) == .alertFirstButtonReturn, !text.isEmpty else { return nil }
         return (typeKey, text)
     }
 

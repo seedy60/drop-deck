@@ -86,7 +86,7 @@ final class SendPanel: NSObject {
         alert.addButton(withTitle: "Cancel")
         alert.accessoryView = makeAccessory()
         alert.window.initialFirstResponder = onBox
-        return alert.runModal() == .alertFirstButtonReturn
+        return ModalAudit.run(alert) == .alertFirstButtonReturn
     }
 
     /// Everything under the paragraph. Built apart from `run` so the self

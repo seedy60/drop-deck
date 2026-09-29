@@ -51,6 +51,12 @@ enum Secrets {
     /// that. It is also billable, which a stream key is not.
     static let visionPrefix = "TG Drop Deck vision key: "
 
+    /// Set only by `--check-accessibility`, which builds Preferences and the
+    /// go live window for real and must not read, move or prompt for a key in
+    /// the owner's keychain while it does. Every call answers as though the
+    /// keychain were empty and nothing is written.
+    static var offline = false
+
     /// What one station's entry is called. The same string Windows uses for
     /// its target name, so a person who runs both copies sees the same label
     /// in two different credential stores.
@@ -65,6 +71,7 @@ enum Secrets {
     /// are shared with the Windows shape and a machine that has somehow lost
     /// its keychain should degrade rather than crash.
     static func available() -> Bool {
+        if offline { return false }
         // A round trip on a name nothing else uses. Cheap, and it proves the
         // daemon answers rather than assuming it.
         let probe = "TG Drop Deck keychain check"
@@ -83,6 +90,7 @@ enum Secrets {
     @discardableResult
     static func store(station: String, key: String,
                       prefix: String = targetPrefix) -> Bool {
+        if offline { return false }
         if key.isEmpty { return forget(station: station, prefix: prefix) }
         let account = target(for: station, prefix: prefix)
         let data = Data(key.utf8)
@@ -122,6 +130,7 @@ enum Secrets {
 
     /// Every station a stream key is filed under, whatever it is called.
     static func stations(prefix: String = targetPrefix) -> [String] {
+        if offline { return [] }
         var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: C.appName,
@@ -144,6 +153,7 @@ enum Secrets {
     /// and the old entry removed, so nothing is left lying about under a name
     /// that no longer means anything.
     static func fetchVideoKey(server: String, host: String, stationName: String) -> String {
+        if offline { return "" }
         let station = videoStation(server: server, host: host)
         let here = fetch(station: station)
         if !here.isEmpty { return here }
@@ -162,6 +172,7 @@ enum Secrets {
 
     /// The key for one station, or an empty string. Never throws.
     static func fetch(station: String, prefix: String = targetPrefix) -> String {
+        if offline { return "" }
         var query = base(account: target(for: station, prefix: prefix))
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -174,6 +185,7 @@ enum Secrets {
     /// Remove a station's key. True when there is no longer one there.
     @discardableResult
     static func forget(station: String, prefix: String = targetPrefix) -> Bool {
+        if offline { return true }
         SecItemDelete(base(account: target(for: station, prefix: prefix)) as CFDictionary)
         // Deleting something that was never there is a success, not a failure:
         // what was asked for was that no key is kept, and none is.

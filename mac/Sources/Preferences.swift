@@ -814,7 +814,7 @@ extension MainWindow {
         // The Voice tab changes the live chain as you move, so Cancel has to
         // put it back.
         let voiceBefore = mic.chain.settings
-        guard alert.runModal() == .alertFirstButtonReturn else {
+        guard ModalAudit.run(alert) == .alertFirstButtonReturn else {
             mic.chain.settings = voiceBefore
             speaker.announceHelp("Nothing changed")
             // A station saved or forgotten on the Streaming tab is a deliberate

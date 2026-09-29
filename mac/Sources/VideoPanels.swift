@@ -33,6 +33,12 @@ import CoreVideo
 /// that keeps answering while a nested box is up eats the keys meant for it.
 enum PanelKeys {
     static func run(_ alert: NSAlert, extra: ((NSEvent) -> Bool)? = nil) -> NSApplication.ModalResponse {
+        // Handed to the accessibility check instead of shown, and answered
+        // the way Escape answers here. Nil in the app. See ModalAudit.
+        if let audit = ModalAudit.capture {
+            audit(alert)
+            return .alertSecondButtonReturn
+        }
         var response: NSApplication.ModalResponse = .alertFirstButtonReturn
         ModalKeys.claim({ event in
             guard NSApp.keyWindow === alert.window else { return false }

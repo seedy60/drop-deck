@@ -89,7 +89,7 @@ final class KeyboardCheckPanel: NSObject {
             self.escapedOnce = false
             return true                                 // nothing here fires a pad
         }) {
-            alert.runModal()
+            ModalAudit.run(alert)
         }
 
         let missing = Self.wanted.filter { !seen.contains($0.0) }

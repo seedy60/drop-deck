@@ -87,7 +87,7 @@ final class SlotPropertiesPanel: NSObject {
         alert.window.initialFirstResponder = nameField
         nameField.currentEditor()?.selectAll(nil)
 
-        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        guard ModalAudit.run(alert) == .alertFirstButtonReturn else { return nil }
         return SlotPropertiesResult(
             name: nameField.stringValue.trimmingCharacters(in: .whitespaces),
             trimDB: levelSlider.doubleValue.rounded(),
@@ -188,7 +188,7 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         alert.accessoryView = box
         alert.window.initialFirstResponder = queryField
 
-        let response = alert.runModal()
+        let response = ModalAudit.run(alert)
         guard table.selectedRow >= 0, table.selectedRow < matches.count else { return nil }
         let chosen = matches[table.selectedRow]
         switch response {

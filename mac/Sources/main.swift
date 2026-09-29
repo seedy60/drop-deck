@@ -8,6 +8,13 @@ if CommandLine.arguments.contains("--selftest") {
     exit(SelfTest().run())
 }
 
+// Every window read the way VoiceOver reads it, from inside, because the shell
+// the checks run from cannot be given the Accessibility permission. Nothing
+// real is opened or touched. See AccessibilityCheck.swift.
+if CommandLine.arguments.contains("--check-accessibility") {
+    exit(AccessibilityCheck.run())
+}
+
 // The one thing the unit checks cannot prove is that a real server accepts what
 // this sends. See StreamTest.
 if let at = CommandLine.arguments.firstIndex(of: "--streamtest") {

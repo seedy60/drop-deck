@@ -729,6 +729,74 @@ the day the microphone landed. `MixerGroup.monitorMixer` returned `primary`
 unconditionally while its own doc comment described the behaviour it did not
 have. A setting that does nothing is worse than no setting.
 
+## Level with Windows 3.8.4, on 29 September 2026
+
+Mac 3.8.4 took all of Windows 3.8.0 to 3.8.4 in one release, and most of what
+Windows fixed in those four turned out to be on the Mac too. What is worth
+knowing before touching any of it:
+
+**YouTube DOES answer a publish, and the old note saying it never does was
+wrong.** Measured 29 September 2026 with Tony's real key through
+`--check-stream-key`: accepted in 0.54 seconds with `NetStream.Publish.Start`,
+and nothing at all sent after the publish command. The "twelve seconds of
+silence" of 8 September was measured with a MADE UP key, and YouTube's answer
+to a bad key is to hang up without a word. The receive loop could not see a
+hang up at all, so a server that had gone looked exactly like one that was
+thinking. `RTMPClient` now records a peer close, and a close after the publish
+has gone out is a refusal (a close before it is the network).
+
+**Check my stream key sends NOTHING after publish**, not even the
+`FCUnpublish` Windows sends. That is the whole safety argument, and
+`mac/tools/check_keycheck.py` proves it against `tools/mock_rtmp.py` and six
+misbehaving servers of our own in `mac/tools/keycheck_servers.py` (refuses,
+hangs up at each stage, chatters every 50 ms, declares a 16 MB message,
+Icecast 403, a connect `_error`). Every wait in a conversation shares one
+monotonic deadline: a timeout per read is not a bound when the other end
+chooses how cheap a read is.
+
+**What is fatal is Windows' rule, word for word** (`Retry` in
+`StreamTruth.swift`): a refused key or password stops on any attempt, "could
+not be found" only on the first, and an Icecast 403 (mount still held by the
+connection that just dropped) is retried. The first cut made 403 fatal, which
+would have ended a show for good on a Wi-Fi blip.
+
+**Command+B is video and Option+Shift+B is radio**, one toggle per
+destination, as Windows split them in 3.8.2. Where Windows left a sentence
+that the split made false ("Ctrl+B goes to your radio station"), the Mac says
+something true instead; `OnAir.swift` holds the decisions as pure functions.
+
+**One picture, reference counted** (`PictureFeed.swift`). Every open and close
+runs on the feed's own queue, never the main thread: the first camera open
+waits on a permission answer that arrives ON the main queue, so opening there
+hangs for two minutes. The fallback card is published before a source starts,
+so a stream never goes out with no picture while a camera opens.
+
+**FrameTap is two deep and the lead is 0 on the Mac, not Windows' -1.**
+Measured with `--check-record-frames`, numbered frames decoded back out of the
+file: one slot lost 6.7 to 7.8 per cent of frames, depth 2 with lead 0 loses
+1.0 to 2.4 and sits within about 6 to 19 ms of the sound. Sweep it again if
+the depth changes.
+
+**The board file is guarded like Windows'**: `last_board.json`, a fingerprint
+taken from the bytes read, never saving over a changed file (a sidecar copy
+instead), an unreadable board copied aside, and the demo CLAIMING a path
+rather than taking it. `TGDROPDECK_DATA` points the whole config folder
+somewhere else, which is what every test uses so nothing touches the real
+board. The board's fallback stream key carries `mac_video_key_server`, so a
+YouTube key kept in the board is never offered to Facebook.
+
+**The camera entitlement was missing since the camera arrived.** Under the
+hardened runtime, `com.apple.security.device.camera` absent means macOS never
+asks and never lists the app, whatever `NSCameraUsageDescription` says. A self
+test reads the running bundle's own signature for it now.
+
+**A running order tick is the check box's VALUE, never its label.** Every row
+said "Ticked to play" because the label carried the state and was the same on
+every row. `TickBox` has the fixed label "Play" and a value of 1 or 0.
+
+**`DropDeckApplication` is the principal class** (for `errors.log`), declared
+`@objc(DropDeckApplication)` so the Info.plist name resolves.
+
 ## Still to do
 
 - **A real broadcast to YouTube and Facebook.** The RTMP client is proved end
@@ -736,9 +804,18 @@ have. A setting that does nothing is worse than no setting.
   frame, and it has not yet been pointed at a real platform. Restream with
   every channel switched off is the place to start: the stream reaches
   Restream and goes nowhere.
-- **The camera has not been opened by the real app yet.** Enumeration is
-  proved and the permission is in the Info.plist, but nothing has yet shown
-  Tony the system prompt, which is his to answer.
+- **The camera has not been opened by the real app yet.** Until 3.8.4 it
+  could not have been: the camera entitlement was missing. Nothing has yet
+  shown Tony the system prompt, which is his to answer.
+- **A captured program quitting and reopening has not been tried for real**
+  on macOS 15 or 26. `ProgramWatch` handles it by bundle id and is tested with
+  stand ins only.
+- **Test the cable has not been pressed against a real cable** from the
+  window. `--check-send` has, and the judging is cross checked against
+  Windows' `cabletest.py`.
+- **Artist - Title is Mac first.** `stream_title_format` is a board key the
+  Windows copy does not know, and Windows' `to_dict` drops unknown keys, so a
+  board saved on Windows goes back to Title by Artist until Windows adds it.
 - **Hosting Audio Units in the voice chain**, the Mac's answer to the Windows
   VST3 hosting. The entitlement for it is already in place
   (`disable-library-validation`), the parameter list the chain uses is the
