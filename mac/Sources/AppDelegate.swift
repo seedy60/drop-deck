@@ -19,9 +19,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var main: MainWindow!
     private var monitor: Any?
 
-    // The three items that say what state they are in. Relabelled rather than
-    // duplicated, so there is one key for going live and one for coming off.
+    // The items that say what state they are in. Relabelled rather than
+    // duplicated, so each go live key also comes off air from its own place.
     private var goLiveItem: NSMenuItem!
+    private var goLiveRadioItem: NSMenuItem!
     private var micItem: NSMenuItem!
     private var recordItem: NSMenuItem!
     private var recordVideoItem: NSMenuItem!
@@ -261,7 +262,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .search: main.showSearch()
         case .whatsPlaying: main.whatIsPlaying()
         case .ducking: main.toggleDucking()
-        case .streamToggle: main.toggleStream(); refreshAirMenu()
+        case .streamToggle: main.toggleStream(to: C.liveToVideo); refreshAirMenu()
+        case .streamToggleRadio: main.toggleStream(to: C.liveToAudio); refreshAirMenu()
         case .record: main.toggleRecording(); refreshAirMenu()
         case .micToggle: main.toggleMic(); refreshAirMenu()
         case .globalHotkeysToggle: main.toggleGlobalHotkeys(); refreshAirMenu()
@@ -476,8 +478,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // On air
         let airItem = NSMenuItem()
         let air = NSMenu(title: "On air")
-        goLiveItem = item("Go live", .streamToggle, #selector(toggleStream))
+        // TWO ITEMS, because there are two destinations and they are not the
+        // same broadcast (W382-07). The single item went wherever Streaming
+        // location happened to point, so the summary in front of you before
+        // going live was for a destination chosen on another day.
+        let titles = OnAir.menuTitles(videoOn: false, radioOn: false)
+        goLiveItem = item(titles.video, .streamToggle, #selector(toggleStream))
+        goLiveItem.toolTip = "Send the show to your video platform, and stop sending it"
         air.addItem(goLiveItem)
+        goLiveRadioItem = item(titles.radio, .streamToggleRadio, #selector(toggleStreamRadio))
+        goLiveRadioItem.toolTip = "Send the show to your radio station, and stop sending it"
+        air.addItem(goLiveRadioItem)
         air.addItem(item("What the stream is doing", .streamStatus, #selector(streamStatus)))
         air.addItem(item("Who is listening...", .streamStats, #selector(streamStats)))
         air.addItem(item("What the camera can see", .cameraCheck, #selector(cameraCheck)))
@@ -522,8 +533,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         air.addItem(item("Video source...", .videoSource, #selector(videoSource)))
         air.addItem(item("Audio sources...", .sources, #selector(showSources)))
         air.addItem(.separator())
-        // Where Command B sends the show, which should have been here the day
-        // video arrived: until 3.4.2 the choice lived on the page for one of
+        // Which of the two destinations the show goes to, or last went to,
+        // which should have been here the day video arrived. Since the key
+        // split each key moves it too. Until 3.4.2 the choice lived on the page for one of
         // the two answers, so a board with a radio station and a YouTube
         // channel both set up gave no sign anywhere that there was a choice.
         liveToMenu = NSMenu(title: "Streaming location")
@@ -633,7 +645,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func clearPlaylist() { main.playlistClear() }
 
     func refreshAirMenu() {
-        goLiveItem?.title = main.streamer.isOn ? "Come off air" : "Go live"
+        // Each item from its OWN streamer (N1, W382-10). This read the radio
+        // streamer alone, so all through a YouTube broadcast the menu offered
+        // "Go live".
+        let air = OnAir.menuTitles(videoOn: main.videoStreamer.isOn,
+                                   radioOn: main.streamer.isOn)
+        goLiveItem?.title = air.video
+        goLiveRadioItem?.title = air.radio
         micItem?.title = main.mic.isOpen ? "Microphone off" : "Microphone on"
         micItem?.state = main.mic.isOpen ? .on : .off
         recordItem?.title = main.recorder.isRecording ? "Stop recording" : "Start recording"
@@ -682,7 +700,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return (station, platform)
     }
 
-    /// Where Command B sends the show, with a dot beside the one it uses.
+    /// The two destinations, with a dot beside the one the show goes to or
+    /// last went to. Command B and Option Shift B each move the dot as they
+    /// go live, and Command Shift B describes the dotted one while off air.
     ///
     /// Every entry answers the same question, which is why the two
     /// destinations and the saved setups live together: the two are what is
@@ -698,8 +718,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         audio.target = self
         audio.representedObject = C.liveToAudio
         audio.state = main.board.liveTo == C.liveToAudio ? .on : .off
-        audio.toolTip = "Send the show to your radio server: Icecast, Liquidsoap or "
-                      + "SHOUTcast. Set it up on the Streaming page"
+        audio.toolTip = "Your radio server: Icecast, Liquidsoap or SHOUTcast. "
+                      + "Option Shift B goes live there. Set it up on the Streaming page"
         liveToMenu.addItem(audio)
 
         let video = NSMenuItem(title: "My video platform: \(labels.video)",
@@ -707,8 +727,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         video.target = self
         video.representedObject = C.liveToVideo
         video.state = main.board.liveTo == C.liveToVideo ? .on : .off
-        video.toolTip = "Send the show to YouTube, Facebook, Restream or any RTMP "
-                      + "server, with a picture. Set it up on the Video streaming page"
+        video.toolTip = "YouTube, Facebook, Restream or any RTMP server, with a "
+                      + "picture. Command B goes live there. Set it up on the Video "
+                      + "streaming page"
         liveToMenu.addItem(video)
 
         liveToMenu.addItem(.separator())
@@ -759,7 +780,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func submitFeedback() { main.submitFeedback() }
     @objc func checkUpdates() { main.checkForUpdates() }
 
-    @objc func toggleStream() { main.toggleStream(); refreshAirMenu() }
+    @objc func toggleStream() { main.toggleStream(to: C.liveToVideo); refreshAirMenu() }
+    @objc func toggleStreamRadio() { main.toggleStream(to: C.liveToAudio); refreshAirMenu() }
     @objc func streamStatus() { main.streamStatus() }
     @objc func streamStats() { main.streamStats() }
     @objc func toggleMic() { main.toggleMic(); refreshAirMenu() }

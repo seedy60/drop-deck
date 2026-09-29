@@ -26,7 +26,8 @@ for key in ("icecast", "shoutcast", "youtube", "facebook", "restream", "rtmp",
 
 for url in ("rtmps://a.rtmps.youtube.com/live2/abcd-key",
             "rtmp://live.restream.io/live", "http://radio.example.com:8000",
-            "not a url", "", "rtmps://live-api-s.facebook.com:443/rtmp/FB-1-key"):
+            "not a url", "", "rtmps://live-api-s.facebook.com:443/rtmp/FB-1-key",
+            "live.example.com/app/KEY"):
     out.append("host|%s|%s" % (url, streamout.host_label(url)))
 
 # -------------------------------------------------------- bitrate advice ---
@@ -41,13 +42,22 @@ for server in ("facebook", "youtube", "restream", "rtmp"):
                            % (server, w, h, fps, vb, ab, got))
 
 # ------------------------------------------------------------ where it goes ---
+# W382-04..06: the video channel's own name is a separate axis, and the radio
+# station's name must never be said about a video platform. Servers "" and
+# "nonsense" reach the branches with no platform label.
 for video in (False, True):
     for name in ("", "Blindside Radio"):
-        for server in ("icecast", "shoutcast", "youtube", "facebook", "restream", "rtmp"):
-            for host in ("", "radio.example.com", "rtmps://a.rtmps.youtube.com/live2/k"):
-                s = {"server": server, "host": host, "name": name, "mount": "/live"}
-                out.append("goes|%s|%s|%s|%s|%s"
-                           % (video, name, server, host, P.where_it_goes(s, video)))
+        for channel in ("", "Tony Gebhard", "  "):
+            for server in ("icecast", "shoutcast", "youtube", "facebook",
+                           "restream", "rtmp", "", "nonsense"):
+                for host in ("", "radio.example.com",
+                             "rtmps://a.rtmps.youtube.com/live2/k",
+                             "rtmp://live.example.com/app/KEY"):
+                    s = {"server": server, "host": host, "name": name,
+                         "video_name": channel, "mount": "/live"}
+                    out.append("goes|%s|%s|%s|%s|%s|%s"
+                               % (video, name, channel, server, host,
+                                  P.where_it_goes(s, video)))
 
 # --------------------------------------------------------- picture words ---
 for kind in C.PICTURE_SOURCES:
@@ -132,10 +142,10 @@ for consumer in (P.FOR_STREAM, P.FOR_RECORDING):
 # advice together, so the order between them was never exercised. 400 kbps
 # with titles off does. Notes only: the summary line is where_it_goes, which
 # is a separate question.
-# YouTube is left out on purpose: its going live warning is the Windows 3.8.4
-# auto start wording, a separate port, and repeating that difference here
-# would only hide the one this row exists to catch.
-for server, host in (("facebook", "rtmps://live-api-s.facebook.com:443/rtmp/k"),
+# YouTube is in since the Mac has the Windows 3.8.4 auto start wording
+# (W384-11), which is the going live warning at the end of its notes.
+for server, host in (("youtube", "rtmps://a.rtmps.youtube.com/live2/k"),
+                     ("facebook", "rtmps://live-api-s.facebook.com:443/rtmp/k"),
                      ("restream", "rtmp://live.restream.io/live")):
     for titles in (True, False):
         for vb in (400, 2500):

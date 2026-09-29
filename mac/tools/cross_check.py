@@ -154,6 +154,9 @@ EXPECTED = {
          "the Windows alias, so the instruction names the one a Mac user will "
          "reach for"),
         ("Control Shift B", "Command Shift B", "what the stream is doing"),
+        ("Alt Shift B", "Option Shift B",
+         "go live on the radio station. The same key: Option is what Alt is "
+         "called on a Mac"),
         ("Control Shift F", "Command Shift F", "what the camera can see"),
         ("CONTROL B", "COMMAND B", "go live, in the shouted YouTube warning"),
         ("Control B", "Command B", "go live"),
@@ -255,6 +258,40 @@ DIVERGENCES = [
      "wrong-types|out.camera|42",
      "wrong-types|out.camera|''",
      "the same value written back out"),
+    # M15. host_label hands back an address it cannot find a host in exactly
+    # as typed, and the path of an RTMP address is where the stream key is.
+    ("preflight",
+     "host|live.example.com/app/KEY|live.example.com/app/KEY",
+     "host|live.example.com/app/KEY|live.example.com",
+     "streamout.host_label is the function every spoken address goes through "
+     "so that a key is never read out, and for an address typed without its "
+     "rtmp:// it returns the whole string, key included. The Mac says only "
+     "what comes before the first slash"),
+    # Windows 3.8.2 gave each destination its own key and left two sentences
+    # in the setting-up help that the split made false: Control B goes to the
+    # video platform whatever is ticked, so "tick this so Control B goes here"
+    # and "a dot beside the one Control B will use" describe a setting that no
+    # longer decides anything about Control B. Written in the Mac's key names,
+    # because EXPECTED has already been applied when these are.
+    ("streamhelp",
+     "Tick Go live here when I press Command B, so Command B sends the show "
+     "to this platform rather than to your radio station.",
+     "Command B sends the show to this platform and Option Shift B sends it "
+     "to your radio station, so there is nothing to tick.",
+     "streamhelp.py AFTER still tells people to tick a box so Control B goes "
+     "to the platform. Since 3.8.2 Control B goes to the video platform "
+     "whatever the box says, and the box only moves Streaming location"),
+    ("streamhelp",
+     "with a dot beside the one Command B will use, and the Go live here when "
+     "I press Command B box on the Video streaming page is the same setting.",
+     "with a dot beside the one you last went live to, and the Streaming "
+     "location is this platform box on the Video streaming page is the same "
+     "setting.",
+     "the Control B goes to the wrong place entry names a dot beside 'the one "
+     "Control B will use', and Control B always uses the video platform now. "
+     "The dot is the destination last gone live to. The Mac box is called "
+     "Streaming location is this platform, because Go live here when I press "
+     "Command B stopped being true"),
 ]
 
 

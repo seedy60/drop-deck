@@ -86,7 +86,11 @@ extension MainWindow {
         s.server = video ? board.videoServer : board.stream.server
         s.host = video ? board.videoHost : board.stream.host
         s.mount = video ? "" : board.stream.mount
+        // The radio station's name, which the card says either way, and the
+        // video channel's name, which is the only name said about a video
+        // platform (W382-06). Two destinations, two names.
         s.name = board.stream.name
+        s.videoName = video ? board.videoName : ""
         s.password = video ? videoStreamSettings().key : board.stream.password
         s.format = board.stream.format
         s.bitrate = board.stream.bitrate
@@ -363,24 +367,24 @@ extension MainWindow {
         StreamHelpPanel(speaker: speaker).run(over: window)
     }
 
-    /// Which of the two Command B sends the show to.
+    /// On air, Streaming location: which destination the dot is beside and
+    /// Command Shift B describes while off air. Since the key split the keys
+    /// themselves choose where the show goes, and each one moves this too.
     func setLiveTo(_ which: String) {
         guard C.liveTo.contains(which) else { return }
         if streamer.isOn || videoStreamer.isOn {
-            speaker.announce("Come off air first, Command B, then change where it goes")
+            speaker.announce(OnAir.comeOffFirst(videoOn: videoStreamer.isOn,
+                                                radioOn: streamer.isOn))
             return
         }
         board.liveTo = which
         board.dirty = true
-        let name = C.liveToLabels[which] ?? which
         // The pre-flight summary, so the answer is where it is going rather
         // than which of two words was picked.
         let report = preflight()
-        var said = "Command B now goes to \(name), \(report.summary())"
-        if report.blocked {
-            said += ". " + report.stops.map { $0.text }.joined(separator: ". ")
-        }
-        speaker.announceState(said)
+        speaker.announceState(OnAir.locationMoved(
+            to: which, summary: report.summary(),
+            stops: report.blocked ? report.stops.map { $0.text } : []))
         updateAirMenu()
     }
 }

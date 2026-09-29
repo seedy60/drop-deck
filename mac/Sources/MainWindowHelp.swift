@@ -56,7 +56,9 @@ extension MainWindow {
             "samplerate": group.sampleRate,
             "mic_open": mic?.isOpen ?? false,
             "mic_monitor": board.micMonitor,
-            "streaming": streamer.isOn,
+            // Either destination (N2): this said false all through a video
+            // broadcast, because it asked the radio streamer alone.
+            "streaming": OnAir.streaming(audio: streamer.isOn, video: videoStreamer.isOn),
             "recording": recorder.isRecording,
             "sources": board.sources.count,
         ]
@@ -287,7 +289,8 @@ extension MainWindow {
         // than none.
         guard name.isEmpty || name != board.stream.name else { return }
         if streamer.isOn || videoStreamer.isOn {
-            speaker.announce("Come off air first, Command B, then change where it goes")
+            speaker.announce(OnAir.comeOffFirst(videoOn: videoStreamer.isOn,
+                                                radioOn: streamer.isOn))
             updateAirMenu()
             return
         }
@@ -297,11 +300,9 @@ extension MainWindow {
             touch()
             let report = preflight()
             let label = Board.stationLabel(name, at: board.stationNames.firstIndex(of: name) ?? 0)
-            var said = "\(label). Command B goes to \(report.summary())"
-            if wasVideo != (board.liveTo == C.liveToVideo) {
-                said += ", which is a different kind of destination from the last one"
-            }
-            speaker.announce(said)
+            speaker.announce(OnAir.setupLoaded(
+                label: label, liveTo: board.liveTo, summary: report.summary(),
+                otherKind: wasVideo != (board.liveTo == C.liveToVideo)))
         }
         updateAirMenu()
     }

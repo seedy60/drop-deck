@@ -110,26 +110,53 @@ extension MainWindow {
 
     // ------------------------------------------------------------- the air ---
 
-    /// Command B. Nothing goes out until this is pressed.
+    /// Command B goes live on the video platform and Option Shift B on the
+    /// radio station, each a toggle for its own destination (W382-07). Nothing
+    /// goes out until one of them is pressed.
+    ///
+    /// **The key IS the choice**, so it is written down before anything reads
+    /// it (W382-08): everything downstream asks the board which destination
+    /// this is, and it gets the answer the user just gave rather than one from
+    /// last week. And, as on Windows, Stay off air leaves it where the key
+    /// pointed it: a mis-press is undone by pressing the other key.
+    ///
+    /// **The wrong key while live does nothing but say where you are**
+    /// (W382-09). It used to stop whatever was on, which after the split
+    /// would have let the radio key drop a video broadcast.
     ///
     /// **The asking lives here and never in `startStream`.** That is load
     /// bearing rather than tidy: this is called by a person pressing a key,
     /// and only a person can answer a question. A panel inside the starting
     /// code would hang every check that goes live, for ever, on a window
     /// nothing can click.
-    func toggleStream() {
-        if streamer.isOn || videoStreamer.isOn {
-            if streamer.isOn { streamer.stop(group: group) }
-            if videoStreamer.isOn {
+    func toggleStream(to: String? = nil) {
+        // Nobody said, so honour what is set up. The keys and the menu items
+        // always say; this covers anything older that does not.
+        let to = to ?? board.liveTo
+        switch OnAir.press(to, liveTo: board.liveTo, videoOn: videoStreamer.isOn,
+                           radioOn: streamer.isOn) {
+        case .comeOff:
+            if to == C.liveToVideo {
                 videoStreamer.stop(group: group)
                 // Let go of the picture, never close it: a recording may be
                 // holding the same one, and it now fills its own frames.
                 releaseStreamPicture()
+            } else {
+                streamer.stop(group: group)
             }
             speaker.announceState("Off air")
             updateStatusLine()
             updateAirMenu()
             return
+        case .elsewhere(let said):
+            speaker.announceAnswer(said)
+            return
+        case .goLive(let pointAt):
+            if pointAt {
+                board.liveTo = to
+                touch()
+                updateAirMenu()
+            }
         }
         // What is about to happen, said before it happens, and checked.
         // Nearly every way of getting a broadcast wrong survives the
@@ -141,10 +168,21 @@ extension MainWindow {
             // with nothing to press.
             var asking = true
             while asking {
+                // Put it right opens Preferences, where the Streaming location
+                // box lives, and unticking it there must not turn Command B
+                // into a radio broadcast. The key pressed is the destination.
+                if board.liveTo != to {
+                    board.liveTo = to
+                    touch()
+                    updateAirMenu()
+                }
                 let report = preflight()
                 switch GoLivePanel(report: report, board: board).run(over: window) {
                 case .stayOff:
-                    speaker.announceState("Still off air")
+                    // The reason, when there is one (W384-13): Escape after a
+                    // blocked summary used to answer "Still off air" and
+                    // nothing else.
+                    speaker.announceState(GoLivePanel.stayOffSentence(report))
                     return
                 case .putItRight(let page):
                     showPreferences(tab: page == C.fixVideo ? "Video streaming" : "Streaming")
@@ -168,7 +206,7 @@ extension MainWindow {
             }
             if report.blocked { return }
         }
-        if board.liveTo == C.liveToVideo { startVideoStream() } else { startAudioStream() }
+        if to == C.liveToVideo { startVideoStream() } else { startAudioStream() }
     }
 
     private func startAudioStream() {
@@ -240,7 +278,8 @@ extension MainWindow {
 
     /// Command Shift B. An answer, so it speaks at every level.
     func streamStatus() {
-        // **Whichever destination Command B would use.** Windows read the
+        // **Whichever destination Streaming location points at**, named with
+        // the key that goes live there. Windows read the
         // radio station's address whichever was ticked until 3.4.1, so a board
         // set up for YouTube and nothing else answered "Off air, and no server
         // is set up yet" while Command B would have gone live perfectly well.
@@ -263,7 +302,7 @@ extension MainWindow {
         // "no server is set up yet" while Command B would have gone live
         // perfectly well.
         let report = preflight()
-        var line = "Off air. Command B would go to \(report.summary())"
+        var line = OnAir.offAirStatus(liveTo: board.liveTo, summary: report.summary())
         let trouble = (report.stops + report.warnings).map { $0.text }
         if !trouble.isEmpty { line += ". " + trouble.joined(separator: ". ") }
         speaker.announceAnswer(MainWindow.withSentence(line, taping))

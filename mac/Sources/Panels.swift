@@ -536,7 +536,13 @@ enum KeyboardHelp {
           other program does, and you go on hearing it yourself while it does.
 
         PUTTING THE SHOW ON THE INTERNET
-          Command B                     Go live, and come off air
+          Command B                     Go live on your VIDEO platform, and come
+                                        off air again
+          Option Shift B                Go live on your RADIO station, and come
+                                        off air again. One key each, so the
+                                        summary you are shown before going live
+                                        is always for the place you actually
+                                        meant
           Command Shift B               What the stream is doing
           Command Shift A               Who is listening
           Command Shift Return          Play the running order from the top,
@@ -547,7 +553,12 @@ enum KeyboardHelp {
           and the network run on their own thread, so a bad connection costs the
           stream and never your own audio, and it reconnects by itself.
 
-          Nothing goes out until you press Command B.
+          Nothing goes out until you press Command B or Option Shift B. It is
+          never on when the app opens.
+
+          Pressing one while the OTHER one is on air says where you are and
+          does nothing else, rather than dropping one broadcast and starting
+          another on a key that looks like a toggle.
 
         THE PICTURE, FOR A STREAM OR A RECORDING
           Option Shift V                Change the picture: a card, your

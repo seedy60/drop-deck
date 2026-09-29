@@ -67,6 +67,7 @@ final class SelfTest {
         runSendChecks()
         runVideoChecks()
         runBoardFileChecks()
+        runTwoKeysChecks()
         testRealDevice()
 
         out.append("")

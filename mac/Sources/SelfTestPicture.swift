@@ -373,8 +373,15 @@ extension SelfTest {
             fallenBack: false, reason: "", marks: "")
         check("on a radio board it says what the picture is for",
               radio == "Your picture is a camera, 1280 by 720. Nothing is using it yet. "
-                     + "Command+B goes to your radio station, which sends no picture, so "
-                     + "this is for Command+Shift+R until you switch Command+B over.", radio)
+                     + "Your radio station sends no picture, so Option+Shift+B does not "
+                     + "use it. It goes out when you press Command+B, which goes live on "
+                     + "your video platform, and into the file when you press "
+                     + "Command+Shift+R.", radio)
+        // The key split made the old sentence false (P3 hand-off): Command+B
+        // never goes to the radio station now, and nothing is "switched over".
+        check("and never says Command+B goes to the radio station",
+              !radio.contains("Command+B goes to your radio station")
+              && !radio.contains("switch Command+B over"), radio)
         let busy = MainWindow.pictureReport(
             chosen: "a camera", width: 1280, height: 720,
             using: "the stream and the recording", liveToVideo: true, fallenBack: true,

@@ -372,11 +372,10 @@ extension MainWindow {
                            + "and disconnects. It sends no audio."
         // **The way back on.** Go live has a box that turns the asking off for
         // good, and a "do not ask again" with no way back is a one way door.
-        let askBox = check("Say what Command B is about to do, and wait",
-                           board.askBeforeLive)
-        askBox.toolTip = "Command B says where the show is going, what it is sending, "
-                       + "what will be on the screen and whether your microphone is on "
-                       + "the air, and then Return puts you live."
+        // Both go live keys ask, so both are named. Windows' "before Ctrl+B
+        // goes live" was made incomplete by its own key split.
+        let askBox = check(VideoPrefs.askLabel, board.askBeforeLive)
+        askBox.toolTip = VideoPrefs.askHelp
         streamBox.addArrangedSubview(askBox)
 
         let stationRow = NSStackView(views: [saveStation, forgetStation, testButton])
@@ -407,6 +406,16 @@ extension MainWindow {
             + "Restream hands out its own along with the key, so paste theirs over "
             + "this one if it differs."))
 
+        // The CHANNEL's name (W382-03). The radio station's name is on the
+        // Streaming page and this is not it: the go live summary used to say
+        // "Blindside Radio, on YouTube Live", which names an Icecast station as
+        // though it were a YouTube channel. Optional, because a platform with
+        // one address speaks for itself.
+        let channelField = text(board.videoName, "Channel name")
+        channelField.setAccessibilityHelp(VideoPrefs.channelHelp)
+        videoBox.addArrangedSubview(field("Channel name", channelField))
+        videoBox.addArrangedSubview(note(VideoPrefs.channelHelp))
+
         // The key is NOT in the board file. Anybody holding a YouTube key can
         // broadcast to that channel, and a board is plain JSON that people
         // send each other.
@@ -429,13 +438,29 @@ extension MainWindow {
         let getKeyButton = NSButton(title: "Get my stream key", target: videoControls,
                                     action: #selector(VideoControls.getKey))
         getKeyButton.bezelStyle = .rounded
+        // Check my stream key (W384-10). It asks the platform and sends no
+        // sound and no picture. **Never disabled while it works**: it is the
+        // button with the focus, and disabling a focused button moves the
+        // focus, silently, to the next control. A flag and a spoken line.
+        let checkKeyButton = NSButton(title: "Check my stream key", target: videoControls,
+                                      action: #selector(VideoControls.checkKey))
+        checkKeyButton.bezelStyle = .rounded
+        checkKeyButton.toolTip = StreamKeyCheck.buttonHelp
+        checkKeyButton.setAccessibilityHelp(StreamKeyCheck.buttonHelp)
         let helpButton = NSButton(title: "How do I set this up?", target: videoControls,
                                   action: #selector(VideoControls.help))
         helpButton.bezelStyle = .rounded
-        let videoRow = NSStackView(views: [getKeyButton, helpButton])
+        let videoRow = NSStackView(views: [getKeyButton, checkKeyButton, helpButton])
         videoRow.orientation = .horizontal
         videoRow.spacing = 8
         videoBox.addArrangedSubview(videoRow)
+        // The reassurance goes HERE and not only on the button, because a
+        // box is read out with its label the moment somebody tabs to it.
+        let (checkScroll, checkText) = readOnlyText(
+            StreamKeyCheck.nothingTriedYet, label: "What happened", width: 460, height: 70)
+        checkScroll.heightAnchor.constraint(equalToConstant: 70).isActive = true
+        videoBox.addArrangedSubview(field("What happened", checkScroll))
+        let keyChecking = WorkFlag()
 
         let showPopup = NSPopUpButton()
         showPopup.addItems(withTitles: C.pictureSources.map { C.pictureLabels[$0] ?? $0 })
@@ -493,11 +518,12 @@ extension MainWindow {
             "Command Shift F says what the camera can see whenever you ask, whatever "
             + "this is set to."))
 
-        let liveHereBox = check("Go live here when I press Command B",
-                                board.liveTo == C.liveToVideo)
+        // The box a user already knows, kept, and made TRUE. Windows still
+        // reads "Go live here when I press Ctrl+B", which its own key split
+        // made false: Command B goes live here whatever this box says.
+        let liveHereBox = check(VideoPrefs.locationLabel, board.liveTo == C.liveToVideo)
         videoBox.addArrangedSubview(liveHereBox)
-        videoBox.addArrangedSubview(note(
-            "The same choice as On air, Streaming location. The two move together."))
+        videoBox.addArrangedSubview(note(VideoPrefs.locationNote))
 
         // **What happens when you connect**, which is the most important thing
         // on this page and the one a presenter cannot find out any other way.
@@ -559,6 +585,55 @@ extension MainWindow {
             }
             NSWorkspace.shared.open(url)
             self?.speaker.announce("Opened the page where your key is.")
+        }
+        videoControls.onCheckKey = { [weak self] in
+            guard let self else { return }
+            let which = C.videoServerOrder[
+                max(0, min(C.videoServerOrder.count - 1, platformPopup.indexOfSelectedItem))]
+            func say(_ text: String) {
+                checkText.string = text
+                checkText.setSelectedRange(NSRange(location: 0, length: 0))
+                self.speaker.announceAnswer(text)
+            }
+            switch VideoPrefs.checkPress(running: keyChecking.running, server: which,
+                                         host: videoHostField.stringValue,
+                                         key: keyField.stringValue) {
+            case .refuse(let said, let focusKey):
+                say(said)
+                if focusKey { keyField.window?.makeFirstResponder(keyField) }
+                return
+            case .stillChecking:
+                say(StreamKeyCheck.stillChecking)
+                return
+            case .ask(let question):
+                let alert = NSAlert()
+                alert.messageText = StreamKeyCheck.questionTitle
+                alert.informativeText = question
+                alert.addButton(withTitle: "Check the key")
+                let no = alert.addButton(withTitle: "Do not check")
+                no.keyEquivalent = "\u{1b}"
+                guard alert.runModal() == .alertFirstButtonReturn else {
+                    say(StreamKeyCheck.declined)
+                    return
+                }
+            case .start:
+                break
+            }
+            guard keyChecking.begin() else {
+                say(StreamKeyCheck.stillChecking)
+                return
+            }
+            // The UNSAVED boxes: the popup, the address and the key as they
+            // stand, every space and newline out of the key (M11), because
+            // checking the key saved last week is not what anybody pressed
+            // the button for.
+            let key = VideoPrefs.cleanKey(keyField.stringValue)
+            say(StreamKeyCheck.checkingWith(server: which))
+            StreamKeyCheck.check(host: videoHostField.stringValue, key: key,
+                                 server: which) { result in
+                keyChecking.end()
+                say(StreamKeyCheck.verdict(result, server: which, key: key))
+            }
         }
         videoControls.onHelp = { [weak self] in
             guard let self else { return }
@@ -773,6 +848,7 @@ extension MainWindow {
         board.framingLevel = C.framingLevels[
             max(0, min(C.framingLevels.count - 1, framingPopup.indexOfSelectedItem))]
         board.liveTo = liveHereBox.state == .on ? C.liveToVideo : C.liveToAudio
+        board.videoName = channelField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         // The key goes to the keychain, never to the board file.
         // Filed by platform. NOT by the station name, which is the radio
         // station's and can be cleared: when it was, the key was still in the
@@ -1019,12 +1095,14 @@ extension MainWindow {
 /// outlives the click. Closures set by the window; nothing else.
 final class VideoControls: NSObject {
     var onGetKey: (() -> Void)?
+    var onCheckKey: (() -> Void)?
     var onHelp: (() -> Void)?
     var onBrowse: (() -> Void)?
     var onListModels: (() -> Void)?
     var onProviderChanged: (() -> Void)?
     var onPlatformChanged: (() -> Void)?
     @objc func getKey() { onGetKey?() }
+    @objc func checkKey() { onCheckKey?() }
     @objc func help() { onHelp?() }
     @objc func browse() { onBrowse?() }
     @objc func listModels() { onListModels?() }
@@ -1041,9 +1119,14 @@ enum GoingLive {
     static func note(_ server: String) -> String {
         switch server {
         case "youtube":
-            return "YouTube puts you live the MOMENT you connect. It makes the watch "
-                 + "page, tells your subscribers and saves the video. Set the stream "
-                 + "to Private in YouTube Studio before your first try."
+            // Windows' words since 3.8.4 (W384-11), key translated. Careful,
+            // and honest about the part the app cannot see: auto start is a
+            // YouTube setting nothing here can read, and a flat promise either
+            // way is wrong for half the users.
+            return "Careful: with auto start on, pressing Command B puts you live on "
+                 + "YouTube straight away, with no preview, your subscribers notified "
+                 + "and the stream saved to your channel. With auto start off, YouTube "
+                 + "waits for you to press Go live in your live control room."
         case "facebook":
             return "Facebook shows you a preview and posts NOTHING until you press Go "
                  + "Live Now on Facebook's own page, so going live here is safe to try."
@@ -1292,6 +1375,60 @@ enum VideoPrefs {
         + "changes it from anywhere."
 
     enum KeyAction: Equatable { case leave, store, forget }
+
+    /// The Channel name box's help, Windows' words with the Mac's page name
+    /// (W382-03): the radio station's name is on the Streaming page here.
+    static let channelHelp = "What this channel is called, if you want it said on the "
+        + "way to air. Nothing to do with your radio station's name, which is on the "
+        + "Streaming page. Leave it empty and Drop Deck just says the platform."
+
+    /// The Streaming page's ask first box. Both go live keys ask.
+    static let askLabel = "Say what going live is about to do, and wait"
+    static let askHelp = "Command B and Option Shift B say where the show is going, what "
+        + "it is sending, what will be on the screen and whether your microphone is on "
+        + "the air, and then Return puts you live."
+
+    /// The Video streaming page's Streaming location box. It was "Go live here
+    /// when I press Command B", which the key split made false: Command B goes
+    /// live on the video platform whatever the box says.
+    static let locationLabel = "Streaming location is this platform"
+    static let locationNote = "The same choice as On air, Streaming location, and the "
+        + "two move together. Command B always goes live on this platform and Option "
+        + "Shift B on your radio station, and each one moves Streaming location as it "
+        + "goes. It is the one Command Shift B describes while you are off air."
+
+    /// What one press of Check my stream key does.
+    enum CheckPress: Equatable {
+        /// Nothing to check with: say this. No network, no question.
+        case refuse(String, focusKey: Bool)
+        /// A check is already out: say so, and leave the focus where it is.
+        case stillChecking
+        /// Ask this first.
+        case ask(String)
+        /// Go straight ahead.
+        case start
+    }
+
+    /// Windows' order: the instant checks that need no network (an address
+    /// that is not one, no key at all), then the re-entry guard, then the
+    /// question for any platform not known to be safe (W384-09, W384-10).
+    /// `key` is the box as typed; every space in it is taken out first (M11).
+    static func checkPress(running: Bool, server: String, host: String,
+                           key: String) -> CheckPress {
+        if StreamKeyCheck.split(StreamKeyCheck.address(server: server, typed: host)) == nil {
+            return .refuse(StreamKeyCheck.verdict(StreamKeyCheck.Result(.badAddress),
+                                                  server: server, key: ""),
+                           focusKey: false)
+        }
+        if cleanKey(key).isEmpty {
+            return .refuse(StreamKeyCheck.verdict(StreamKeyCheck.Result(.noKey),
+                                                  server: server, key: ""),
+                           focusKey: true)
+        }
+        if running { return .stillChecking }
+        if let question = StreamKeyCheck.question(server: server) { return .ask(question) }
+        return .start
+    }
 
     /// What OK does with the stream key box.
     ///

@@ -581,9 +581,9 @@ final class Streamer {
     private var connected = false
     private var currentTitle = ""
     /// Which run a worker thread belongs to. A worker from a run that has
-    /// been stopped, or replaced by a new Command B, may not change the state
-    /// (M6): it used to be able to say ON AIR after Command B had taken the
-    /// show off.
+    /// been stopped, or replaced by a new Option Shift B, may not change the
+    /// state (M6): it used to be able to say ON AIR after the go live key had
+    /// taken the show off.
     private(set) var generation = 0
     /// Connection attempts in this run, the first being 1.
     private(set) var attempts = 0
@@ -696,13 +696,13 @@ final class Streamer {
     }
 
     /// A run that ended itself, on a refusal or on silence, lets go of the
-    /// programme bus, which Command B would otherwise leave being filled for
+    /// programme bus, which Option Shift B would otherwise leave being filled for
     /// nobody until the app quits.
     private func releaseAfterFailure(_ run: Int, bus used: AirBus) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            // The bus THIS run used, whatever has happened since: a Command B
-            // straight after the failure has already made a new one.
+            // The bus THIS run used, whatever has happened since: an Option
+            // Shift B straight after the failure has already made a new one.
             self.group?.removeAirBus(used)
             if self.bus === used { self.bus = nil }
         }
@@ -1071,7 +1071,7 @@ final class Streamer {
         guard s != .off else {
             return settings.host.isEmpty
                 ? "Off air, and no server is set up yet"
-                : "Off air. Command B goes live to \(settings.host)"
+                : "Off air. Option Shift B goes live to \(settings.host)"
         }
         var parts = [s.spoken]
         if s == .live {

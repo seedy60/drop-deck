@@ -11,7 +11,8 @@ for key in ["icecast", "shoutcast", "youtube", "facebook", "restream", "rtmp",
 }
 for url in ["rtmps://a.rtmps.youtube.com/live2/abcd-key",
             "rtmp://live.restream.io/live", "http://radio.example.com:8000",
-            "not a url", "", "rtmps://live-api-s.facebook.com:443/rtmp/FB-1-key"] {
+            "not a url", "", "rtmps://live-api-s.facebook.com:443/rtmp/FB-1-key",
+            "live.example.com/app/KEY"] {
     out.append("host|\(url)|\(StreamServers.hostLabel(url))")
 }
 
@@ -33,12 +34,18 @@ for server in ["facebook", "youtube", "restream", "rtmp"] {
 // ------------------------------------------------------- where it goes ---
 for video in [false, true] {
     for name in ["", "Blindside Radio"] {
-        for server in ["icecast", "shoutcast", "youtube", "facebook", "restream", "rtmp"] {
-            for host in ["", "radio.example.com", "rtmps://a.rtmps.youtube.com/live2/k"] {
-                var s = PreflightSettings()
-                s.server = server; s.host = host; s.name = name; s.mount = "/live"
-                out.append("goes|\(py(video))|\(name)|\(server)|\(host)|"
-                         + Preflighter.whereItGoes(s, video: video))
+        for channel in ["", "Tony Gebhard", "  "] {
+            for server in ["icecast", "shoutcast", "youtube", "facebook",
+                           "restream", "rtmp", "", "nonsense"] {
+                for host in ["", "radio.example.com",
+                             "rtmps://a.rtmps.youtube.com/live2/k",
+                             "rtmp://live.example.com/app/KEY"] {
+                    var s = PreflightSettings()
+                    s.server = server; s.host = host; s.name = name
+                    s.videoName = channel; s.mount = "/live"
+                    out.append("goes|\(py(video))|\(name)|\(channel)|\(server)|\(host)|"
+                             + Preflighter.whereItGoes(s, video: video))
+                }
             }
         }
     }
@@ -144,7 +151,8 @@ for consumer in [Preflighter.forStream, Preflighter.forRecording] {
 }
 
 // ---------------------------------------------------------- note order ---
-for pair in [("facebook", "rtmps://live-api-s.facebook.com:443/rtmp/k"),
+for pair in [("youtube", "rtmps://a.rtmps.youtube.com/live2/k"),
+             ("facebook", "rtmps://live-api-s.facebook.com:443/rtmp/k"),
              ("restream", "rtmp://live.restream.io/live")] {
     for titles in [true, false] {
         for vb in [400, 2500] {

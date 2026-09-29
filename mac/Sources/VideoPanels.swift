@@ -588,9 +588,15 @@ final class AskPanel: NSObject {
     private let askConsent: (CVPixelBuffer) -> Bool
 
     private var question: NSTextField!
-    private var send: NSButton!
+    private(set) var send: NSButton!
     private var answer: NSTextView!
-    private var busy = false
+    /// A question in flight. NEVER a disabled button (W384-32): disabling a
+    /// focused button moves focus, silently, so a second press is refused out
+    /// loud instead and the focus stays exactly where it was.
+    let work = WorkFlag()
+
+    /// Said when Ask is pressed again before the answer is back.
+    static let stillAsking = "Still asking. The answer will be read out."
     private(set) var history: [(asked: String, answered: String)] = []
 
     var view: NSView!
@@ -647,7 +653,10 @@ final class AskPanel: NSObject {
     }
 
     @objc func ask() {
-        if busy { return }
+        if work.running {
+            speaker.announceAnswer(AskPanel.stillAsking)
+            return
+        }
         let asked = question.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if asked.isEmpty {
             speaker.announce("Type a question first.")
@@ -683,8 +692,7 @@ final class AskPanel: NSObject {
             ticket = made
         }
 
-        busy = true
-        send.isEnabled = false
+        _ = work.begin()
         show("Asking...")
         speaker.announce("Asking.")
         let provider = board.visionProvider
@@ -697,8 +705,7 @@ final class AskPanel: NSObject {
                                          consent: ticket)
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.busy = false
-                self.send.isEnabled = true
+                self.work.end()
                 self.show(got.text)
                 if got.ok {
                     self.history.append((asked, got.text))
@@ -742,8 +749,13 @@ final class ShotCheckPanel: NSObject {
     private var looks: NSTextView!
     private var ask: AskPanel!
     private var goButton: NSButton?
-    private var busy = false
+    /// A look in flight. A flag and a spoken line, never a disabled button
+    /// (W384-32): Check the shot is the button with the focus.
+    let work = WorkFlag()
     private var lookedAt: CVPixelBuffer?
+
+    /// Said when Check the shot is pressed again before the answer is back.
+    static let stillLooking = "Still looking at the picture. The answer will be read out."
     private static var toldAboutTabbing = false
 
     init(board: Board, speaker: Speaker, window: NSWindow?, kind: String,
@@ -835,8 +847,11 @@ final class ShotCheckPanel: NSObject {
         return alert.runModal() == .alertFirstButtonReturn ? false : true
     }
 
-    private func check() {
-        if busy { return }
+    func check() {
+        if work.running {
+            speaker.announceAnswer(ShotCheckPanel.stillLooking)
+            return
+        }
         let key = Secrets.fetch(station: board.visionProvider, prefix: Secrets.visionPrefix)
         if key.isEmpty {
             let said = "No key has been set up yet. Open Preferences, AI Provider, "
@@ -856,8 +871,7 @@ final class ShotCheckPanel: NSObject {
             speaker.announce("Nothing was sent.")
             return
         }
-        busy = true
-        goButton?.isEnabled = false
+        _ = work.begin()
         show("Looking at the picture. This usually takes a second or two.")
         // Windows only SHOWS this, so pressing the button produces silence for
         // a second or two. Say it.
@@ -882,8 +896,7 @@ final class ShotCheckPanel: NSObject {
             let got = ShotCheck.describe(shot, kind: kind, provider: provider,
                                          key: key, model: model, consent: ticket)
             DispatchQueue.main.async {
-                self.busy = false
-                self.goButton?.isEnabled = true
+                self.work.end()
                 self.lookedAt = shot
                 self.show(got.text)
                 let first = AskPanel.firstLine(got.text)
@@ -1052,7 +1065,12 @@ final class ColoursPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     private var lookText: NSTextView!
     private var ask: AskPanel!
     private var opinionButton: NSButton!
-    private var busy = false
+    /// An opinion in flight. A flag and a spoken line, never a disabled
+    /// button (W384-32).
+    let work = WorkFlag()
+
+    /// Said when the button is pressed again before the answer is back.
+    static let stillLooking = "Still looking at these colours. The answer will be read out."
 
     private static let rows = ["look", "background", "text", "accent"]
 
@@ -1205,8 +1223,11 @@ final class ColoursPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate {
                                                    back: C.colourBackground))
     }
 
-    @objc private func opinion() {
-        if busy { return }
+    @objc func opinion() {
+        if work.running {
+            speaker.announceAnswer(ColoursPanel.stillLooking)
+            return
+        }
         let key = Secrets.fetch(station: board.visionProvider, prefix: Secrets.visionPrefix)
         if key.isEmpty {
             let said = "No key has been set up yet. Open Preferences, AI Provider, "
@@ -1214,8 +1235,7 @@ final class ColoursPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             speaker.announce(said)
             return
         }
-        busy = true
-        opinionButton.isEnabled = false
+        _ = work.begin()
         speaker.announce("Looking at these colours.")
         let provider = board.visionProvider
         let model = board.visionModel
@@ -1225,8 +1245,7 @@ final class ColoursPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             let got = ShotCheck.describe(shot, kind: "branding", provider: provider,
                                          key: key, model: model)
             DispatchQueue.main.async {
-                self.busy = false
-                self.opinionButton.isEnabled = true
+                self.work.end()
                 self.speaker.announceAnswer(AskPanel.firstLine(got.text))
                 if got.ok {
                     self.ask.remember(asked: "What do these colours look like?",
@@ -1325,7 +1344,7 @@ final class ColoursPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
 // --------------------------------------------------------------- going live ---
 
-/// What Command B is about to do, and what is wrong with it.
+/// What Command B or Option Shift B is about to do, and what is wrong with it.
 ///
 /// Command B then Return is still the whole gesture. The muscle memory costs
 /// one extra keypress and the presenter hears the destination, the format, the
@@ -1361,7 +1380,7 @@ final class GoLivePanel: NSObject {
         stay.setAccessibilityLabel("Stay off air")
         stay.keyEquivalent = "\u{1b}"
 
-        let fix = report.notes.first(where: { !$0.fix.isEmpty })?.fix
+        let fix = GoLivePanel.fixPage(report)
         var fixButton: NSButton?
         if let fix, !fix.isEmpty {
             let button = alert.addButton(withTitle: "Put it right...")
@@ -1380,7 +1399,7 @@ final class GoLivePanel: NSObject {
         let height: CGFloat = hasNotes ? 320 : 190
         let box = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
 
-        let summary = report.lines.map { "\($0.label): \($0.value)" }.joined(separator: "\n")
+        let summary = GoLivePanel.summaryText(report)
         let (goingScroll, going) = readOnlyText(summary, label: "What will go out",
                                                 width: width, height: 130)
         goingScroll.frame = NSRect(x: 0, y: height - 130, width: width, height: 130)
@@ -1404,8 +1423,7 @@ final class GoLivePanel: NSObject {
                              target: nil, action: nil)
         never.frame = NSRect(x: 0, y: 6, width: width, height: 24)
         never.setAccessibilityLabel("Do not ask again, just go live")
-        never.toolTip = "Command B goes straight on the air. Command Shift B still says "
-                      + "what is going out, and you can turn this back on in Preferences."
+        never.toolTip = GoLivePanel.neverTip
         box.addSubview(never)
 
         alert.accessoryView = box
@@ -1424,6 +1442,49 @@ final class GoLivePanel: NSObject {
         default: return .stayOff
         }
     }
+
+    /// What the focused box says (W384-13).
+    ///
+    /// **When the broadcast is blocked, the reason is the FIRST line of the box
+    /// focus lands on.** It used to be only in the second box, which nothing
+    /// focuses, so the window read out where the show was going and never the
+    /// one sentence saying why it could not, and Command B then Return, the
+    /// gesture the manual teaches, answered "Still off air" with no reason
+    /// anywhere. Joshua reported exactly that shape on Windows. Windows' words,
+    /// "Not going out: " and the first stop with its first letter lowered.
+    static func summaryText(_ report: Preflight) -> String {
+        var lines = report.lines.map { "\($0.label): \($0.value)" }
+        if report.blocked, let stop = report.stops.first?.text, let first = stop.first {
+            lines.insert("Not going out: " + first.lowercased() + stop.dropFirst(), at: 0)
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// Where Put it right goes (M16).
+    ///
+    /// **The page for the STOP when something is stopping the broadcast.** It
+    /// took the first note with a page at all, in the order the checks ran,
+    /// so a warning about the microphone could send somebody to the Streaming
+    /// page while the thing actually keeping them off air, a missing stream
+    /// key, was on the Video streaming page. Windows has the same order; the
+    /// Mac reads stops first, which is the order the notes box shows them in.
+    static func fixPage(_ report: Preflight) -> String? {
+        (report.stops + report.warnings).first(where: { !$0.fix.isEmpty })?.fix
+    }
+
+    /// Said when the window is closed without going live. With the reason
+    /// when there was one, because "Still off air" on its own after a blocked
+    /// summary leaves somebody guessing.
+    static func stayOffSentence(_ report: Preflight) -> String {
+        guard let stop = report.stops.first?.text else { return "Still off air" }
+        return "Still off air. \(stop)"
+    }
+
+    /// The Do not ask again box's help. Both keys ask, so both are named: the
+    /// Windows wording names Ctrl+B alone, which the key split made untrue.
+    static let neverTip = "Command B and Option Shift B go straight on the air. Command "
+        + "Shift B still says what is going out, and you can turn this back on in "
+        + "Preferences."
 }
 
 // ---------------------------------------------------- setting up streaming ---

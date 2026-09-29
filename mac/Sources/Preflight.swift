@@ -101,7 +101,11 @@ struct PreflightSettings {
     var server = ""
     var host = ""
     var mount = ""
+    /// The RADIO station's name. Never said about the video platform.
     var name = ""
+    /// The VIDEO channel's name, board.video_name, which is usually empty and
+    /// then the platform speaks for itself (W382-04..06).
+    var videoName = ""
     var password = ""
     var format = "mp3"
     var bitrate = 0
@@ -147,19 +151,33 @@ enum Preflighter {
     /// out which entry covers their server, and exactly wrong on the way to
     /// air. The software name is the fallback rather than the lead, so a
     /// server with no name still says something useful.
+    ///
+    /// **The two destinations have two names and this must never borrow one
+    /// for the other.** `name` is the radio station. A video platform's name
+    /// is `videoName`, which is usually empty, and an empty one means the
+    /// platform speaks for itself. It used to print the radio station's name
+    /// on the way to YouTube: "Blindside Radio, on YouTube Live", which names
+    /// an Icecast station as though it were a YouTube channel. Tony read that
+    /// on 12 September 2026 and called it untrue, because it is.
     static func whereItGoes(_ settings: PreflightSettings, video: Bool) -> String {
         let host = settings.host
-        let name = settings.name.trimmingCharacters(in: .whitespacesAndNewlines)
         if video {
             // An RTMP address has the stream key in it, so it goes through
             // hostLabel. YouTube and Facebook have one address each and it is
             // not the user's to choose, so naming the platform is enough.
             let platform = StreamServers.serverLabel(settings.server)
-            if !name.isEmpty {
-                return platform.isEmpty ? name : "\(name), on \(platform)"
-            }
+            let channel = settings.videoName.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !channel.isEmpty && !platform.isEmpty { return "\(channel), on \(platform)" }
+            if !channel.isEmpty { return channel }
+            if platform.isEmpty { return StreamServers.hostLabel(host) }
+            // YouTube and Facebook have ONE address each and it is not the
+            // user's to choose, so the address tells them nothing they can act
+            // on and reads as a scary URL on the way to air. A custom server's
+            // address is the one useful fact about it, so that one keeps it.
+            if C.rtmpFixedAddress.contains(settings.server) { return platform }
             return "\(platform), \(StreamServers.hostLabel(host))"
         }
+        let name = settings.name.trimmingCharacters(in: .whitespacesAndNewlines)
         let where_ = host + settings.mount
         if !name.isEmpty { return "\(name), \(where_)" }
         return "\(StreamServers.serverLabel(settings.server)), \(where_)"
@@ -388,11 +406,20 @@ enum Preflighter {
     /// YouTube publishes and notifies subscribers at once, Facebook shows a
     /// preview and posts nothing. This is said BEFORE connecting. It used to
     /// be said after, which is the wrong side of the only decision it informs.
+    ///
+    /// **"usually", and then the thing the app cannot see** (W384-11). This
+    /// said flatly that YouTube puts you live the moment you connect, which is
+    /// only true while auto start is on for that stream, a YouTube setting
+    /// nothing here can read. With it off the stream sits waiting and the
+    /// channel shows nothing, which is exactly what Joshua ran into.
     static func goingLiveWarning(_ board: PreflightBoard) -> String {
         if board.liveTo != C.liveToVideo { return "" }
         if C.rtmpGoesLiveAtOnce[board.videoServer] == true {
-            return "\(StreamServers.serverLabel(board.videoServer)) puts you live the "
-                 + "moment you connect, and tells your subscribers"
+            let platform = StreamServers.serverLabel(board.videoServer)
+            return "\(platform) usually puts you live the moment you connect, and tells "
+                 + "your subscribers. If auto start is switched off for this stream, "
+                 + "\(platform) waits for you to press Go live in your live control room "
+                 + "instead"
         }
         if board.videoServer == "facebook" {
             return "Facebook will show you a preview and post nothing until you press "

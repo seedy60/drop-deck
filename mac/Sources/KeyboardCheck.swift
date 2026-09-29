@@ -19,7 +19,7 @@ final class KeyboardCheckPanel: NSObject {
     /// and only the second one closes the window.
     private var escapedOnce = false
 
-    private static let wanted: [(String, String)] = [
+    static let wanted: [(String, String)] = [
         ("1", "bank 1, sound 1"),
         ("Shift 1", "bank 1, sound 11"),
         ("Command 1", "bank 2, drop 1"),
@@ -37,7 +37,8 @@ final class KeyboardCheckPanel: NSObject {
         ("Option Space", "stop the last sound"),
         ("Command M", "the microphone"),
         ("Command R", "recording"),
-        ("Command B", "go live"),
+        ("Command B", "go live on video"),
+        ("Option Shift B", "go live on radio"),
         ("Command L", "what is playing"),
     ]
 

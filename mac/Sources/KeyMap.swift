@@ -114,6 +114,9 @@ enum Command: String, CaseIterable {
     case playlistStop, playlistCrossfade, playlistSave, playlistOpen, playlistClear
     case micToggle, micSettings
     case streamToggle, streamStatus, streamStats, streamSetup
+    // Going live on the RADIO station, beside Command B for the video
+    // platform. Windows 3.8.2: one key per destination.
+    case streamToggleRadio
     case record, recordVideo, recordFolder, sources, sourceControl, muteSources, soloMic
     // Giving another program on this machine the show, 3.7.1.
     case sendSetup, sendMonitor, sendStatus, routing, virtualDevice
@@ -326,7 +329,11 @@ enum KeyMap {
         // On air
         .micToggle:     [Binding("m", [.command])],
         .micSettings:   [Binding("m", [.command, .shift])],
+        // One key per destination (W382-07). Command B is the video
+        // platform; Option Shift B is the radio station, which is Windows'
+        // Alt+Shift+B with Alt called what it is called here.
         .streamToggle:  [Binding("b", [.command])],
+        .streamToggleRadio: [Binding("b", [.option, .shift])],
         .streamStatus:  [Binding("b", [.command, .shift])],
         .streamStats:   [Binding("a", [.command, .shift])],
         .record:        [Binding("r", [.command])],

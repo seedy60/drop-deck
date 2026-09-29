@@ -284,9 +284,14 @@ extension MainWindow {
             // The sentence Tony's report was asking for. His radio station
             // takes no picture, and that is not a reason for him to have no
             // picture: it is a reason to say which of the two this is for.
-            said.append("Nothing is using it yet. Command+B goes to your radio station, "
-                        + "which sends no picture, so this is for Command+Shift+R until "
-                        + "you switch Command+B over.")
+            // NOT Windows' "Ctrl+B goes to your radio station ... until you
+            // switch Ctrl+B over", which the key split made false: Command+B
+            // always goes to the video platform now, and the radio station
+            // has a key of its own.
+            said.append("Nothing is using it yet. Your radio station sends no picture, "
+                        + "so Option+Shift+B does not use it. It goes out when you press "
+                        + "Command+B, which goes live on your video platform, and into "
+                        + "the file when you press Command+Shift+R.")
         }
         if fallenBack {
             said.append("A card is standing in"

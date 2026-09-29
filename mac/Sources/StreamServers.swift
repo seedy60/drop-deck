@@ -42,10 +42,21 @@ enum StreamServers {
     /// shows a user where their stream is going has to come through here
     /// rather than printing the URL. Anybody holding a YouTube key can
     /// broadcast to that channel.
+    ///
+    /// **An address with no host to be found is not said whole** (M15). It
+    /// used to come back exactly as typed, so an address pasted without its
+    /// `rtmp://`, "live.example.com/app/KEY", was read out key and all. What
+    /// follows the first slash is where a key lives, so it is never said.
+    /// Windows' `host_label` still returns the whole thing; declared in
+    /// cross_check.py DIVERGENCES.
     static func hostLabel(_ url: String) -> String {
-        guard let parsed = URLComponents(string: url), let host = parsed.host,
-              !host.isEmpty else { return url }
-        return host
+        if let parsed = URLComponents(string: url), let host = parsed.host, !host.isEmpty {
+            return host
+        }
+        var rest = Substring(url)
+        if let scheme = rest.range(of: "://") { rest = rest[scheme.upperBound...] }
+        if let slash = rest.firstIndex(of: "/") { return String(rest[..<slash]) }
+        return String(rest)
     }
 
     /// What is wrong with these settings, in the platform's own numbers.
