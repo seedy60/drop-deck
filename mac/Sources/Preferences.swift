@@ -18,6 +18,9 @@ import Carbon.HIToolbox
 extension MainWindow {
 
     func showPreferences(tab wanted: String? = nil) {
+        // The picture as it is before anything on these pages can change it,
+        // so OK can tell whether the picture in use has to follow.
+        let pictureAtOpen = pictureSettings()
         let alert = NSAlert()
         alert.messageText = "Preferences"
         alert.addButton(withTitle: "OK")
@@ -729,11 +732,11 @@ extension MainWindow {
             }
             // Each platform keeps its own key, so moving between them brings
             // the right one back rather than showing the last one typed.
-            keyAtOpen = VideoPrefs.cleanKey(Board.keyInForce(
-                keychain: Secrets.fetchVideoKey(
-                    server: which, host: videoHostField.stringValue,
-                    stationName: board.stream.name),
-                board: board.videoKey))
+            // The board's own key only for the platform it was saved for, so
+            // one platform's key never appears in another's box (audit 1,
+            // finding 5).
+            keyAtOpen = VideoPrefs.cleanKey(board.videoKeyInForce(
+                server: which, host: videoHostField.stringValue))
             keyField.stringValue = keyAtOpen
             whatText.string = GoingLive.note(which)
             whatText.setSelectedRange(NSRange(location: 0, length: 0))
@@ -843,6 +846,9 @@ extension MainWindow {
         board.askBeforeLive = askBox.state == .on
 
         // ------------------------------------------------------------- video --
+        // Whose the board key is, pinned BEFORE the platform can change, so a
+        // key kept on the board stays the one platform's it was typed for.
+        board.videoKeyFor = board.videoKeyOwner
         board.videoServer = C.videoServerOrder[max(0, platformPopup.indexOfSelectedItem)]
         let typedHost = videoHostField.stringValue.trimmingCharacters(in: .whitespaces)
         // YouTube and Facebook have one address each and it is not the user's
@@ -879,15 +885,18 @@ extension MainWindow {
             break
         case .forget:
             board.videoKey = ""
+            board.videoKeyFor = ""
             Secrets.forget(station: station)
         case .store:
             if Secrets.store(station: station, key: typedKey) {
                 board.videoKey = ""
+                board.videoKeyFor = ""
             } else {
                 // W384-23. The keychain would not keep it, so it goes where it
                 // always used to, and that is SAID: a broadcast credential in
                 // a file people send each other is not something to do quietly.
                 board.videoKey = typedKey
+                board.videoKeyFor = station
                 keyWarning = VideoPrefs.keyNotKept
             }
         }
@@ -1017,6 +1026,14 @@ extension MainWindow {
         if player.isPlaying, let track = player.currentTrack {
             window?.title = "\(track.named(board.titleFormat)) - \(C.appName)"
         }
+        // The picture in use follows a picture changed here (audit 1, finding
+        // 4). OK changed the board and nothing else, so a camera, a size or a
+        // colour changed mid show did nothing until some later holder came
+        // along and rebuilt the camera under the air at a moment nobody chose.
+        let pictureChange = MainWindow.picturePrefsChange(
+            before: pictureAtOpen, after: pictureSettings(),
+            held: pictureFeed.held, live: pictureLive())
+        if pictureChange.rebuild { pictureFeed.rebuild() }
         updateStatusLine()
         touch()
 
@@ -1028,6 +1045,7 @@ extension MainWindow {
         if schemeChanged {
             line += ". Banks 2 and 3 now fire on \(KeyMap.bank2Spoken) and \(KeyMap.bank3Spoken)"
         }
+        if let said = pictureChange.say { line += ". " + said }
         line += ". " + micSummary()
         if !keyWarning.isEmpty { line += ". " + keyWarning }
         speaker.announce(line)

@@ -294,10 +294,18 @@ final class Overlay {
     private var fileText: [String: String] = [:]
 
     private(set) var renders = 0
-    var station = ""
-    var title = ""
+    /// Everything below is read by `draw` on the stream's and the
+    /// recording's threads and written from the main one on every track
+    /// change, so every read and write is under `lock` (audit 1, finding 6).
+    /// They were plain properties written with no lock, a data race on a
+    /// Swift string, which can crash.
+    private var stationNow = ""
+    private var titleNow = ""
     private var panel = C.overlayBackground
     private var ink = C.overlayForeground
+
+    var station: String { lock.lock(); defer { lock.unlock() }; return stationNow }
+    var title: String { lock.lock(); defer { lock.unlock() }; return titleNow }
 
     /// Where the clock's string comes from. Held so a test can pin it; the app
     /// never sets it.
@@ -320,12 +328,12 @@ final class Overlay {
             files[place.key] = held["file"] ?? ""
         }
         fileSeen = [:]; fileText = [:]; tiles = [:]; text = [:]
-        lock.unlock()
-        station = settings.name.isEmpty ? settings.streamName : settings.name
+        stationNow = settings.name.isEmpty ? settings.streamName : settings.name
         panel = Colours.rgb(settings.colourBackground.isEmpty
                             ? C.colourBackground : settings.colourBackground)
         ink = Colours.rgb(settings.colourText.isEmpty
                           ? C.colourText : settings.colourText)
+        lock.unlock()
     }
 
     func kindOf(_ key: String) -> String {
@@ -334,15 +342,18 @@ final class Overlay {
     }
 
     /// What is playing. Called from the same place the card is told.
-    func setTitle(_ title: String) { self.title = title }
+    func setTitle(_ title: String) {
+        lock.lock(); titleNow = title; lock.unlock()
+    }
 
     // ------------------------------------------------------- the strings ---
 
     /// What this place should be saying right now.
     private func wanted(_ key: String) -> String {
         switch kinds[key] ?? C.textNone {
-        case C.textStation: return station
-        case C.textPlaying: return title
+        // Called with `lock` held, so the stored values, not the accessors.
+        case C.textStation: return stationNow
+        case C.textPlaying: return titleNow
         case C.textTime:
             let formatter = DateFormatter()
             // A fixed pattern needs a fixed locale, or a region setting can

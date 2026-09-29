@@ -422,6 +422,27 @@ extension SelfTest {
               unreachable.note.hasSuffix("board opened instead"), unreachable.note)
         try? FileManager.default.moveItem(atPath: moved, toPath: show)
 
+        // Audit 1, finding 10: asked with a limit whether it is there, and
+        // then READ with one too. A share that goes away between the two
+        // questions used to freeze the start for as long as macOS took.
+        let slowBegan = Date()
+        let slowRead = BoardFiles.loadStartup(
+            configDir: config, demoPath: nil,
+            readRemembered: { path in
+                BoardFiles.readQuickly(path, timeout: 0.3) { _ in
+                    Thread.sleep(forTimeInterval: 3)
+                    return .failure(.missing)
+                }
+            })
+        let slowTook = Date().timeIntervalSince(slowBegan)
+        check("a remembered board that will not finish being read is not waited for",
+              slowTook < 1.5 && slowRead.note.contains("could not be reached")
+                && Board.samePath(slowRead.pinned, show),
+              String(format: "%.2f s: %@", slowTook, slowRead.note))
+        check("and a quick one is read as ever",
+              BoardFiles.readQuickly(show).map { if case .success = $0 { return true }; return false }
+                == true)
+
         let began = Date()
         let answer = BoardFiles.existsQuickly("/Volumes/never-answers/Show.json", timeout: 0.3) { _ in
             Thread.sleep(forTimeInterval: 3)
@@ -486,8 +507,9 @@ extension SelfTest {
         let lockedKeeper = BoardKeeper(board: locked.board, configDir: lockedConfig)
         lockedKeeper.noteStartingVersion()
         check("and coming back to the window does not announce it a second time",
-              lockedKeeper.comingBack(path: lockedBoard, changed: locked.board.changedOnDisk(),
-                                      now: locked.board.diskNow(), busy: false) == .nothing)
+              lockedKeeper.comingBack(BoardKeeper.look(path: lockedBoard,
+                                                       knowledge: locked.board.disk),
+                                      busy: false) == .nothing)
         locked.board.dirty = true
         _ = lockedKeeper.save()
         _ = lockedKeeper.saveForClose()
@@ -518,12 +540,14 @@ extension SelfTest {
         b.stream.host = "mine.example.org"
         let keeper = BoardKeeper(board: b, configDir: config)
         _ = keeper.save(to: path)
+        func look(_ at: String = path) -> BoardKeeper.Look {
+            BoardKeeper.look(path: at, knowledge: b.disk)
+        }
         check("nothing changed is nothing to do",
-              keeper.comingBack(path: path, changed: b.changedOnDisk(), now: nil, busy: false)
-                == .nothing)
+              keeper.comingBack(look(), busy: false) == .nothing)
         write(path, "{\"app\": \"TG Drop Deck\", \"stream_host\": \"theirs.example.org\"}")
-        let changed = b.changedOnDisk()
-        let loaded = keeper.comingBack(path: path, changed: changed, now: b.diskNow(), busy: false)
+        let changedLook = look()
+        let loaded = keeper.comingBack(changedLook, busy: false)
         if case .load(let fresh) = loaded {
             check("with nothing going on, a board copied in meanwhile loads",
                   fresh.stream.host == "theirs.example.org")
@@ -531,21 +555,20 @@ extension SelfTest {
             check("with nothing going on, a board copied in meanwhile loads", false, "\(loaded)")
         }
         check("and the same version is never acted on twice",
-              keeper.comingBack(path: path, changed: changed, now: b.diskNow(), busy: false)
-                == .nothing)
+              keeper.comingBack(changedLook, busy: false) == .nothing)
 
         write(path, "{\"app\": \"TG Drop Deck\", \"stream_host\": \"third.example.org\"}")
-        let busy = keeper.comingBack(path: path, changed: true, now: b.diskNow(), busy: true)
+        let busy = keeper.comingBack(look(), busy: true)
         check("while something is playing or live it is said and nothing moves",
               busy == .say("Back has been changed outside Drop Deck. It will not be saved over. "
                            + "File, Open board loads the new one when you are ready"), "\(busy)")
         check("once",
-              keeper.comingBack(path: path, changed: true, now: b.diskNow(), busy: true) == .nothing)
+              keeper.comingBack(look(), busy: true) == .nothing)
 
         write(path, "{\"app\": \"TG Drop Deck\",\n\"x\": 1\n\"y\": 2}")
         var said: [ComingBackSaid] = []
         for _ in 0..<3 {
-            let answer = keeper.comingBack(path: path, changed: true, now: b.diskNow(), busy: false)
+            let answer = keeper.comingBack(look(), busy: false)
             if case .say(let line) = answer { said.append(ComingBackSaid(line: line)) }
             if case .load = answer { said.append(ComingBackSaid(line: "LOADED")) }
         }
@@ -553,7 +576,44 @@ extension SelfTest {
               said.count == 1 && said[0].line.contains("cannot be read, there is a mistake in it on line 3")
                 && said[0].line.hasSuffix("It will not be saved over"), "\(said.map { $0.line })")
         check("a different board's path is none of its business",
-              keeper.comingBack(path: path + ".other", changed: true, now: nil, busy: false) == .nothing)
+              keeper.comingBack(BoardKeeper.Look(path: path + ".other", knowledge: b.disk,
+                                                 changed: true, now: nil, read: nil),
+                                busy: false) == .nothing)
+
+        // Audit 1, finding 10. A look that set out before the app's own save
+        // landed compares the file with what was known BEFORE, so the app's
+        // own write looks like somebody else's. Thrown away.
+        let own = (scratch as NSString).appendingPathComponent("Own.json")
+        let mine = Board()
+        mine.stream.host = "mine.example.org"
+        let ownKeeper = BoardKeeper(board: mine, configDir: config)
+        _ = ownKeeper.save(to: own)
+        let before = mine.disk
+        mine.stream.host = "changed.example.org"
+        mine.dirty = true
+        _ = ownKeeper.save()          // the autosave, while the look was out
+        mine.dirty = false
+        let stale = BoardKeeper.look(path: own, knowledge: before)
+        check("the app's own save is not taken for somebody else's",
+              stale.changed && ownKeeper.comingBack(stale, busy: false) == .nothing,
+              "changed \(stale.changed)")
+        check("and the next look, with what is known now, sees nothing changed",
+              ownKeeper.comingBack(BoardKeeper.look(path: own, knowledge: mine.disk),
+                                   busy: false) == .nothing)
+
+        // And the board is not read on the main thread: `comingBack` uses the
+        // look's own reading and never reads the file again itself.
+        let elsewhere = Board()
+        elsewhere.stream.host = "read.on.the.look.example.org"
+        write(own, "{\"app\": \"TG Drop Deck\",\n\"x\": 1\n\"y\": 2}")
+        let handed = BoardKeeper.Look(path: own, knowledge: mine.disk, changed: true,
+                                      now: Board.diskStamp(own), read: .success(elsewhere))
+        if case .load(let got) = ownKeeper.comingBack(handed, busy: false) {
+            check("comingBack loads what the look read, not a fresh read of its own",
+                  got === elsewhere)
+        } else {
+            check("comingBack loads what the look read, not a fresh read of its own", false)
+        }
     }
 
     private struct ComingBackSaid { let line: String }
@@ -604,9 +664,43 @@ extension SelfTest {
               VideoPrefs.videoKeyAction(typed: VideoPrefs.cleanKey("abcd-1234 \n"),
                                         atOpen: VideoPrefs.cleanKey("abcd-1234")) == .leave)
         check("the keychain's key is the one in force",
-              Board.keyInForce(keychain: "from-keychain", board: "from-board") == "from-keychain")
+              Board.keyInForce(keychain: "from-keychain", board: "from-board",
+                               boardFor: "youtube", station: "youtube") == "from-keychain")
         check("and the board file's only when the keychain has none",
-              Board.keyInForce(keychain: "", board: "from-board") == "from-board")
+              Board.keyInForce(keychain: "", board: "from-board",
+                               boardFor: "youtube", station: "youtube") == "from-board")
+
+        // Audit 1, finding 5: the board's one key is never offered to another
+        // platform. The keychain is not asked here; the owner rule is.
+        check("a board key saved for YouTube is not offered to Facebook",
+              Board.keyInForce(keychain: "", board: "yt-key", boardFor: "youtube",
+                               station: "facebook") == "")
+        var file: [String: Any] = ["app": "TG Drop Deck", "video_server": "youtube",
+                                   "video_key": "yt-key"]
+        let older = Board.from(dict: file, relativeTo: nil)
+        check("a board with no owner recorded (older, or Windows') is given the platform it was saved with",
+              older.videoKeyFor == "youtube" && older.videoKeyOwner == "youtube",
+              older.videoKeyFor)
+        older.videoServer = "facebook"
+        check("so moving it to Facebook does not carry the YouTube key there",
+              Board.keyInForce(keychain: "", board: older.videoKey, boardFor: older.videoKeyOwner,
+                               station: Secrets.videoStation(server: older.videoServer,
+                                                             host: older.videoHost)) == "",
+              older.videoKeyOwner)
+        let written = older.toDict()
+        check("Windows' video_key is written exactly as it was, and the owner beside it",
+              written["video_key"] as? String == "yt-key"
+                && written["mac_video_key_server"] as? String == "youtube"
+                && written["video_server"] as? String == "facebook")
+        let back = Board.from(dict: written, relativeTo: nil)
+        check("and it reads back as YouTube's, whatever the board's platform is now",
+              back.videoKeyOwner == "youtube" && back.videoServer == "facebook"
+                && back.toDict()["mac_video_key_server"] as? String == "youtube")
+        check("coming back to YouTube offers it again",
+              Board.keyInForce(keychain: "", board: back.videoKey, boardFor: back.videoKeyOwner,
+                               station: "youtube") == "yt-key")
+        file["video_key"] = ""
+        check("no key, no owner", Board.from(dict: file, relativeTo: nil).videoKeyOwner == "")
         check("a key the keychain would not keep is said out loud, in Windows' words",
               VideoPrefs.keyNotKept == "macOS would not store your stream key safely, so it is "
                 + "in your board file. Do not send that file to anybody.")

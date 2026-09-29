@@ -135,6 +135,11 @@ final class ScreenSource: NSObject, PictureSource, SCStreamOutput, SCStreamDeleg
     /// A start is under way, so a retry arriving at the same moment does not
     /// ask ScreenCaptureKit twice.
     private var opening = false
+    /// Closed for good, so a start that lands late opens nothing, and a
+    /// capture that finishes starting after the close is stopped at once
+    /// (audit 1, finding 9).
+    private var closed = false
+    var isClosed: Bool { lock.lock(); defer { lock.unlock() }; return closed }
 
     /// How many real pictures have arrived. Nought means still starting.
     var framesRead: Int? { lock.lock(); defer { lock.unlock() }; return frameCount }
@@ -180,7 +185,7 @@ final class ScreenSource: NSObject, PictureSource, SCStreamOutput, SCStreamDeleg
 
     func start() {
         lock.lock()
-        if stream != nil || opening { lock.unlock(); return }
+        if stream != nil || opening || closed { lock.unlock(); return }
         opening = true
         lock.unlock()
         // The same fault as the camera, and worse, because there is no
@@ -298,7 +303,14 @@ final class ScreenSource: NSObject, PictureSource, SCStreamOutput, SCStreamDeleg
     /// Taking a lock directly inside an async function is refused in the
     /// Swift 6 language mode, so the one line that needs it lives here.
     private func keep(_ made: SCStream) {
-        lock.lock(); stream = made; lock.unlock()
+        lock.lock()
+        if closed {
+            lock.unlock()
+            Task { try? await made.stopCapture() }
+            return
+        }
+        stream = made
+        lock.unlock()
     }
 
     private func pick(from displays: [SCDisplay]) -> SCDisplay? {
@@ -487,6 +499,7 @@ final class ScreenSource: NSObject, PictureSource, SCStreamOutput, SCStreamDeleg
 
     func close() {
         lock.lock()
+        closed = true
         let running = stream
         stream = nil
         latest = nil
@@ -498,8 +511,14 @@ final class ScreenSource: NSObject, PictureSource, SCStreamOutput, SCStreamDeleg
     }
 }
 
+/// A picture whose camera corner can be moved while it is live, with no
+/// rebuild. The split is the one; a check stands one in that opens nothing.
+protocol CornerMovable: AnyObject {
+    var corner: String { get set }
+}
+
 /// The screen filling the frame, with the camera small in a corner.
-final class SplitSource: PictureSource {
+final class SplitSource: PictureSource, CornerMovable {
 
     let kind = C.pictureSplit
     let screen: ScreenSource

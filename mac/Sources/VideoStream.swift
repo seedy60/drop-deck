@@ -264,21 +264,31 @@ final class VideoStreamer {
 
     private func run(rate: Double, generation run: Int) {
         guard let bus else { return }
+        // Every way out before the loop lets go of the bus as well (audit 1,
+        // finding 12). These returned without it, so an encoder that would
+        // not start left the programme bus in the mixer group, filled for
+        // nobody until the app quit.
         guard let aac = AACEncoder(rate: rate, bitrate: settings.audioBitrate) else {
             applyState(.failed, "the sound encoder would not start", generation: run)
+            releaseAfterFailure(run, bus: bus)
             return
         }
         let chunk = AACEncoder.frameSize
         guard let format = AVAudioFormat(standardFormatWithSampleRate: rate, channels: 2),
               let pcm = AVAudioPCMBuffer(pcmFormat: format,
                                          frameCapacity: AVAudioFrameCount(chunk))
-        else { return }
+        else {
+            applyState(.failed, "the sound encoder would not start", generation: run)
+            releaseAfterFailure(run, bus: bus)
+            return
+        }
         var interleaved = [Float](repeating: 0, count: chunk * 2)
 
         let video = VideoEncoder(width: settings.width, height: settings.height,
                                  fps: settings.fps, bitrate: settings.videoBitrate)
         guard video.open() else {
             applyState(.failed, video.error, generation: run)
+            releaseAfterFailure(run, bus: bus)
             return
         }
         encoder = video
@@ -357,10 +367,10 @@ final class VideoStreamer {
 
             // A platform that is going to refuse may do it after the first
             // frames rather than at publish, so it is asked every turn.
+            // Sorted the way a refusal at connect is (W384-15): one naming the
+            // key stops for good, anything else is worth another attempt.
             if let refused = link.refusal() {
-                hangUp()
-                applyState(.failed, refused, generation: run)
-                failed = true
+                if survive(RTMPError.refused(refused).fault) { continue }
                 break
             }
 

@@ -85,6 +85,10 @@ final class PictureFeed {
     private var wanted = PictureSettings()
     /// A rebuild has been asked for and not yet done.
     private var rebuildWanted = false
+    /// The source the worker is starting right now, if any. `close` shuts it
+    /// at once rather than waiting for a start that may be waiting on a
+    /// permission prompt the user has not answered.
+    private var opening: PictureSource?
     private var title = ""
     private var reasonNow = ""
     private var asked = 0
@@ -112,9 +116,24 @@ final class PictureFeed {
     /// open was built for settings that have since changed. Returns at once;
     /// `waitReady` is for a caller that can afford to wait, never the main
     /// thread.
+    ///
+    /// **Main thread only**: this reads the settings out of the board. A
+    /// caller on any other thread uses `acquire(_:settings:)` with settings it
+    /// took on the main thread before it left (audit 1, finding 6).
     @discardableResult
     func acquire(_ who: String) -> PictureFeed {
-        let settings = PictureFeed.comparable(settingsFor())
+        acquire(who, settings: settingsFor())
+    }
+
+    /// The same, with the settings handed in. Safe on any thread.
+    ///
+    /// What an open source is compared with is what it was built from, kept
+    /// up to date by everything that changes a live source in place (the
+    /// split's corner), so a newcomer only rebuilds a picture that really is
+    /// a different picture (audit 1, finding 4).
+    @discardableResult
+    func acquire(_ who: String, settings asked: PictureSettings) -> PictureFeed {
+        let settings = PictureFeed.comparable(asked)
         lock.lock()
         if holders[who] == nil { order.append(who) }
         holders[who, default: 0] += 1
@@ -170,8 +189,38 @@ final class PictureFeed {
 
     /// Wait for everything asked of the worker so far to be done. For the
     /// checks, and for a caller off the main thread that needs the answer.
+    /// **Never on the main thread**: the worker may be inside a camera start
+    /// that waits for a permission answer delivered on the main queue.
     func settle() {
         worker.sync {}
+    }
+
+    /// The same, for at most `timeout` seconds. True when the worker finished.
+    @discardableResult
+    func settle(timeout: Double) -> Bool {
+        let done = DispatchSemaphore(value: 0)
+        worker.async { done.signal() }
+        return done.wait(timeout: .now() + timeout) == .success
+    }
+
+    /// How long closing the app waits for the picture to be shut properly.
+    static let shutdownWait = 1.0
+
+    /// Closing the app: everybody lets go, anything still opening is shut at
+    /// once, and the wait for the worker is SHORT (audit 1, finding 2). It
+    /// was `settle()`, a wait with no end, on the main thread, while the
+    /// worker could be inside `CameraSource.start()` waiting up to two
+    /// minutes for a permission answer that is delivered on the main queue.
+    /// Command+Q with the camera prompt up made the app stop responding.
+    /// Whatever is still opening is closed here, so it cannot open a session
+    /// when its start finally returns, and the worker shuts the rest when it
+    /// gets there. True when everything was shut within the wait.
+    @discardableResult
+    func shutDown(within timeout: Double = PictureFeed.shutdownWait) -> Bool {
+        close()
+        lock.lock(); let starting = opening; lock.unlock()
+        starting?.close()
+        return settle(timeout: timeout)
     }
 
     /// Wait for the REAL picture, not the card standing in for it. Never call
@@ -295,8 +344,18 @@ final class PictureFeed {
     func setCorner(_ corner: String) -> Bool {
         lock.lock(); let open = source; lock.unlock()
         let target = (open as? FallbackSource)?.primary ?? open
-        guard let split = target as? SplitSource else { return false }
+        guard let split = target as? CornerMovable else { return false }
         split.corner = corner
+        // The live source has it now, so it is part of what that source was
+        // built from. Without this a newcomer (Command+Shift+R, a preview)
+        // saw settings that differed from `builtFrom` and closed and reopened
+        // the camera under the air to "apply" a corner already applied.
+        lock.lock()
+        if source === open {
+            builtFrom?.splitCorner = split.corner
+            wanted.splitCorner = split.corner
+        }
+        lock.unlock()
         return true
     }
 
@@ -361,8 +420,46 @@ final class PictureFeed {
         }
         box.source = made
         if !heading.isEmpty { made.setTitle(heading) }
+        lock.lock(); opening = made; lock.unlock()
+        defer { lock.lock(); if opening === made { opening = nil }; lock.unlock() }
+
+        // **Nothing on the air to hold it, so the card goes out while the
+        // real picture opens** (audit 1, finding 3). Published only after
+        // `start()` returned, a first open, and every same camera rebuild,
+        // sent no video at all: the stream's pump skips a frame the feed
+        // cannot give, and a camera's first start can wait up to two minutes
+        // on a permission prompt. The fallback's card stands in while its
+        // primary starts (W381-31), which is what `startVideoStream` always
+        // said happened. With an OLD picture still up, new in before old out
+        // is kept: the old picture is better than a card.
+        if outgoing == nil, let fallback = made as? FallbackSource {
+            fallback.backup.start()
+            guard publish(made, settings) else { shut(made); return }
+            onChange?()
+            fallback.primary.start()
+            lock.lock()
+            if source === made { reasonNow = made.error }
+            lock.unlock()
+            onChange?()
+            return
+        }
+
         made.start()
+        guard publish(made, settings) else {
+            // Everybody let go while it was opening.
+            shut(made)
+            return
+        }
+        if let outgoing { shut(outgoing) }
+        onChange?()
+    }
+
+    /// Put a built source up as THE source. False when nobody holds the feed
+    /// any more, in which case the caller shuts it. Counted as open either
+    /// way, so `shut` can count it closed.
+    private func publish(_ made: PictureSource, _ settings: PictureSettings) -> Bool {
         lock.lock()
+        defer { lock.unlock() }
         openNow += 1
         mostOpenAtOnce = max(mostOpenAtOnce, openNow)
         builds += 1
@@ -371,19 +468,12 @@ final class PictureFeed {
             cameraOf[ObjectIdentifier(made)] = device
             mostOnOneCamera = max(mostOnOneCamera, onCamera[device] ?? 0)
         }
-        guard !holders.isEmpty else {
-            // Everybody let go while it was opening.
-            lock.unlock()
-            shut(made)
-            return
-        }
+        guard !holders.isEmpty else { return false }
         source = made
         builtFrom = settings
         reasonNow = made.error
         asked = 0
-        lock.unlock()
-        if let outgoing { shut(outgoing) }
-        onChange?()
+        return true
     }
 
     /// Which camera a picture holds, or nil when it holds none. An empty name
@@ -510,17 +600,19 @@ final class RecordPicturePump {
 
     /// Stop our own thread. The tap is left alone: the stream may be about to
     /// fill it.
+    ///
+    /// **Returns at once, and nothing reaches the tap after it has** (audit 1,
+    /// finding 8). It used to spin on the calling thread, which is the main
+    /// one, for up to two seconds until the thread finished, and the thread
+    /// could be inside `waitReady` for five or in the framing check: VoiceOver
+    /// stalled just as the stream reached ON AIR during a recording. Now the
+    /// flag is set under the lock every put is made under, so once this
+    /// returns the thread can put nothing more, and it ends by itself.
     func stop() {
         lock.lock()
         stopping = true
-        let worker = thread
         thread = nil
         lock.unlock()
-        guard let worker, worker !== Thread.current else { return }
-        let deadline = Date().addingTimeInterval(2.0)
-        while !worker.isFinished && Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.005)
-        }
     }
 
     private var done: Bool { lock.lock(); defer { lock.unlock() }; return stopping }
@@ -535,8 +627,13 @@ final class RecordPicturePump {
         while !done {
             if let raw = feed.frame(width: width, height: height) {
                 let shown = Pixels.composite(raw, overlay, width: width, height: height)
+                // Put under the lock `stop` sets the flag under, and only if
+                // it has not been set, so nothing lands after `stop` returns.
+                lock.lock()
+                if stopping { lock.unlock(); break }
                 tap.put(shown)
-                lock.lock(); puts += 1; lock.unlock()
+                puts += 1
+                lock.unlock()
                 // LAST, and on the composite: what a watcher is asked is
                 // whether anybody watching would see anything.
                 health.look(buffer: shown, moving: feed.moving)

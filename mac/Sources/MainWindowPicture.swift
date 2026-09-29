@@ -89,6 +89,21 @@ extension MainWindow {
         recordOverlay.setTitle(nowPlayingTitle)
     }
 
+    /// What Preferences, OK does about the picture in use: rebuild it only
+    /// when something the PICTURE is made from changed and something holds
+    /// it, and say so only when that is the air or a recording, because a
+    /// momentary preview is invisible. The title is not a picture field: it
+    /// follows the track on its own.
+    static func picturePrefsChange(before: PictureSettings, after: PictureSettings,
+                                   held: Bool, live: Bool) -> (rebuild: Bool, say: String?) {
+        guard held, PictureFeed.comparable(before) != PictureFeed.comparable(after) else {
+            return (false, nil)
+        }
+        return (true, live ? picturePrefsSentence : nil)
+    }
+
+    static let picturePrefsSentence = "The picture in use now follows the new settings"
+
     // ------------------------------------------------------ the stream's hold ---
 
     /// Command+B to a video platform takes the stream's hold. Returns the feed

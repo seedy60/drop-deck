@@ -121,6 +121,13 @@ final class CameraSource: NSObject, PictureSource, AVCaptureVideoDataOutputSampl
     /// A start is under way, so a retry arriving at the same moment does not
     /// open the device twice.
     private var opening = false
+    /// Closed for good (audit 1, finding 9). `start()` runs off the feed's
+    /// worker when the fallback retries, so it can land after `close()`; a
+    /// closed camera refuses it, and a start already past its checks gives
+    /// the session it made straight back rather than keeping it, so the
+    /// light cannot stay on under a source nobody holds.
+    private var closed = false
+    var isClosed: Bool { lock.lock(); defer { lock.unlock() }; return closed }
     /// The observers for a session that dies underneath us. See `lost`.
     private var watchers: [NSObjectProtocol] = []
 
@@ -144,7 +151,7 @@ final class CameraSource: NSObject, PictureSource, AVCaptureVideoDataOutputSampl
 
     func start() {
         lock.lock()
-        if session != nil || opening { lock.unlock(); return }
+        if session != nil || opening || closed { lock.unlock(); return }
         opening = true
         lock.unlock()
         defer { lock.lock(); opening = false; lock.unlock() }
@@ -175,6 +182,9 @@ final class CameraSource: NSObject, PictureSource, AVCaptureVideoDataOutputSampl
                 return
             }
         }
+        // The prompt can take as long as the user likes, and the source may
+        // have been closed meanwhile: nothing more is touched if it was.
+        if isClosed { return }
         guard let picked = Cameras.device(named: device) else {
             setError(Cameras.explain("not connected", device: device))
             return
@@ -218,7 +228,15 @@ final class CameraSource: NSObject, PictureSource, AVCaptureVideoDataOutputSampl
         made.addOutput(output)
         made.commitConfiguration()
 
-        lock.lock(); session = made; lock.unlock()
+        lock.lock()
+        if closed {
+            // Closed while this was opening, the permission prompt being the
+            // long part: nothing was ever started, so there is nothing to stop.
+            lock.unlock()
+            return
+        }
+        session = made
+        lock.unlock()
         watch(made, device: picked)
         // startRunning blocks while the device warms up, which is why it is
         // not on the caller's thread.
@@ -370,6 +388,7 @@ final class CameraSource: NSObject, PictureSource, AVCaptureVideoDataOutputSampl
     /// that has stopped delivering never reaches the check.
     func close() {
         lock.lock()
+        closed = true
         let running = session
         session = nil
         latest = nil

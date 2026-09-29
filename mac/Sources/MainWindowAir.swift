@@ -18,9 +18,19 @@ extension MainWindow {
     /// and a recording without you in it sound exactly like ones with you in it
     /// from where you are sitting. Nothing said so until 3.3.2, and the first
     /// person to hit it had a stream going out with no presenter on it.
+    ///
+    /// **Either streamer is a stream** (audit 1, finding 7): both take the
+    /// same on air mix, which the one switch keeps the microphone out of, and
+    /// "On air to YouTube" used to carry no warning at all. A picture
+    /// recording is a recording, for the same reason.
     var micOffAirNote: String? {
-        guard !board.stream.sendMic else { return nil }
-        let live = streamer.isOn, taping = recorder.isRecording
+        MainWindow.micOffAirNote(sendMic: board.stream.sendMic,
+                                 streaming: streamer.isOn || videoStreamer.isOn,
+                                 recording: recorder.isRecording || videoRecorder.isRecording)
+    }
+
+    static func micOffAirNote(sendMic: Bool, streaming live: Bool, recording taping: Bool) -> String? {
+        guard !sendMic else { return nil }
         guard live || taping else { return nil }
         let what = live && taping ? "the stream or the recording"
                  : live ? "the stream" : "the recording"

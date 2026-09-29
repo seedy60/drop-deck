@@ -416,7 +416,7 @@ final class MainWindow: NSWindowController, NSWindowDelegate {
         } else {
             parts.append("Mic off")
         }
-        parts.append(streamer.state == .off ? "Off air" : streamer.state.spoken.uppercased())
+        parts.append(MainWindow.airStatus(radio: streamer.state, video: videoStreamer.state))
         parts += MainWindow.recordingStatus(audio: recorder.isRecording,
                                             picture: videoRecorder.isRecording)
         // Muted and soloed sources are the two states you can hear the effect
@@ -934,6 +934,21 @@ final class MainWindow: NSWindowController, NSWindowDelegate {
         }
     }
 
+    /// The status line's on air words, for BOTH streamers (audit 1, finding
+    /// 7). It read the radio streamer alone, so it said "Off air" for the
+    /// whole of a YouTube broadcast. The radio's words are unchanged; the
+    /// video's say so, because two things can be on the air at once.
+    static func airStatus(radio: StreamState, video: StreamState) -> String {
+        switch (radio == .off, video == .off) {
+        case (true, true): return "Off air"
+        case (false, true): return radio.spoken.uppercased()
+        case (true, false): return "VIDEO " + video.spoken.uppercased()
+        case (false, false):
+            if radio == video { return radio.spoken.uppercased() + ", RADIO AND VIDEO" }
+            return "RADIO " + radio.spoken.uppercased() + ", VIDEO " + video.spoken.uppercased()
+        }
+    }
+
     /// The status line's recording words. "RECORDING PICTURE" is its own word
     /// (W381-12): a picture recording running with nothing on the line was a
     /// camera light on in the room with nothing anywhere saying why.
@@ -956,8 +971,10 @@ final class MainWindow: NSWindowController, NSWindowDelegate {
         if videoRecorder.isRecording { finishVideoRecording(quiet: true) }
         streamer.stop(group: group)
         videoStreamer.stop(group: group)
-        pictureFeed.close()
-        pictureFeed.settle()
+        // A SHORT wait, never an endless one: the worker can be inside a
+        // camera start waiting for a permission answer that arrives on this
+        // very thread (audit 1, finding 2).
+        pictureFeed.shutDown()
     }
 
     /// Is anything happening that a board loading underneath would cut off.
@@ -979,13 +996,14 @@ final class MainWindow: NSWindowController, NSWindowDelegate {
         boardCheckBusy = true
         let knowledge = board.disk
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let changed = Board.changedOnDisk(path: path, knowledge: knowledge)
-            let now = changed ? Board.diskStamp(path) : nil
+            // The read too, here and not on the main thread (audit 1,
+            // finding 10). `comingBack` throws the answer away if the board's
+            // own knowledge moved on meanwhile.
+            let look = BoardKeeper.look(path: path, knowledge: knowledge)
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.boardCheckBusy = false
-                switch self.keeper.comingBack(path: path, changed: changed, now: now,
-                                              busy: self.boardBusy) {
+                switch self.keeper.comingBack(look, busy: self.boardBusy) {
                 case .nothing: break
                 case .say(let line): self.speaker.announce(line)
                 case .load(let fresh): self.loadInto(path, keepPath: true, board: fresh)

@@ -283,27 +283,19 @@ extension MainWindow {
 
     /// The picture going out or being recorded, or the one that would be.
     ///
-    /// **Through the one shared feed** (W381-40). Whatever already holds the
-    /// picture is looked through rather than a second one opened; when nothing
-    /// does, a hold is taken for the look and let go again, and it is a
-    /// RELEASE rather than a close, so a stream or a recording that took hold
-    /// meanwhile keeps the device. Never on the main queue: it waits for the
-    /// picture.
-    func previewPicture() -> CVPixelBuffer? {
-        let feed = pictureFeed
-        let width = board.videoWidth, height = board.videoHeight
+    /// **Through the one shared feed** (W381-40). Called on the main queue;
+    /// the look it returns waits for the picture, so it is never called there.
+    ///
+    /// **Everything it needs out of the board is taken HERE, on the main
+    /// thread**, and the look itself is `PicturePreview.grab`, which touches
+    /// neither the board nor the player (audit 1, finding 6): the shot check
+    /// calls it from a queue of its own.
+    func previewPicture() -> PicturePreview {
         let overlay = Overlay(settings: overlaySettings())
         overlay.setTitle(nowPlayingTitle)
-        var taken = false
-        if !feed.running {
-            feed.acquire(PictureFeed.forPreview)
-            taken = true
-            _ = feed.waitReady(timeout: C.cameraOpenTimeout)
-        }
-        defer { if taken { feed.release(PictureFeed.forPreview) } }
-        return feed.frame(width: width, height: height).map {
-            Pixels.composite($0, overlay, width: width, height: height)
-        }
+        return PicturePreview(feed: pictureFeed, settings: pictureSettings(),
+                              width: board.videoWidth, height: board.videoHeight,
+                              overlay: overlay)
     }
 
     func showShotCheck() {
@@ -313,12 +305,14 @@ extension MainWindow {
         // The kind decides whether consent is asked for, so it is read from
         // what the picture really is rather than passed around.
         let kind = C.pictureNeedsScreen.contains(board.picture) ? "screen" : "camera"
+        // Taken now, on the main thread; the panel grabs from its own queue.
+        let preview = previewPicture()
         let panel = ShotCheckPanel(board: board, speaker: speaker, window: window,
                                    kind: kind,
                                    where: MainWindow.shotWhere(
                                        showing: showingPicture,
                                        recording: videoRecorder.isRecording),
-                                   grab: { [weak self] in self?.previewPicture() })
+                                   grab: { preview.grab() })
         panel.run(over: window)
     }
 
@@ -350,9 +344,12 @@ extension MainWindow {
         speaker.announce("Looking through the camera.")
         let feed = pictureFeed
         let level = board.framingLevel
+        // Read here, on the main thread, and handed in: the board is the
+        // window's and the look runs on another queue (audit 1, finding 6).
+        let settings = pictureSettings()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let held = feed.held
-            if !held { feed.acquire(PictureFeed.forPreview) }
+            if !held { feed.acquire(PictureFeed.forPreview, settings: settings) }
             defer { if !held { feed.release(PictureFeed.forPreview) } }
             _ = feed.waitReady(timeout: C.cameraOpenTimeout)
             guard let frame = feed.latest() else {
@@ -413,5 +410,33 @@ extension MainWindow {
             to: which, summary: report.summary(),
             stops: report.blocked ? report.stops.map { $0.text } : []))
         updateAirMenu()
+    }
+}
+
+/// One look through the shared picture, with everything it needs taken out of
+/// the board beforehand on the main thread. `grab` is safe on any thread and
+/// waits for the picture, so it is never called on the main one.
+struct PicturePreview {
+    let feed: PictureFeed
+    let settings: PictureSettings
+    let width: Int
+    let height: Int
+    let overlay: Overlay
+
+    /// Whatever already holds the picture is looked through rather than a
+    /// second one opened; when nothing does, a hold is taken for the look and
+    /// let go again, a RELEASE rather than a close, so a stream or a recording
+    /// that took hold meanwhile keeps the device.
+    func grab() -> CVPixelBuffer? {
+        var taken = false
+        if !feed.running {
+            feed.acquire(PictureFeed.forPreview, settings: settings)
+            taken = true
+            _ = feed.waitReady(timeout: C.cameraOpenTimeout)
+        }
+        defer { if taken { feed.release(PictureFeed.forPreview) } }
+        return feed.frame(width: width, height: height).map {
+            Pixels.composite($0, overlay, width: width, height: height)
+        }
     }
 }

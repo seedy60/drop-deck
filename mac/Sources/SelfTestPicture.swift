@@ -36,9 +36,53 @@ final class FakePicture: PictureSource {
     func setTitle(_ title: String) { titleSet = title }
 }
 
+/// A picture whose `start()` does not return until it is let go: the way a
+/// camera's first start waits on the permission prompt. Opens nothing.
+final class SlowPicture: PictureSource {
+    let kind = C.pictureCamera
+    private let gate = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var starting = false
+    private var closeCount = 0
+    /// When set, the start is let go by a block on the MAIN queue, which is
+    /// how a permission answer arrives.
+    let answeredOnMain: Bool
+    let limit: Double
+    init(answeredOnMain: Bool = false, limit: Double = 4) {
+        self.answeredOnMain = answeredOnMain
+        self.limit = limit
+    }
+    var inStart: Bool { lock.lock(); defer { lock.unlock() }; return starting }
+    var closes: Int { lock.lock(); defer { lock.unlock() }; return closeCount }
+    var framesRead: Int? { 0 }
+    func frame(width: Int, height: Int) -> CVPixelBuffer? { nil }
+    func describe() -> String { "a slow stand in camera" }
+    func start() {
+        lock.lock(); starting = true; lock.unlock()
+        if answeredOnMain {
+            let gate = self.gate
+            DispatchQueue.main.async { gate.signal() }
+        }
+        _ = gate.wait(timeout: .now() + limit)
+        lock.lock(); starting = false; lock.unlock()
+    }
+    func letGo() { gate.signal() }
+    func close() { lock.lock(); closeCount += 1; lock.unlock() }
+}
+
+/// A split that moves its corner and opens nothing.
+final class FakeSplit: PictureSource, CornerMovable {
+    let kind = C.pictureSplit
+    var corner: String
+    init(corner: String) { self.corner = corner }
+    func frame(width: Int, height: Int) -> CVPixelBuffer? { nil }
+    func describe() -> String { "a stand in split" }
+}
+
 extension SelfTest {
 
     func runPictureChecks() {
+        testAuditOnePicture()
         testPictureFeedHolds()
         testPictureFeedRebuild()
         testOneCameraOwner()
@@ -836,5 +880,223 @@ extension SelfTest {
                                                 + "well, to one MP4")
               && VideoPrefs.recordingNote.contains("Option+Shift+V changes it from "
                                                    + "anywhere"))
+    }
+
+    // ------------------------------------------------------ audit 1 ---
+
+    private func testAuditOnePicture() {
+        out.append("")
+        out.append("The picture, after the first audit of 3.8.4")
+
+        var s = PictureSettings()
+        s.picture = C.pictureCamera
+        s.camera = "Test Camera"
+        let card = Pixels.make(width: 64, height: 36)
+
+        // Finding 3: while the real picture opens, the card goes out, not
+        // nothing.
+        let slow = SlowPicture()
+        let stand = FakePicture(kind: C.pictureCard, answer: card)
+        let feed = PictureFeed(settings: { s }, build: { _, fell in
+            FallbackSource(primary: slow, backup: stand, onFallback: fell)
+        })
+        feed.acquire(PictureFeed.forStream, settings: s)
+        let by = Date().addingTimeInterval(2)
+        while Date() < by && !(slow.inStart && feed.running) { Thread.sleep(forTimeInterval: 0.01) }
+        check("while a camera is still opening the stream gets the card, not nothing",
+              slow.inStart && feed.running && feed.frame(width: 64, height: 36) != nil,
+              "starting \(slow.inStart), published \(feed.running)")
+        check("and nothing is announced about it",
+              !feed.fallenBack && feed.reason.isEmpty)
+        slow.letGo()
+        feed.settle()
+        check("it is the one source, counted once", feed.builds == 1 && feed.openNow == 1,
+              "\(feed.builds) built, \(feed.openNow) open")
+        feed.close()
+        feed.settle()
+        check("and it closes as ever", !feed.running && feed.openNow == 0 && slow.closes >= 1)
+
+        // Finding 2: closing the app never waits long on a picture whose start
+        // waits for the main thread, and what was opening is shut at once.
+        let waiting = SlowPicture(answeredOnMain: true)
+        let shutFeed = PictureFeed(settings: { s }, build: { _, fell in
+            FallbackSource(primary: waiting, backup: FakePicture(kind: C.pictureCard,
+                                                                 answer: card),
+                           onFallback: fell)
+        })
+        shutFeed.acquire(PictureFeed.forStream, settings: s)
+        let by2 = Date().addingTimeInterval(2)
+        while Date() < by2 && !waiting.inStart { Thread.sleep(forTimeInterval: 0.01) }
+        let began = Date()
+        let finished = shutFeed.shutDown(within: 0.3)
+        let took = Date().timeIntervalSince(began)
+        check("closing the app with a start waiting on the main thread returns at once",
+              !finished && took < 1.0, String(format: "%.2f s", took))
+        check("and what was opening is closed straight away, not when the start returns",
+              waiting.closes >= 1)
+        let by3 = Date().addingTimeInterval(3)
+        while Date() < by3 && (shutFeed.running || shutFeed.openNow > 0) {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+        }
+        check("and once the start comes back, nothing is left open",
+              !shutFeed.running && shutFeed.openNow == 0, "\(shutFeed.openNow) open")
+
+        // Finding 4: a corner moved on the live split is what it was built
+        // from, so a newcomer does not close and reopen the camera.
+        var split = PictureSettings()
+        split.picture = C.pictureSplit
+        split.camera = "Test Camera"
+        split.splitCorner = "bottom right"
+        var splits: [FakeSplit] = []
+        let cornerFeed = PictureFeed(settings: { split }, build: { made, _ in
+            let one = FakeSplit(corner: made.splitCorner)
+            splits.append(one)
+            return one
+        })
+        cornerFeed.acquire(PictureFeed.forStream, settings: split)
+        cornerFeed.settle()
+        check("the corner moves on the live source", cornerFeed.setCorner("top left")
+              && splits.first?.corner == "top left")
+        split.splitCorner = "top left"
+        cornerFeed.acquire(PictureFeed.forRecording, settings: split)
+        cornerFeed.settle()
+        check("and Command+Shift+R after it does not rebuild the camera under the air",
+              cornerFeed.builds == 1, "\(cornerFeed.builds) built")
+        split.colourAccent = "red"
+        cornerFeed.acquire(PictureFeed.forPreview, settings: split)
+        cornerFeed.settle()
+        check("a picture that really is different still is rebuilt", cornerFeed.builds == 2)
+        cornerFeed.close()
+        cornerFeed.settle()
+
+        var before = PictureSettings()
+        before.picture = C.pictureCamera
+        var after = before
+        after.colourBackground = "navy"
+        check("Preferences OK rebuilds a held picture whose settings changed, and says so on the air",
+              { let c = MainWindow.picturePrefsChange(before: before, after: after,
+                                                      held: true, live: true)
+                return c.rebuild && c.say == MainWindow.picturePrefsSentence }())
+        check("for a preview alone it rebuilds and says nothing",
+              { let c = MainWindow.picturePrefsChange(before: before, after: after,
+                                                      held: true, live: false)
+                return c.rebuild && c.say == nil }())
+        check("with nothing holding it there is nothing to rebuild",
+              { let c = MainWindow.picturePrefsChange(before: before, after: after,
+                                                      held: false, live: false)
+                return !c.rebuild && c.say == nil }())
+        var retitled = before
+        retitled.title = "Another song"
+        check("and a title is not a picture change",
+              { let c = MainWindow.picturePrefsChange(before: before, after: retitled,
+                                                      held: true, live: true)
+                return !c.rebuild && c.say == nil }())
+
+        // Finding 6: a look from another thread takes the settings it was
+        // handed, and never asks the board.
+        let asked = NSLock()
+        var boardReads = 0
+        var builtWith = ""
+        let offMain = PictureFeed(settings: {
+            asked.lock(); boardReads += 1; asked.unlock()
+            return PictureSettings()
+        }, build: { made, _ in
+            asked.lock(); builtWith = made.name; asked.unlock()
+            return FakePicture(kind: made.picture, answer: card)
+        })
+        var handed = PictureSettings()
+        handed.picture = C.pictureCard
+        handed.name = "Taken on main"
+        let preview = PicturePreview(feed: offMain, settings: handed, width: 64, height: 36,
+                                     overlay: Overlay())
+        let looked = DispatchSemaphore(value: 0)
+        var grabbed = false
+        DispatchQueue.global().async {
+            grabbed = preview.grab() != nil
+            looked.signal()
+        }
+        _ = looked.wait(timeout: .now() + 6)
+        offMain.settle()
+        asked.lock(); let reads = boardReads, name = builtWith; asked.unlock()
+        check("a preview from another thread never reads the board",
+              grabbed && reads == 0 && name == "Taken on main",
+              "grabbed \(grabbed), \(reads) board reads, built from \(name)")
+
+        // Finding 6: the words on top are written and drawn from different
+        // threads at once. Under the lock this is simply busy; without it, a
+        // string torn in half is a crash.
+        var words = OverlaySettings()
+        words.places = ["lower": ["kind": C.textPlaying, "words": "", "file": ""]]
+        let marks = Overlay(settings: words)
+        let writers = DispatchGroup()
+        DispatchQueue.global().async(group: writers) {
+            for i in 0..<4000 { marks.setTitle(i % 2 == 0 ? "A song with a long name \(i)" : "") }
+        }
+        DispatchQueue.global().async(group: writers) {
+            for i in 0..<400 { marks.apply(words); if i % 50 == 0 { _ = marks.describe() } }
+        }
+        var drawn = 0
+        let paint = Pixels.make(width: 160, height: 90)
+        for _ in 0..<300 {
+            guard let paint else { break }
+            CVPixelBufferLockBaseAddress(paint, [])
+            if let ctx = Pixels.context(for: paint) { marks.draw(into: ctx, width: 160, height: 90) }
+            CVPixelBufferUnlockBaseAddress(paint, [])
+            drawn += 1
+        }
+        _ = writers.wait(timeout: .now() + 20)
+        check("the words on top can be changed while they are being drawn", drawn == 300)
+
+        // Finding 8: a recording's picture thread stops at once, even inside
+        // its wait for the picture, and puts nothing after.
+        let stuck = SlowPicture()
+        let pumpFeed = PictureFeed(settings: { s }, build: { _, fell in
+            FallbackSource(primary: stuck, backup: FakePicture(kind: C.pictureCard, answer: card),
+                           onFallback: fell)
+        })
+        pumpFeed.acquire(PictureFeed.forRecording, settings: s)
+        let tap = FrameTap()
+        let pump = RecordPicturePump(feed: pumpFeed, tap: tap, width: 64, height: 36, fps: 30,
+                                     overlay: Overlay(), framingLevel: C.framingProblems,
+                                     say: { _ in })
+        pump.start()
+        Thread.sleep(forTimeInterval: 0.2)
+        let stopBegan = Date()
+        pump.stop()
+        let stopTook = Date().timeIntervalSince(stopBegan)
+        check("stopping a recording's picture thread never waits on it",
+              stopTook < 0.05 && !pump.isRunning, String(format: "%.3f s", stopTook))
+        stuck.letGo()
+        pumpFeed.settle()
+        Thread.sleep(forTimeInterval: 0.3)
+        check("and nothing reaches the tap after it was told", tap.puts == 0, "\(tap.puts) put")
+        pumpFeed.close()
+        pumpFeed.settle()
+
+        // Finding 9: a retry that lands after the source was closed opens
+        // nothing.
+        var clock = 0.0
+        var restarts = 0
+        let dead = FakePicture(kind: C.pictureCamera)
+        dead.count = 5
+        let closing = FallbackSource(primary: dead, backup: FakePicture(kind: C.pictureCard,
+                                                                        answer: card))
+        closing.now = { clock }
+        closing.restart = { _ in restarts += 1 }
+        _ = closing.frame(width: 64, height: 36)
+        clock += C.pictureRetrySeconds + 0.1
+        _ = closing.frame(width: 64, height: 36)
+        let before9 = restarts
+        closing.close()
+        clock += C.pictureRetrySeconds + 0.1
+        _ = closing.frame(width: 64, height: 36)
+        check("a fallback that has been closed asks for no more retries",
+              before9 == 1 && restarts == 1, "\(before9) before, \(restarts) after")
+        let camera = CameraSource(device: "Test Camera")
+        camera.close()
+        let screen = ScreenSource()
+        screen.close()
+        check("and a closed camera and a closed screen know it, so a late start opens nothing",
+              camera.isClosed && screen.isClosed && !camera.holdsSession && !screen.holdsCapture)
     }
 }

@@ -129,6 +129,14 @@ final class Board {
     /// Kept only so a board written by an older build round trips. The key
     /// itself belongs in the keychain: see Secrets.swift.
     var videoKey = ""
+    /// Which platform `videoKey` belongs to, as `Secrets.videoStation` names
+    /// it. The Mac's own key, `mac_video_key_server`, beside Windows'
+    /// `video_key`, which is left exactly as Windows wrote it (audit 1,
+    /// finding 5). Without it the one board key was offered to whatever
+    /// platform was chosen: a YouTube key came up in the Facebook box, and
+    /// Check my stream key and Command+B sent it there. A board that has none
+    /// (older, or written by Windows) is given the platform it was saved with.
+    var videoKeyFor = ""
     /// Which of the two Command+B sends the show to.
     var liveTo = C.liveToAudio
     var picture = C.pictureCard
@@ -380,6 +388,7 @@ final class Board {
         d["video_host"] = videoHost
         d["video_name"] = videoName
         d["video_key"] = videoKey
+        d["mac_video_key_server"] = videoKeyFor
         d["live_to"] = liveTo
         d["picture"] = picture
         d["picture_file"] = pictureFile
@@ -685,6 +694,7 @@ final class Board {
             "stream_title_format", "stream_stations",
             "ask_before_live",
             "video_server", "video_host", "video_name", "video_key", "live_to",
+            "mac_video_key_server",
             "picture", "picture_file", "picture_clock", "camera", "screen",
             "split_corner", "text_places", "colour_background", "colour_text",
             "colour_accent", "vision_provider", "vision_model",
@@ -842,6 +852,16 @@ final class Board {
         b.videoHost = Board.rtmpAddress(b.videoHost)
         if b.videoHost.isEmpty {
             b.videoHost = C.rtmpIngest[b.videoServer] ?? ""
+        }
+        // Whose the board's key is. Recorded when the Mac wrote it; otherwise
+        // the platform the board was saved with, which is the one it was
+        // typed for.
+        if b.videoKey.isEmpty {
+            b.videoKeyFor = ""
+        } else if let owner = dict["mac_video_key_server"] as? String, !owner.isEmpty {
+            b.videoKeyFor = owner
+        } else {
+            b.videoKeyFor = Secrets.videoStation(server: b.videoServer, host: b.videoHost)
         }
 
         let picture = dict["picture"] as? String ?? ""
@@ -1068,7 +1088,12 @@ final class Board {
         // Only when the station has one: a station saved before 3.8.2 has no
         // channel name, and that is not the same as asking for none.
         if let v = station["video_name"] as? String { videoName = v }
-        if let v = station["video_key"] as? String { videoKey = v }
+        if let v = station["video_key"] as? String {
+            videoKey = v
+            // A station's key is the key of the platform that station names.
+            videoKeyFor = v.isEmpty ? "" : Secrets.videoStation(server: videoServer,
+                                                                host: videoHost)
+        }
         if let v = station["live_to"] as? String, C.liveTo.contains(v) { liveTo = v }
         if let raw = station["picture"], !(raw is NSNull) {
             let v = raw as? String ?? ""
@@ -1226,6 +1251,7 @@ final class Board {
         videoHost = other.videoHost
         videoName = other.videoName
         videoKey = other.videoKey
+        videoKeyFor = other.videoKeyFor
         liveTo = other.liveTo
         picture = other.picture
         pictureFile = other.pictureFile
@@ -1269,14 +1295,32 @@ final class Board {
     /// so on a machine whose store refused a write the box came up empty over
     /// a key that was working, and OK, seeing an empty box, forgot it.
     func videoKeyInForce() -> String {
-        Board.keyInForce(keychain: Secrets.fetchVideoKey(
-            server: videoServer, host: videoHost, stationName: stream.name),
-            board: videoKey)
+        videoKeyInForce(server: videoServer, host: videoHost)
     }
 
-    /// The read order, as arithmetic, so it can be asserted.
-    static func keyInForce(keychain: String, board: String) -> String {
-        keychain.isEmpty ? board : keychain
+    /// The key in force for a platform that may not be the board's own yet:
+    /// Preferences asks this as the platform popup moves.
+    func videoKeyInForce(server: String, host: String) -> String {
+        Board.keyInForce(keychain: Secrets.fetchVideoKey(
+            server: server, host: host, stationName: stream.name),
+            board: videoKey, boardFor: videoKeyOwner,
+            station: Secrets.videoStation(server: server, host: host))
+    }
+
+    /// Whose the board key is, never empty while there is a key.
+    var videoKeyOwner: String {
+        if videoKey.isEmpty { return "" }
+        return videoKeyFor.isEmpty ? Secrets.videoStation(server: videoServer, host: videoHost)
+                                   : videoKeyFor
+    }
+
+    /// The read order, as arithmetic, so it can be asserted. The board's key
+    /// is offered ONLY to the platform it was saved for (audit 1, finding 5),
+    /// the rule `Secrets.fetchVideoKey` already keeps for the keychain.
+    static func keyInForce(keychain: String, board: String, boardFor: String,
+                           station: String) -> String {
+        if !keychain.isEmpty { return keychain }
+        return !board.isEmpty && boardFor == station ? board : ""
     }
 
     // ------------------------------------------------------ the address ---

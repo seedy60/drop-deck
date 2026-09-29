@@ -9,6 +9,51 @@
 // sentences, and the decisions.
 
 import Foundation
+import Network
+
+/// A source server on this machine's loopback that answers every connection
+/// with one status line, and counts the connections. No network beyond
+/// 127.0.0.1 is touched.
+final class StatusLineServer {
+    private let listener: NWListener
+    private let queue = DispatchQueue(label: "app.tgstudios.dropdeck.selftest.status")
+    private let lock = NSLock()
+    private var held: [NWConnection] = []
+    private(set) var port = 0
+    private var count = 0
+    var connections: Int { lock.lock(); defer { lock.unlock() }; return count }
+
+    init?(answer: String) {
+        let parameters = NWParameters.tcp
+        parameters.requiredInterfaceType = .loopback
+        guard let made = try? NWListener(using: parameters, on: .any) else { return nil }
+        listener = made
+        let reply = Data(answer.utf8)
+        made.newConnectionHandler = { [weak self] connection in
+            guard let self else { return }
+            self.lock.lock(); self.count += 1; self.held.append(connection); self.lock.unlock()
+            connection.start(queue: self.queue)
+            connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { _, _, _, _ in
+                connection.send(content: reply, completion: .contentProcessed { _ in })
+            }
+        }
+        let ready = DispatchSemaphore(value: 0)
+        made.stateUpdateHandler = { state in
+            if case .ready = state { ready.signal() }
+            if case .failed = state { ready.signal() }
+        }
+        made.start(queue: queue)
+        _ = ready.wait(timeout: .now() + 3)
+        guard let bound = made.port?.rawValue, bound > 0 else { made.cancel(); return nil }
+        port = Int(bound)
+    }
+
+    func stop() {
+        listener.cancel()
+        lock.lock(); let open = held; held = []; lock.unlock()
+        for c in open { c.cancel() }
+    }
+}
 
 extension SelfTest {
 
@@ -297,6 +342,100 @@ extension SelfTest {
                   Retry.isFatal(fault, attempts: attempts) == fatal)
         }
 
+        // Audit 1, finding 1: what Windows retries is retried, and the
+        // decision is taken from the REAL mapping, not a fault built by hand.
+        // `Streamer.fault(answer:)` is what `connect()` asks of the server's
+        // status line; `RTMPError.fault` is what the video streamer asks of
+        // what `RTMPClient.connect()` throws; `RTMPClient.saying` is the
+        // sentence a server's refusal is turned into.
+        let status: [(String, String, Int, Bool?)] = [
+            ("a 401 wrong password", "HTTP/1.1 401 Unauthorized\r\n\r\n", 3, true),
+            ("a 404 missing mount", "HTTP/1.0 404 File Not Found\r\n\r\n", 3, true),
+            ("a 403 mount in use at Option Shift B", "HTTP/1.0 403 Forbidden\r\n\r\n", 1, false),
+            ("a 403 mount in use on a reconnect", "HTTP/1.0 403 Forbidden\r\n\r\n", 3, false),
+            ("a harbor saying Mountpoint in use", "HTTP/1.0 500 Mountpoint in use\r\n\r\n", 2, false),
+            ("an OK", "HTTP/1.0 200 OK\r\n\r\n", 1, nil),
+        ]
+        for (name, line, attempts, fatal) in status {
+            let fault = Streamer.fault(answer: line)
+            if let fatal {
+                check("radio: \(name) \(fatal ? "stops" : "keeps trying") on attempt \(attempts)",
+                      fault.map { Retry.isFatal($0, attempts: attempts) } == fatal,
+                      "\(String(describing: fault))")
+            } else {
+                check("radio: \(name) is no fault at all", fault == nil)
+            }
+        }
+        let rtmp: [(String, RTMPError, Int, Bool)] = [
+            ("a key refused by its code", .refused(RTMPClient.saying(
+                code: "NetStream.Publish.BadName", description: "Publish Rejected: Invalid URL")),
+             3, true),
+            ("a Connect.Rejected", .refused(RTMPClient.saying(
+                code: "NetConnection.Connect.Rejected")), 2, true),
+            ("a generic _error on a reconnect", .refused(RTMPClient.saying(
+                code: "NetConnection.Connect.Failed", description: "Connection failed.")), 3, false),
+            ("a generic _error at Command B, which Windows also retries",
+             .refused(RTMPClient.saying(code: "NetConnection.Connect.Failed")), 1, false),
+            ("an _error whose words name the stream key", .refused(RTMPClient.saying(
+                code: "Some.Code", description: "Invalid stream key")), 3, true),
+        ]
+        for (name, error, attempts, fatal) in rtmp {
+            check("video: \(name) \(fatal ? "stops" : "keeps trying") on attempt \(attempts)",
+                  Retry.isFatal(error.fault, attempts: attempts) == fatal, error.description)
+        }
+        check("the words are Windows' REFUSED, in Windows' order",
+              Retry.refusedWords == ["password", "no mount point by that name", "stream key",
+                                     "there is no stream key", "there is no server address",
+                                     "not an rtmp one", "no sound ever reached"])
+
+        // And on the real radio streamer, against a server on this machine
+        // that answers 403 to every connection: it tries again rather than
+        // going FAILED mid show.
+        if let busy = StatusLineServer(answer: "HTTP/1.0 403 Forbidden\r\nContent-Length: 0\r\n\r\n") {
+            let group403 = MixerGroup(mainDeviceUID: nil, bankDevices: [:])
+            var mountInUse = StreamSettings()
+            mountInUse.host = "127.0.0.1"
+            mountInUse.port = busy.port
+            mountInUse.mount = "/live"
+            let radio403 = Streamer()
+            var everFailed = false
+            _ = radio403.start(group: group403, settings: mountInUse)
+            let by403 = Date().addingTimeInterval(6)
+            while Date() < by403 && radio403.attempts < 2 {
+                if radio403.state == .failed { everFailed = true; break }
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            if radio403.state == .failed { everFailed = true }
+            check("a real 403 from a real socket is tried again, not FAILED",
+                  !everFailed && radio403.attempts >= 2 && busy.connections >= 2,
+                  "\(radio403.state) after \(radio403.attempts) attempts, "
+                  + "\(busy.connections) connections: \(radio403.detail)")
+            radio403.stop(group: group403)
+            group403.stop()
+            busy.stop()
+        } else {
+            check("a loopback server for the 403 check could be opened", false)
+        }
+
+        // Audit 1, finding 7: the status line and the microphone warning
+        // know about the video streamer.
+        check("the status line says a video broadcast is on air",
+              MainWindow.airStatus(radio: .off, video: .live) == "VIDEO ON AIR")
+        check("the radio's words are unchanged",
+              MainWindow.airStatus(radio: .live, video: .off) == "ON AIR"
+                && MainWindow.airStatus(radio: .off, video: .off) == "Off air")
+        check("and both at once are both said",
+              MainWindow.airStatus(radio: .live, video: .live) == "ON AIR, RADIO AND VIDEO"
+                && MainWindow.airStatus(radio: .live, video: .retrying)
+                    == "RADIO ON AIR, VIDEO OFF AIR, TRYING AGAIN")
+        check("a microphone kept off the air is warned about on a video broadcast",
+              MainWindow.micOffAirNote(sendMic: false, streaming: true, recording: false)
+                == "Your microphone is NOT going to the stream. "
+                 + "Preferences, Streaming, put the microphone on the air")
+        check("and not when it is going out",
+              MainWindow.micOffAirNote(sendMic: true, streaming: true, recording: true) == nil
+                && MainWindow.micOffAirNote(sendMic: false, streaming: false, recording: false) == nil)
+
         // W384-16. The two sentences, and when.
         check("no silence is said inside the limit",
               SilenceWatch.fault(idle: C.streamSilenceTimeout - 0.1, mediaBytes: 0) == nil)
@@ -357,6 +496,24 @@ extension SelfTest {
         check("and says why in Windows' words",
               failing.detail.hasPrefix("that server address is not an RTMP one"), failing.detail)
         failing.stop(group: group)
+
+        // Audit 1, finding 12: an encoder that will not start lets go of the
+        // programme bus too. A frame no encoder can make fails before any
+        // connection, on the real streamer.
+        let leakGroup = MixerGroup(mainDeviceUID: nil, bankDevices: [:])
+        var noPicture = settings
+        noPicture.width = 0
+        noPicture.height = 0
+        let early = VideoStreamer()
+        _ = early.start(group: leakGroup, settings: noPicture)
+        let byEarly = Date().addingTimeInterval(5)
+        while Date() < byEarly && (early.state != .failed || !leakGroup.taps.isEmpty) {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+        }
+        check("a video streamer that fails before connecting lets go of the bus",
+              early.state == .failed && leakGroup.taps.isEmpty && early.attempts == 0,
+              "\(early.state), bus still held: \(!leakGroup.taps.isEmpty), \(early.detail)")
+        leakGroup.stop()
 
         // M5 on the radio streamer, again with no network: a port that is not
         // valid set FAILED and was overwritten with RETRYING on the next line.

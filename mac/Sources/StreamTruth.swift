@@ -45,6 +45,32 @@ enum StreamFault: Equatable {
 /// for ever from the very first attempt, and the radio streamer set FAILED for
 /// a wrong password and then overwrote it with RETRYING on the next line (M5).
 enum Retry {
+    /// Windows' `streamout.REFUSED`, word for word: a sentence containing any
+    /// of these is the far end saying no, on ANY attempt.
+    ///
+    /// **Asked only of a refusal the Mac cannot sort by its kind**: a server's
+    /// `_error` or error `onStatus` whose code says nothing about the key.
+    /// Windows hears those as "<host> said: ..." and retries them unless the
+    /// words name a password or a key, so a transient `_error` on the way
+    /// back from a dropped connection does not end a working show. The Mac
+    /// used to call every one of them fatal (audit 1, finding 1).
+    static let refusedWords = [
+        "password",
+        "no mount point by that name",
+        "stream key",
+        "there is no stream key",
+        "there is no server address",
+        "not an rtmp one",
+        "no sound ever reached",
+    ]
+
+    /// A refusal, sorted by what it says: fatal when it names something
+    /// Windows' REFUSED names, otherwise a drop worth another attempt.
+    static func sortRefusal(_ said: String) -> StreamFault {
+        let low = said.lowercased()
+        return refusedWords.contains { low.contains($0) } ? .refused(said) : .dropped(said)
+    }
+
     static func isFatal(_ fault: StreamFault, attempts: Int) -> Bool {
         switch fault {
         case .refused, .noSound:

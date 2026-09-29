@@ -89,9 +89,15 @@ enum RTMPError: Error, CustomStringConvertible {
 
     /// What a streamer should do about it. A refusal is the far end saying
     /// no, and saying it again will not help; see `Retry.isFatal`.
+    ///
+    /// A server's own refusal is sorted by its words, as Windows sorts it
+    /// (`Retry.sortRefusal`): one naming the stream key stops, and a generic
+    /// `_error` is retried, because on a reconnect it is as often the server
+    /// still tidying up the last connection as a real no.
     var fault: StreamFault {
         switch self {
-        case .badURL, .notRTMP, .refused, .keyRefused: return .refused(description)
+        case .refused(let why): return Retry.sortRefusal(why)
+        case .badURL, .notRTMP, .keyRefused: return .refused(description)
         case .notFound: return .notFound(description)
         default: return .dropped(description)
         }

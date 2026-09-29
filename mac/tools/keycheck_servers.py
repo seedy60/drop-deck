@@ -34,6 +34,12 @@ Modes:
     huge               answers the handshake, then after connect declares a
                        16 MB command message and starts sending it.
     icecast401         an HTTP source server that refuses the password.
+    icecast403         an HTTP source server that answers 403, which is what
+                       Icecast says while it still holds the last connection
+                       on the mount: a reconnect lands on it after a blip.
+    error_connect      answers connect with a plain `_error`, code
+                       NetConnection.Connect.Failed, nothing about a key: the
+                       kind of refusal Windows retries.
 
 Nothing here touches the internet.
 """
@@ -235,7 +241,7 @@ class Server:
     def _serve(self, conn):
         conn.settimeout(30)
         try:
-            if self.mode == "icecast401":
+            if self.mode in ("icecast401", "icecast403"):
                 self._icecast(conn)
             else:
                 self._rtmp(conn)
@@ -259,7 +265,10 @@ class Server:
                 return
             data += block
         self.record["commands"].append(data.split(b" ", 1)[0].decode("ascii", "replace"))
-        conn.sendall(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+        if self.mode == "icecast403":
+            conn.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+        else:
+            conn.sendall(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
 
     def _rtmp(self, conn):
         peer = _Peer(conn, self.record)
@@ -284,6 +293,13 @@ class Server:
                 if self.mode == "huge":
                     self._huge(peer)
                     return
+                if self.mode == "error_connect":
+                    peer.send(message(COMMAND, amf_string("_error") + amf_number(txn)
+                                      + amf_null()
+                                      + amf_object([("level", "error"),
+                                                    ("code", "NetConnection.Connect.Failed"),
+                                                    ("description", "Connection failed.")])))
+                    continue
                 peer.send(message(5, struct.pack(">I", 2500000), 2))
                 peer.send(message(COMMAND, amf_string("_result") + amf_number(txn)
                                   + amf_object([("fmsVer", "FMS/3,5,7,7009"),

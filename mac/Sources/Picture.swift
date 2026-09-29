@@ -392,6 +392,11 @@ final class FallbackSource: PictureSource {
     var restart: (PictureSource) -> Void = { source in
         DispatchQueue.global(qos: .userInitiated).async { source.start() }
     }
+    /// Closed for good. A retry asked for after this is not made, and the
+    /// camera and the screen refuse a start that arrives late anyway (audit 1,
+    /// finding 9): a restart queued just before the feed replaced this source
+    /// used to open a capture session on a source nobody held any more.
+    private var closed = false
 
     init(primary: PictureSource, backup: PictureSource,
          onFallback: @escaping (String) -> Void = { _ in }) {
@@ -445,7 +450,7 @@ final class FallbackSource: PictureSource {
     private func decide(width: Int, height: Int, said: inout String?) -> CVPixelBuffer? {
         let at = now()
         if fallenBack {
-            if (at - triedAt) >= C.pictureRetrySeconds {
+            if (at - triedAt) >= C.pictureRetrySeconds && !closed {
                 triedAt = at
                 // START IT AGAIN FIRST (W381-32). A camera unplugged, taken by
                 // another program or reset by its driver leaves its session
@@ -535,6 +540,7 @@ final class FallbackSource: PictureSource {
     }
 
     func close() {
+        gate.lock(); closed = true; gate.unlock()
         primary.close()
         backup.close()
     }

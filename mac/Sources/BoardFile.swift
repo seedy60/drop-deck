@@ -28,6 +28,11 @@ enum BoardFiles {
     /// measured 43.8 seconds for a dead share to answer, before the window
     /// exists. `C.BOARD_REACH_SECONDS`.
     static let reachSeconds = 2.0
+    /// How long a remembered board is given to be READ, once it is known to
+    /// be there. Longer than the reach, because a real board over a slow
+    /// share takes a moment; still a limit, because a share that goes away
+    /// between the two questions blocks the read as long as the stat.
+    static let readSeconds = 5.0
 
     /// How long after the app comes back before looking at the board's file.
     /// VoiceOver is announcing the window at exactly that moment, and
@@ -110,6 +115,29 @@ enum BoardFiles {
         DispatchQueue.global(qos: .userInitiated).async {
             let there = exists(path)
             answer.lock.lock(); answer.value = there; answer.lock.unlock()
+            done.signal()
+        }
+        guard done.wait(timeout: .now() + timeout) == .success else { return nil }
+        answer.lock.lock(); defer { answer.lock.unlock() }
+        return answer.value
+    }
+
+    /// `Board.read`, with a time limit. Nil when it did not answer in time
+    /// (audit 1, finding 10): the remembered board was asked whether it was
+    /// there with a limit and then read with none, so a network volume going
+    /// away between the two still froze the start.
+    static func readQuickly(_ path: String, timeout: Double = readSeconds,
+                            read: @escaping (String) -> Result<Board, BoardReadFailure> = {
+                                Board.read($0) }) -> Result<Board, BoardReadFailure>? {
+        final class Answer: @unchecked Sendable {
+            let lock = NSLock()
+            var value: Result<Board, BoardReadFailure>?
+        }
+        let answer = Answer()
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let got = read(path)
+            answer.lock.lock(); answer.value = got; answer.lock.unlock()
             done.signal()
         }
         guard done.wait(timeout: .now() + timeout) == .success else { return nil }
@@ -254,6 +282,8 @@ enum BoardFiles {
     /// directly, as Windows does.
     static func loadStartup(configDir: String, demoPath: String?,
                             reach: (String) -> Bool? = { existsQuickly($0) },
+                            readRemembered: (String) -> Result<Board, BoardReadFailure>? = {
+                                readQuickly($0) },
                             now: Date = Date()) -> Startup {
         let usual = defaultBoardPath(configDir: configDir)
         var candidates: [(String, Bool)] = []
@@ -275,7 +305,20 @@ enum BoardFiles {
                 }
                 continue
             }
-            switch Board.read(path) {
+            // The remembered one is READ with a limit too; the usual one is
+            // read directly, as Windows does.
+            let got: Result<Board, BoardReadFailure>
+            if wasRemembered {
+                guard let answered = readRemembered(path) else {
+                    notes.append(notReached(path, missing: nil))
+                    pinned = path
+                    continue
+                }
+                got = answered
+            } else {
+                got = Board.read(path)
+            }
+            switch got {
             case .success(let board):
                 if !notes.isEmpty { notes.append(openedInstead(path)) }
                 return Startup(board: board, note: notes.joined(separator: ". "),
@@ -456,16 +499,47 @@ final class BoardKeeper {
     /// shows a box when the file will not load; closing the box brought the
     /// window back, which asked again, and the box came back for ever. Mark
     /// found it with a board holding one stray comma.
-    func comingBack(path: String, changed: Bool, now: DiskStamp?, busy: Bool) -> ComingBack {
-        guard changed, Board.samePath(board.path, path) else { return .nothing }
-        let version = now.map { $0.hash } ?? "unreadable \(path)"
+    func comingBack(_ look: Look, busy: Bool) -> ComingBack {
+        let path = look.path
+        guard look.changed, Board.samePath(board.path, path) else { return .nothing }
+        // **Stale: the app has written the file itself since the look began**
+        // (audit 1, finding 10). The look compared the file with what was
+        // known BEFORE it left the main thread; an autosave in between makes
+        // the app's own write look like somebody else's, which said "changed
+        // outside Drop Deck" about nothing, or reloaded the board for no
+        // reason. The next look, with what is known now, is the one to trust.
+        guard board.disk == look.knowledge else { return .nothing }
+        let version = look.now.map { $0.hash } ?? "unreadable \(path)"
         if version == seenVersion { return .nothing }
         seenVersion = version
         if busy || board.dirty { return .say(BoardFiles.changedWhileBusy(path)) }
-        switch Board.read(path) {
-        case .success(let fresh): return .load(fresh)
-        case .failure(let failure):
+        // Read on the look's own thread, never here: this runs on the main
+        // one, and a board on a network volume that has gone away can take
+        // most of a minute to answer.
+        switch look.read {
+        case .success(let fresh)?: return .load(fresh)
+        case .failure(let failure)?:
             return .say(BoardFiles.changedAndUnreadable(path, failure))
+        case nil:
+            return .say(BoardFiles.changedAndUnreadable(path, .missing))
         }
+    }
+
+    /// Everything `comingBack` needs to know about the file, found out on any
+    /// thread but the main one: whether it changed since `knowledge`, what it
+    /// is now, and what reading it gives. Nothing here touches the board.
+    struct Look {
+        let path: String
+        let knowledge: DiskKnowledge?
+        let changed: Bool
+        let now: DiskStamp?
+        let read: Result<Board, BoardReadFailure>?
+    }
+
+    static func look(path: String, knowledge: DiskKnowledge?) -> Look {
+        let changed = Board.changedOnDisk(path: path, knowledge: knowledge)
+        return Look(path: path, knowledge: knowledge, changed: changed,
+                    now: changed ? Board.diskStamp(path) : nil,
+                    read: changed ? Board.read(path) : nil)
     }
 }

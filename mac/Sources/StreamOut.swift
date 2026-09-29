@@ -883,20 +883,37 @@ final class Streamer {
         // insists on a reply before sending would hang on a harbor that sends
         // none.
         let answer = readAnswer(timeout: 3.0)
-        if let answer, !answer.isEmpty {
-            let head = answer.split(separator: "\r\n").first.map(String.init) ?? answer
-            var refused: String?
-            if head.contains("401") || head.lowercased().contains("unauthor") {
-                refused = "the server refused the password"
-            } else if head.contains("403") {
-                refused = "the server refused the mount point"
-            } else if head.contains("404") {
-                refused = "the server has no such mount point"
-            }
-            if let refused {
-                dropConnection()
-                return .refused(refused)
-            }
+        if let answer, let fault = Streamer.fault(answer: answer) {
+            dropConnection()
+            return fault
+        }
+        return nil
+    }
+
+    /// What the server's answer to the source request means, or nil when it
+    /// took it. `connect()` asks this and nothing else, so the checks can
+    /// hold the real mapping.
+    ///
+    /// **A 403 is NOT a refusal on any attempt** (audit 1, finding 1). It is
+    /// what Icecast says while it still holds the last connection on the
+    /// mount, for its source timeout of about ten seconds, which is exactly
+    /// where a reconnect after a Wi-Fi blip lands. Windows' `_explain` calls it
+    /// "the server refused the mount point, which usually means something else
+    /// is already connected to it" and `streamout.REFUSED` does not contain
+    /// that sentence, so Windows retries it; the Mac ended the show instead.
+    /// A password and a missing mount point stay fatal, as they are there.
+    static func fault(answer: String) -> StreamFault? {
+        guard !answer.isEmpty else { return nil }
+        let head = answer.split(separator: "\r\n").first.map(String.init) ?? answer
+        let low = head.lowercased()
+        if head.contains("401") || low.contains("unauthor") {
+            return .refused("the server refused the password")
+        }
+        if head.contains("403") || low.contains("forbidden") || low.contains("in use") {
+            return .dropped("the server refused the mount point")
+        }
+        if head.contains("404") {
+            return .refused("the server has no such mount point")
         }
         return nil
     }

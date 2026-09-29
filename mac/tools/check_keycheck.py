@@ -292,6 +292,28 @@ def main():
         check("never overwritten with trying again",
               not any(s.startswith("retrying") for s in result["states"]), result["states"])
 
+        print("")
+        print("Refusals Windows retries are retried (audit 1, finding 1)")
+        with Server("icecast403") as server:
+            result = run(binary, "radio", "127.0.0.1", server.port, 4)
+            server.settle(0.5)
+            connections = server.record["connections"]
+        check("a 403 mount in use is tried again, not FAILED",
+              not any(s.startswith("failed") for s in result["states"])
+              and any(s.startswith("retrying") for s in result["states"]), result["states"])
+        check("on another connection", connections >= 2 and result["attempts"] >= 2,
+              "%d connections, %d attempts" % (connections, result["attempts"]))
+
+        with Server("error_connect") as server:
+            result = run(binary, "video", server.url, "a-key", "rtmp", 4)
+            server.settle(0.5)
+            connections = server.record["connections"]
+        check("a plain _error that says nothing of the key is tried again, not FAILED",
+              not any(s.startswith("failed") for s in result["states"])
+              and any(s.startswith("retrying") for s in result["states"]), result["states"])
+        check("on another connection", connections >= 2 and result["attempts"] >= 2,
+              "%d connections, %d attempts" % (connections, result["attempts"]))
+
     print("")
     if problems:
         print("%d check%s failed." % (len(problems), "" if len(problems) == 1 else "s"))
