@@ -8,7 +8,7 @@ They are muscle memory and they are not up for redesign.
 from . import audiofile as _audiofile
 
 APP_NAME = "TG Drop Deck"
-APP_VERSION = "3.8.4"
+APP_VERSION = "3.9.0"
 VENDOR = "TG Studios"
 TAGLINE = "An accessible soundboard for podcasts, radio and live shows."
 
@@ -100,7 +100,8 @@ SPEECH_LEVELS = (SPEECH_ALL, SPEECH_ESSENTIAL, SPEECH_NONE)
 SPEECH_LABELS = (
     "Everything, including confirmations and bank hints",
     "Only what I cannot hear or read for myself",
-    "Nothing but the answers to what I ask, such as Ctrl+L",
+    "Nothing but the answers to what I ask, such as Ctrl+L, and whether a "
+    "recording started or stopped",
 )
 DEFAULT_SPEECH_LEVEL = SPEECH_ALL
 
@@ -391,6 +392,32 @@ BOARD_CHECK_DELAY_MS = 500
 #: happens before the window exists.
 BOARD_REACH_SECONDS = 2.0
 
+#: Opening a board looks for its missing sounds in the board's own folder,
+#: because that is where they are when a board has been carried to another
+#: computer in a cloud folder. Ali Moosa, 14 October 2026: a board saved to
+#: Google Drive opened elsewhere with its whole playlist missing. The look is
+#: bounded three ways, because a board sitting at the top of somebody's Drive
+#: has the whole Drive under it: this many seconds, this many folders deep,
+#: and this many entries, whichever comes first.
+BESIDE_SEARCH_SECONDS = 2.0
+BESIDE_SEARCH_DEPTH = 3
+BESIDE_SEARCH_ENTRIES = 20000
+
+#: The folder an exported board keeps its sounds in, beside the board file.
+EXPORT_SOUNDS_FOLDER = "Sounds"
+
+#: A long export says how far along it is: not in its first few seconds, and
+#: then no more often than this. By the clock, because a fast disk got
+#: through ten per cent steps in a fifth of a second.
+EXPORT_FIRST_PROGRESS_SECONDS = 3.0
+EXPORT_PROGRESS_EVERY_SECONDS = 5.0
+
+#: Speech that follows a menu closing within this many seconds waits
+#: `AFTER_MENU_SPEECH_MS`, so the screen reader's reading of where focus
+#: landed does not cut it off. See `DropDeckFrame.announce_recording`.
+AFTER_MENU_SECONDS = 0.5
+AFTER_MENU_SPEECH_MS = 400
+
 #: How many device slots to walk when PortAudio cannot hand the whole list
 #: over in one go. Far more than any machine has; the walk stops at the first
 #: index past the end.
@@ -552,7 +579,11 @@ A BEEP BEFORE A TRACK ENDS
   not get one.
 
 RECORDING THE SHOW
-  Ctrl+R starts and stops it. It records the same mix that goes on air: every
+  Ctrl+R starts and stops it, and it says Recording started and Recording
+  stopped at every speech level, because a file being written makes no sound.
+  Alt+Shift+R pauses it and carries on into the same file; nothing that plays
+  while it is paused is in the file. It pauses the picture recording as well,
+  if that is running. It records the same mix that goes on air: every
   sound card, the running order, and your microphone if that is set to go out.
   The cue before a track ends and previews are never in it, because those are
   for you rather than for the show.
@@ -663,6 +694,8 @@ THE MICROPHONE
                             Ctrl+M for itself
   Ctrl+Shift+M              Which microphone, how much gain, which output
                             you hear yourself on, and whether you do
+  Microphone on and Microphone settings are on the On air menu, under
+  Microphone.
 
   While the microphone is ON, the beds and the playlist duck out of the way,
   and they come back up the moment you turn it off. That happens because the
@@ -685,7 +718,7 @@ THE MICROPHONE
 
   IF CTRL+M DOES NOTHING AT ALL, another program has probably taken the key
   before Drop Deck can hear it. Drop Deck says so when it starts if it can
-  tell. Alt+Shift+M still works, and so does Microphone on in the Playlist
+  tell. Alt+Shift+M still works, and so does Microphone on in the On air
   menu. With NVDA, press NVDA+1, then Ctrl+M, then NVDA+1 again to turn input
   help off. If NVDA describes a command, an add-on or one of your own input
   gestures has the key.
@@ -771,6 +804,8 @@ GIVING ANOTHER PROGRAM ON THIS MACHINE YOUR SHOW
 
 RECORDING THE PICTURE AS WELL AS THE SOUND
   Ctrl+R                    Record the sound
+  Alt+Shift+R               Pause the recording, and carry on into the same
+                            file. Sound and picture pause together
   Ctrl+Shift+R              Record the picture AND the sound, to one MP4.
                             It does not need you to be on air, and it takes
                             whatever Alt+Shift+V is set to. It says which
@@ -847,6 +882,7 @@ GLOBAL
                             Sounds and beds. The Stop everything button does
                             it in one press
   Ctrl+R                    Start and stop recording
+  Alt+Shift+R               Pause and resume the recording
   F1                        This help
   Help, User manual         The full manual on the web: every feature,
                             every setting, a contents and an FAQ
@@ -886,10 +922,20 @@ FILE
   Ctrl+S                    Save the current board
   Ctrl+F12                  Save the board to a new file
   Ctrl+O                    Open a board
+  File, Export board with its sounds
+                            One folder holding the board and a copy of every
+                            sound it plays, pads, playlist and drops. Put it
+                            in Google Drive, Dropbox or on a stick, and open
+                            the board from it on any computer, the Mac too
   Ctrl+P                    Preferences: output, sounds and beds, playlist,
                             microphone, voice, audio streaming, video
                             streaming, recording, speech and AI provider.
                             Ten tabs, Ctrl+Tab between them
+
+A board opened on another computer looks for its missing sounds in its own
+folder, and the folders under it, before you have to relink anything. Sounds
+kept in the board's folder are saved relative to it, so a board and its
+sounds kept together in a cloud folder open wherever that folder does.
 
 The playlist has its own fader and ducks under sounds and drops, the same
 way the beds do. Escape three times stops it along with everything else.

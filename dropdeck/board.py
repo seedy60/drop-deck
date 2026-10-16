@@ -8,9 +8,13 @@ keeps working.
 from __future__ import annotations
 
 import hashlib
+import collections
+import copy
 import json
 import sys
 import os
+import re
+import threading
 import time
 
 from . import constants as C
@@ -650,6 +654,150 @@ def demo_board_path():
     return os.path.join(app_dir(), "demo", "demo-board.json")
 
 
+# ------------------------------------------------- paths that travel well --
+def _basename(path):
+    """The last part of a path written on EITHER system.
+
+    A board made on the Mac holds "/Users/..." and one made here holds
+    "G:\\My Drive\\...". Both have to give up their file name on both, or a
+    relink compares a whole foreign path against file names and matches
+    nothing, which is exactly what Siena saw on the Mac on 12 October 2026:
+    "16 sounds still missing" with every one of them in the folder she chose.
+    """
+    return re.split(r"[\\/]", (path or "").rstrip("\\/"))[-1]
+
+
+def _portable(path, base):
+    """``path`` relative to ``base`` if it is under it, with forward slashes.
+
+    Forward slashes because the Mac reads them and Windows reads both. A path
+    anywhere else, on another drive or not a full path at all, is handed back
+    as it came.
+    """
+    if not path or not base or not os.path.isabs(path):
+        return path
+    try:
+        full = os.path.abspath(path)
+        if (os.path.normcase(os.path.commonpath([full, base]))
+                != os.path.normcase(os.path.abspath(base))):
+            return path
+        return os.path.relpath(full, base).replace("\\", "/")
+    except ValueError:
+        # A different drive, or a mix of absolute and relative. Not ours to
+        # shorten.
+        return path
+
+
+def _map_sound_paths(data, change):
+    """Rewrite every sound path in a board dict with ``change``. In place."""
+    for entry in data.get("slots") or []:
+        if entry and entry.get("filepath"):
+            entry["filepath"] = change(entry["filepath"])
+    for entry in (data.get("playlist") or {}).get("tracks") or []:
+        if entry and entry.get("filepath"):
+            entry["filepath"] = change(entry["filepath"])
+    drops = data.get("drops") or {}
+    if drops.get("paths"):
+        drops["paths"] = [change(p) for p in drops["paths"]]
+    return data
+
+
+def _index_folder(folder, recursive=True, depth=None, seconds=None,
+                  entries=None, stems=True):
+    """{lowercased name: full path} for files, and the same for folders.
+
+    Matching is by file name and, with ``stems``, by name without its
+    extension for sound files. Folders are indexed separately: a slot that
+    held a folder must be repaired with a folder, or a random pick slot
+    silently becomes a one shot.
+
+    **Breadth first, so where a name appears twice the SHALLOWER one wins.**
+    `os.walk` is depth first, which handed `a\\b\\c\\x.wav` back ahead of
+    `z\\x.wav` (Mark, 16 October 2026). ``depth``, ``seconds`` and
+    ``entries`` bound it and are checked at every entry, not only between
+    folders; left out, it is the whole tree, which is what a relink the user
+    asked for has always done.
+    """
+    index, folders = {}, {}
+    folder = os.path.abspath(folder)
+    deadline = None if seconds is None else time.monotonic() + seconds
+    seen = 0
+    queue = collections.deque([(folder, 0)])
+    while queue:
+        root, level = queue.popleft()
+        try:
+            listing = list(os.scandir(root))
+        except OSError:
+            continue
+        for entry in sorted(listing, key=lambda e: e.name.lower()):
+            seen += 1
+            if entries is not None and seen > entries:
+                return index, folders
+            if deadline is not None and time.monotonic() > deadline:
+                return index, folders
+            name = entry.name
+            try:
+                is_dir = entry.is_dir()
+            except OSError:
+                continue
+            if is_dir:
+                folders.setdefault(name.lower(), entry.path)
+                if recursive and (depth is None or level + 1 < depth):
+                    queue.append((entry.path, level + 1))
+                continue
+            index.setdefault(name.lower(), entry.path)
+            stem, ext = os.path.splitext(name)
+            if stems and ext.lower() in C.AUDIO_EXTENSIONS:
+                index.setdefault(stem.lower(), entry.path)
+    return index, folders
+
+
+def _is_relative(path):
+    """True for a path written relative to its board, on either system.
+
+    `os.path.isabs` alone is not enough here: on Python 3.13 under Windows a
+    Mac path such as "/Users/siena/intro.mp3" is NOT absolute, so it was
+    joined onto the board's drive and saved back as "C:\\Users\\siena\\...",
+    which no Mac can read again. A path starting with a slash of either kind
+    is somebody's absolute path and is kept exactly as written.
+    """
+    return bool(path) and not os.path.isabs(path) and path[0] not in "/\\"
+
+
+class ExportStopped(Exception):
+    """Raised by an export's progress callback to stop it part way."""
+
+
+def _copy_file(source, dest, done, total, progress, block=1024 * 1024):
+    """Copy one file in blocks, reporting the running total. Returns it."""
+    if progress is not None:
+        progress(done, total)
+    temp = dest + ".part"
+    try:
+        with open(source, "rb") as src, open(temp, "wb") as out:
+            while True:
+                chunk = src.read(block)
+                if not chunk:
+                    break
+                out.write(chunk)
+                done += len(chunk)
+                if progress is not None:
+                    progress(done, total)
+        _replace(temp, dest)
+    except BaseException:
+        try:
+            os.remove(temp)
+        except OSError:
+            pass
+        raise
+    try:
+        stat = os.stat(source)
+        os.utime(dest, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    except OSError:
+        pass
+    return done
+
+
 class Board:
     """Everything the user can save, and the rules for loading it back."""
 
@@ -685,6 +833,12 @@ class Board:
         self.playlist = Playlist()
         #: The drops you reach for over and over. Alt+D takes one at random.
         self.drops = DropLibrary()
+        #: How many missing sounds `load` found beside the board by itself.
+        self.found_beside = 0
+        #: What `find_beside` repaired, {(kind, which): (guess, the path the
+        #: file had)}.
+        #: Saved back as the original, because a guess is not a fact.
+        self._guessed = {}
         #: The microphone. Remembered by name, like every other device.
         #: Whether it was ON is deliberately NOT remembered: nothing opens a
         #: microphone except somebody pressing the key for it.
@@ -1022,48 +1176,267 @@ class Board:
         """Point missing slots at matching filenames under ``folder``.
 
         Matching is by filename, then by name with any extension. Returns the
-        list of slots that were repaired.
+        list of slots and playlist tracks that were repaired.
         """
-        index = {}
-        # Folders are indexed separately from files. A slot that held a folder
-        # must be repaired with a folder: pointing it at a file that happens to
-        # share the name would silently turn a random-pick slot into a one-shot.
-        folders = {}
-        walker = os.walk(folder) if recursive else [
-            (folder, os.listdir(folder), os.listdir(folder))]
-        for root, dirs, files in walker:
-            for name in dirs:
-                full = os.path.join(root, name)
-                if os.path.isdir(full):
-                    folders.setdefault(name.lower(), full)
-            for name in files:
-                full = os.path.join(root, name)
-                if not os.path.isfile(full):
-                    continue
-                index.setdefault(name.lower(), full)
-                stem, ext = os.path.splitext(name)
-                if ext.lower() in C.AUDIO_EXTENSIONS:
-                    index.setdefault(stem.lower(), full)
+        index, folders = _index_folder(folder, recursive=recursive)
+        # The user chose this, so what it finds is no longer a guess and is
+        # written down like any other path.
+        self._guessed.clear()
+        return self._relink_from(index, folders)
 
+    @property
+    def missing_count(self):
+        """Every sound this board cannot find: pads, running order and drops.
+
+        "Loaded, 20 sounds" used to count the pads only, so a board whose whole
+        running order was missing opened without a word about it. That is how
+        Ali Moosa's playlist went missing in silence.
+        """
+        return (len(self.missing_slots) + len(self.playlist.missing)
+                + len(self.drops.missing))
+
+    def find_beside(self):
+        """Repair what is missing out of the board's own folder, in memory.
+
+        A board carried to another computer in Google Drive, Dropbox or
+        OneDrive arrives with every path pointing at the computer it came
+        from, and its sounds are usually right beside it. So before anybody
+        is asked to relink by hand, the board looks next to itself.
+
+        Three rules, all from Mark's audit of 16 October 2026:
+
+        **It is a guess, so it is never written down.** `save` puts the
+        original path back for anything repaired here, and the board is not
+        marked changed. Marking it changed stopped a synced board reloading
+        when the other computer saved it, and left a sidecar copy beside it
+        on every close; and writing the guess down replaced a real path on a
+        drive that was only unplugged today with a same named file that
+        happened to be nearby. Each computer looks again when it opens the
+        board, which costs at most `C.BESIDE_SEARCH_SECONDS`.
+
+        **Exact file names only.** No name without its extension, which
+        turned a missing applause.wav into a different applause.flac, and no
+        file for a folder.
+
+        **The window is never held longer than the bound**, whatever the
+        disk does: the look runs on a thread of its own and is abandoned if
+        it has not answered in time, because one folder on a sleeping network
+        drive can take most of a minute to list and the clock inside the walk
+        cannot interrupt that.
+        """
+        if not self.path or not self.missing_count:
+            return []
+        folder = os.path.dirname(os.path.abspath(self.path))
+        found = {}
+
+        def look():
+            try:
+                found["index"] = _index_folder(
+                    folder, depth=C.BESIDE_SEARCH_DEPTH,
+                    seconds=C.BESIDE_SEARCH_SECONDS,
+                    entries=C.BESIDE_SEARCH_ENTRIES, stems=False)
+            except Exception:
+                pass
+
+        worker = threading.Thread(target=look, daemon=True,
+                                  name="dropdeck-beside")
+        worker.start()
+        worker.join(C.BESIDE_SEARCH_SECONDS + 0.5)
+        if "index" not in found:
+            return []
+        index, _folders = found["index"]
+        was_dirty = self.dirty
+        before = {id(s): s.filepath for s in self.slots}
+        before.update({id(t): t.filepath for t in self.playlist.tracks})
+        drops_before = list(self.drops.paths)
+        try:
+            repaired = self._relink_from(index, {}, files_for_folders=False)
+        except Exception:
+            return []
+        # Remembered PER ITEM, not per found file: one file beside the board
+        # can stand in for a playlist track written on a Mac and a drop
+        # written here, and each must get its own path back.
+        for item in repaired:
+            self._guessed[("item", id(item))] = (item.filepath,
+                                                 before.get(id(item)))
+        for at, (old, new) in enumerate(zip(drops_before, self.drops.paths)):
+            if old != new:
+                self._guessed[("drop", at)] = (new, old)
+        self.dirty = was_dirty
+        return repaired
+
+    def _restore_guesses(self, data):
+        """Put the board file's own paths back over `find_beside`'s guesses.
+
+        Only where the item still holds the guess: anything the user has
+        reassigned or relinked since is theirs and is written as it is.
+        """
+        if not self._guessed:
+            return data
+        pairs = ([("item", s, e) for s, e in zip(self.slots,
+                                                 data.get("slots") or [])]
+                 + [("item", t, e) for t, e in zip(
+                     self.playlist.tracks,
+                     (data.get("playlist") or {}).get("tracks") or [])])
+        for kind, item, entry in pairs:
+            held = self._guessed.get((kind, id(item)))
+            if held and entry and entry.get("filepath") == held[0] and held[1]:
+                entry["filepath"] = held[1]
+        drops = (data.get("drops") or {}).get("paths") or []
+        for at, path in enumerate(drops):
+            held = self._guessed.get(("drop", at))
+            if held and path == held[0] and held[1]:
+                drops[at] = held[1]
+        return data
+
+    def _relink_from(self, index, folders, files_for_folders=True):
         repaired = []
         # The playlist is repaired out of the same walk. Two separate hunts
         # through a music library for the same folder is one hunt too many.
         repaired.extend(self.playlist.relink(index))
-        self.drops.relink(index)
+        drops = self.drops.relink(index)
         for slot in self.missing_slots:
-            base = os.path.basename(slot.filepath.rstrip("\\/"))
+            base = _basename(slot.filepath)
             stem = os.path.splitext(base)[0]
             if slot.folder_count is not None:
                 found = folders.get(base.lower())
-            else:
+            elif files_for_folders:
                 found = index.get(base.lower()) or index.get(stem.lower())
+            else:
+                # Exact names only. A pad saved with no folder count may have
+                # been a folder, so a name with no extension is not matched
+                # to a file at all.
+                found = (index.get(base.lower())
+                         if os.path.splitext(base)[1] else None)
             if found:
                 slot.filepath = found
                 slot.scan_folder(force=True)
                 repaired.append(slot)
-        if repaired:
+        if repaired or drops:
             self.dirty = True
         return repaired
+
+    # -------------------------------------------------------------- export --
+    def sound_paths(self):
+        """Every file or folder this board plays, once each, in board order."""
+        seen, out = set(), []
+        for path in ([s.filepath for s in self.slots if s.filepath]
+                     + [t.filepath for t in self.playlist.tracks if t.filepath]
+                     + list(self.drops.paths)):
+            key = os.path.normcase(os.path.abspath(path))
+            if key not in seen:
+                seen.add(key)
+                out.append(path)
+        return out
+
+    def export_with_sounds(self, target, name=None, progress=None,
+                           data=None, paths=None):
+        """Copy this board and every sound it uses into ``target``.
+
+        The board file written there points at the copies by paths RELATIVE
+        to itself, with forward slashes, so the folder opens on any computer
+        and on the Mac as it is: carried in Google Drive, on a USB stick or in
+        a zip. Ali Moosa, 14 October 2026: a board saved to Google Drive
+        reopened without its playlist, because a board only ever held the
+        addresses of its sounds on the computer it was made on.
+
+        The live board is not changed. ``progress(done_bytes, total_bytes)``
+        is called as the copy goes, and may raise `ExportStopped` to stop it.
+        ``data`` and ``paths`` are the board as it was when the export was
+        asked for, taken on the window's thread by the caller: read here, on
+        a worker, a pad added during a long copy went into the board without
+        its sound. A sound that cannot be read is counted as missing and the
+        rest carry on. Returns a dict: ``board`` (the file written),
+        ``copied``, ``missing`` (the paths that could not be found or read,
+        left pointing where they were) and ``bytes``.
+        """
+        if data is None:
+            data = self.to_dict()
+        if paths is None:
+            paths = self.sound_paths()
+        target = os.path.abspath(target)
+        stem = name or os.path.splitext(_basename(self.path or ""))[0] \
+            or "Drop Deck board"
+        board_file = os.path.join(target, stem + ".json")
+        if os.path.exists(board_file):
+            raise FileExistsError("there is already a board called %s there"
+                                  % os.path.basename(board_file))
+        sounds = os.path.join(target, C.EXPORT_SOUNDS_FOLDER)
+        os.makedirs(sounds, exist_ok=True)
+        plan, missing, taken = [], [], set()
+
+        def destination(name_wanted, folder=False):
+            stem, ext = (name_wanted, "") if folder else os.path.splitext(name_wanted)
+            candidate, count = name_wanted, 2
+            while candidate.lower() in taken:
+                candidate = "%s (%d)%s" % (stem, count, ext)
+                count += 1
+            taken.add(candidate.lower())
+            return os.path.join(sounds, candidate)
+
+        mapping = {}
+        for path in paths:
+            key = os.path.normcase(os.path.abspath(path))
+            if os.path.isdir(path):
+                dest_dir = destination(_basename(path), folder=True)
+                mapping[key] = dest_dir
+                try:
+                    names = sorted(os.listdir(path))
+                except OSError:
+                    names = []
+                for item in names:
+                    full = os.path.join(path, item)
+                    if (os.path.splitext(item)[1].lower() in C.AUDIO_EXTENSIONS
+                            and os.path.isfile(full)):
+                        plan.append((full, os.path.join(dest_dir, item)))
+                os.makedirs(dest_dir, exist_ok=True)
+            elif os.path.isfile(path):
+                dest = destination(_basename(path))
+                mapping[key] = dest
+                plan.append((path, dest))
+            else:
+                missing.append(path)
+
+        total = 0
+        for source, _dest in plan:
+            try:
+                total += os.path.getsize(source)
+            except OSError:
+                pass
+        done = 0
+        copied = 0
+        for source, dest in plan:
+            try:
+                size = os.path.getsize(source)
+            except OSError:
+                size = 0
+            try:
+                done = _copy_file(source, dest, done, total, progress)
+                copied += 1
+            except ExportStopped:
+                raise
+            except OSError:
+                # Gone or unreadable since the plan was made. One sound must
+                # not cost the whole export: it is counted as missing and
+                # the board keeps its original path for it.
+                missing.append(source)
+                done += size
+                for key, moved in list(mapping.items()):
+                    if moved == dest:
+                        del mapping[key]
+
+        def carried(path):
+            moved = mapping.get(os.path.normcase(os.path.abspath(path)), path)
+            return _portable(moved, target)
+
+        payload = json.dumps(_map_sound_paths(copy.deepcopy(data), carried),
+                             indent=2)
+        temp = board_file + ".tmp"
+        with open(temp, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        _replace(temp, board_file)
+        return {"board": board_file, "copied": copied, "missing": missing,
+                "bytes": total}
 
     # ------------------------------------------------------------------- io --
     # ------------------------------------------------------------ stations --
@@ -1236,7 +1609,15 @@ class Board:
 
     def save(self, path=None):
         path = path or self.path or default_board_path()
-        payload = json.dumps(self.to_dict(), indent=2)
+        # A sound kept in the board's own folder, or under it, is written
+        # relative to the board, so a board and its sounds kept together in a
+        # cloud folder open on every computer that folder reaches, the Mac
+        # included. Anything elsewhere keeps its full path, as it always did.
+        base = os.path.dirname(os.path.abspath(path))
+        payload = json.dumps(
+            _map_sound_paths(self._restore_guesses(self.to_dict()),
+                             lambda p: _portable(p, base)),
+            indent=2)
         # Write beside the target then swap, so a crash mid-save cannot leave a
         # half-written board where the real one used to be.
         temp = path + ".tmp"
@@ -1555,11 +1936,17 @@ class Board:
         for index in range(C.TOTAL_SLOTS):
             entry = raw[index] if index < len(raw) else None
             slot = Slot.from_dict(index, entry)
-            if slot.filepath and not os.path.isabs(slot.filepath):
+            if slot.filepath and _is_relative(slot.filepath):
                 slot.filepath = os.path.normpath(os.path.join(base, slot.filepath))
             board.slots[index] = slot
         board._adopt_slots()
         board.dirty = False
+        # Counted as what stopped being missing, so the drops library, which
+        # repairs strings rather than slots or tracks, is counted too.
+        before = board.missing_count
+        if before:
+            board.find_beside()
+            board.found_beside = before - board.missing_count
         return board
 
     @property

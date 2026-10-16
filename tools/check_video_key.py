@@ -142,6 +142,10 @@ KEYS = {
             (wx.WXK_CONTROL,), "M"),
     "micalt": ("Alt+Shift+M", "the microphone", "toggle_mic",
                (wx.WXK_ALT, wx.WXK_SHIFT), "M"),
+    # 3.9.0. Siena's pause, on the same Alt+Shift pair Windows uses to
+    # switch keyboard layout, so it is pressed rather than assumed.
+    "pause": ("Alt+Shift+R", "pausing the recording", "toggle_record_pause",
+              (wx.WXK_ALT, wx.WXK_SHIFT), "R"),
 }
 
 

@@ -94,6 +94,25 @@ def walk(menu, path=""):
     return found
 
 
+def headers(menu, path=""):
+    """Every submenu HEADER, with the level it sits on.
+
+    A header answers a mnemonic at its own level like any item does, and
+    `walk` steps straight past it into the submenu, so a header could share a
+    letter with an item beside it and nothing here saw it. On air had "Who is
+    &listening" and "Streaming &location" both on Alt+L from 3.8.2 to 3.9.0,
+    which Windows treats as two items to cycle between, so Alt+L reached
+    neither. Jessica found it by walking the real menu bar.
+    """
+    found = []
+    for item in menu.GetMenuItems():
+        sub = item.GetSubMenu()
+        if sub is not None:
+            found.append((path, item))
+            found.extend(headers(sub, path + item.GetItemLabelText() + " > "))
+    return found
+
+
 def bound_ids():
     """Every id ui.py binds a menu handler to, read out of the source.
 
@@ -173,6 +192,19 @@ for position in range(bar.GetMenuCount()):
     # Within one level the check is unchanged, and that is the half that
     # matters: two items you can see at once must not answer the same key.
     seen_by_level = {}
+    for path, item in headers(menu):
+        text = item.GetItemLabel().split(chr(9))[0]
+        where = "%s > %s%s" % (title, path, item.GetItemLabelText())
+        if "&" not in text:
+            problems["no mnemonic"].append(where)
+            continue
+        seen = seen_by_level.setdefault(path, {})
+        letter = text[text.index("&") + 1].lower()
+        if letter in seen:
+            duplicates.append("%s and %s both use Alt+%s in %s"
+                              % (seen[letter], item.GetItemLabelText(),
+                                 letter.upper(), title))
+        seen[letter] = item.GetItemLabelText()
     for path, item in walk(menu):
         total += 1
         seen = seen_by_level.setdefault(path, {})

@@ -1,5 +1,90 @@
 # Changelog
 
+## 3.9.0 for Windows, 16 October 2026
+
+**A board you can take to another computer, a recording that says it started
+and stopped, and a pause key.**
+
+### Take a board anywhere
+
+A listener saved his board to Google Drive and opened it again, and his whole
+running order came up missing. A board only ever held where its sounds were on
+the computer it was made on, so on any other computer every one of them was
+missing, even with the sounds sitting right beside it.
+
+- **File, Export board with its sounds** makes one folder holding the board
+  and a copy of every sound it plays: pads, folder pads, the running order and
+  the drops library. Put it in Google Drive, Dropbox, OneDrive or on a stick
+  and open the board from it on any computer, the Mac included. It says how
+  much it copied and anything it could not find or read, a big export says how
+  far along it is, and closing the app part way stops it cleanly.
+- **A board opened on another computer looks beside itself first**, in its
+  own folder and the folders just under it, and says how many sounds it found.
+  The look is short and bounded, so a board at the top of a big cloud drive
+  or a sleeping network drive does not hold anything up. It matches exact
+  file names only, and what it finds is never written into the board file:
+  the paths the board came with stay, so the computer it came from still
+  finds its own sounds, and a drive that is only unplugged today keeps its
+  place. Relink is still how you make a new location permanent.
+- **A sound kept in the board's own folder is saved relative to the board**,
+  so a board and its sounds kept together in one cloud folder open wherever
+  that folder does.
+- **Opening a board counts everything that is missing**, the running order and
+  drops as well as the pads. It used to count the pads alone, so a board whose
+  whole playlist was missing said nothing about it.
+- **Relink reads a board made on the Mac** as well as one made here, and a
+  Mac path in a board is kept as a Mac path when the board is saved here,
+  rather than being turned into a Windows one no Mac can read.
+
+### Recording started, recording stopped
+
+A listener on Windows and the Mac reported that starting or stopping a
+recording never said whether it had. On Windows there was a plain fault behind
+it: straight after the sentence about the recording, the app read out the
+file's full path, and that cut the sentence off. Every time, since 3.8.1.
+
+- The path is never read out now.
+- It says **Recording started** and **Recording stopped** first, then the
+  detail, and it says them at every speech level, including none, because a
+  file being written makes no sound.
+- Chosen from the On air menu rather than by its key, the sentence waits for
+  the menu to close, so your screen reader reading where you landed does not
+  talk over it.
+
+### Pause a recording, Alt+Shift+R
+
+Holds the recording and carries on into the same file when you press it
+again. Nothing that plays while it is paused is in the file, the track list
+carries on from where you resume, and a sound and picture recording pause
+together so the two files still line up. On the On air menu as **Pause
+recording**. Pressed for real with Windows' own keyboard layout switch in
+mind: it reaches the app and leaves your layout alone.
+
+### The microphone is on the On air menu
+
+**Microphone on** and **Microphone settings** moved from the Playlist menu to
+the On air menu, under **Microphone**, which is where the Mac has always had
+them. The keys did not change: `Ctrl+M`, `Alt+Shift+M` and `Ctrl+Shift+M`.
+
+On the same menu, **Who is listening** is Alt+T now and **Screen text** is
+Alt+X. Who is listening and Streaming location had both been answering Alt+L
+since 3.8.2, so Alt+L reached neither of them; the check that should have
+caught it never looked at submenus, and does now.
+
+### Smaller things you will hear
+
+- Every sentence after choosing something from a menu now waits for your
+  screen reader to finish saying where you landed, rather than being cut off
+  by it.
+- A long export says how far along it is every few seconds, instead of a
+  burst of percentages on a fast disk.
+- Sentences no longer read out full file paths or ".json", and numbers are
+  said the way a person says them: "1 sound", "2 seconds", not "0 minutes 2
+  seconds" or "1 files".
+- The status bar says RECORDING PAUSED while a recording is paused.
+- The speech level "Nothing but the answers to what I ask" now says that it
+  includes whether a recording started or stopped.
+
 ## 3.8.4 for Mac, 29 September 2026
 
 **Level with Windows again: your stream key can be checked before a show, each

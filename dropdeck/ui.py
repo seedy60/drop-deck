@@ -258,6 +258,10 @@ ID_PL_OPEN = wx.ID_HIGHEST + 54
 ID_REMOVE_SLOT = wx.ID_HIGHEST + 55
 ID_RESTORE_SLOT = wx.ID_HIGHEST + 56
 ID_RESTORE_ALL_SLOTS = wx.ID_HIGHEST + 57
+#: File, Export board with its sounds. Ali Moosa, 14 October 2026.
+ID_EXPORT = wx.ID_HIGHEST + 74
+#: On air, Pause recording. Siena, October 2026.
+ID_RECORD_PAUSE = wx.ID_HIGHEST + 427
 
 #: The two things this window can be showing.
 VIEW_BOARD, VIEW_PLAYLIST = 0, 1
@@ -314,6 +318,80 @@ def _short_reason(exc):
     if isinstance(exc, PermissionError):
         return "Windows would not let Drop Deck open it"
     return "Drop Deck does not recognise what is in it"
+
+
+def _found_beside_sentence(found):
+    """What opening a board repaired on its own, from the board's folder."""
+    return "%s found beside the board" % _count(found, "sound")
+
+
+def _count(number, noun):
+    """'1 sound', '2 sounds'. Never '1 files'."""
+    return "%d %s%s" % (number, noun, "" if number == 1 else "s")
+
+
+def _duration(seconds):
+    """'2 seconds', '1 minute 5 seconds', '1 hour 3 minutes'. No zeros."""
+    seconds = int(seconds)
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return _count(hours, "hour") + (" " + _count(minutes, "minute")
+                                        if minutes else "")
+    if minutes:
+        return _count(minutes, "minute") + (" " + _count(secs, "second")
+                                            if secs else "")
+    return _count(secs, "second")
+
+
+def _size(count):
+    """A size the way it is said: kilobytes, megabytes or gigabytes."""
+    mb = count / (1024.0 * 1024.0)
+    if mb >= 1024:
+        return "%.1f gigabytes" % (mb / 1024.0)
+    if mb >= 10:
+        return "%.0f megabytes" % mb
+    if mb >= 0.1:
+        return "%.1f megabytes" % mb
+    return "%.0f kilobytes" % (count / 1024.0)
+
+
+def _empty_or_absent(path):
+    """Somewhere an export can make its folder: nothing there, or an empty
+    folder. A FILE of that name, or a folder that cannot be read, is not."""
+    if not os.path.exists(path):
+        return True
+    try:
+        return os.path.isdir(path) and not os.listdir(path)
+    except OSError:
+        return False
+
+
+def _short_place(path):
+    """A folder as somebody says it: its name and the folder it is in.
+
+    A whole path read aloud is a drive letter and a run of backslashes. The
+    last two parts are what anybody would say: "My Drive, Ali show".
+    """
+    parts = [p for p in os.path.normpath(path).split(os.sep) if p]
+    if len(parts) >= 2 and not parts[-2].endswith(":"):
+        return "%s, in %s" % (parts[-1], parts[-2])
+    return parts[-1] if parts else path
+
+
+def _is_a_file_name(text):
+    """Is a recorder's detail a file rather than a sentence.
+
+    A recorder reports its path on starting and stopping, and that path,
+    read aloud, cut off the sentence that said what had happened (Siena).
+    A relative recordings folder made it a relative path, so absolute is
+    not enough of a test (Mark): a sentence never ends in a sound file's
+    extension.
+    """
+    from . import recorder as recording
+    text = (text or "").strip()
+    return os.path.isabs(text) or text.lower().endswith(
+        tuple(recording.EXTENSIONS.values()))
 
 
 def _input_name(device):
@@ -1181,9 +1259,13 @@ class DropDeckFrame(wx.Frame):
             bits.append(micdiag.keys_sentence(taken))
         clashes = self._own_key_clashes()
         bits.extend(clashes)
-        missing = len(self.board.missing_slots)
+        found = getattr(self.board, "found_beside", 0)
+        if found:
+            bits.append(_found_beside_sentence(found))
+        missing = self.board.missing_count
         if missing:
-            bits.append(f"{missing} files missing. Use File, relink missing sounds")
+            bits.append("%s missing. Use File, relink missing sounds"
+                        % _count(missing, "file"))
         if not self.mixer.is_running:
             bits.append(f"Audio could not start. {self.mixer.last_error or ''}")
         # A send the board asked for and did not get. _start_send is called
@@ -1424,6 +1506,9 @@ class DropDeckFrame(wx.Frame):
         file_menu.Append(ID_SAVE_AS, "Save board &as...\tCtrl+F12",
                          "Save this board to a file of its own")
         file_menu.Append(wx.ID_OPEN, "&Open board...\tCtrl+O", "Open a saved board")
+        file_menu.Append(ID_EXPORT, "&Export board with its sounds...",
+                         "Copy this board and every sound it plays into one "
+                         "folder that opens on any computer, the Mac included")
         file_menu.Append(ID_IMPORT, "&Import an old soundboard bank...",
                          "Load a bank from The Tony Gebhard Show Soundboard")
         file_menu.Append(ID_DEMO, "Load the &demo pack",
@@ -1540,13 +1625,6 @@ class DropDeckFrame(wx.Frame):
                   "Load an M3U playlist file in place of this one")
         pl.AppendSeparator()
         pl.Append(ID_PL_CLEAR, "Clear the running or&der")
-        pl.AppendSeparator()
-        self.mic_item = pl.AppendCheckItem(
-            ID_MIC_TOGGLE, "&Microphone on\tCtrl+M",
-            "While it is on, the beds and the playlist duck out of the way")
-        pl.Append(ID_MIC_SETTINGS, "Microphone se&ttings...\tCtrl+Shift+M",
-                  "Which microphone, how much gain, which output you hear it "
-                  "on, and whether you hear it at all")
         bar.Append(pl, "P&laylist")
 
         help_menu = wx.Menu()
@@ -1585,7 +1663,7 @@ class DropDeckFrame(wx.Frame):
         air.Append(ID_STREAM_STATUS, "&What the stream is doing\tCtrl+Shift+B",
                    "Whether it is on air, for how long, and whether anything "
                    "has been lost")
-        air.Append(ID_STREAM_STATS, "Who is &listening...\tCtrl+Shift+A",
+        air.Append(ID_STREAM_STATS, "Who is lis&tening...\tCtrl+Shift+A",
                    "How many people are on the stream, and what the server "
                    "thinks is playing")
         # Alt+M for caMera. Not Alt+S: Station already has it on this menu,
@@ -1595,6 +1673,26 @@ class DropDeckFrame(wx.Frame):
                    "Whether you are in shot, centred and lit. It answers "
                    "whether or not you are on air")
         air.AppendSeparator()
+        # The microphone lives here, beside the recording, which is where the
+        # Mac has always had it. It was on the Playlist menu until 3.9.0, and
+        # Siena asked in October 2026 why the two apps put it in different
+        # places. There was no reason: the microphone is part of the show
+        # going out, not of the running order. The keys did not move.
+        #
+        # A submenu, Alt+P, because this level is out of letters: Jessica
+        # found on 16 October 2026 that "Who is &listening" and "Streaming
+        # &location" had both been answering Alt+L since 3.8.2, so Alt+L
+        # reached neither, and the menu test skipped submenu headers and
+        # never saw it. Two items in a submenu give Who is listening the T.
+        mic_menu = wx.Menu()
+        self.mic_item = mic_menu.AppendCheckItem(
+            ID_MIC_TOGGLE, "&Microphone on\tCtrl+M",
+            "While it is on, the beds and the playlist duck out of the way")
+        mic_menu.Append(ID_MIC_SETTINGS,
+                        "Microphone &settings...\tCtrl+Shift+M",
+                        "Which microphone, how much gain, which output you "
+                        "hear it on, and whether you hear it at all")
+        air.AppendSubMenu(mic_menu, "Micro&phone")
         self.record_item = air.Append(
             ID_RECORD, "Start &recording\tCtrl+R",
             "Record the show to a file. It does not need you to be on air")
@@ -1603,6 +1701,10 @@ class DropDeckFrame(wx.Frame):
             + "Ctrl+Shift+R",
             "Record the picture as well as the sound, to one MP4. It does "
             "not need you to be on air")
+        self.record_pause_item = air.Append(
+            ID_RECORD_PAUSE, "Pau&se recording" + chr(9) + "Alt+Shift+R",
+            "Hold the recording without ending it, and carry on into the "
+            "same file. Pauses the sound and the picture recording alike")
         air.Append(ID_SOURCE_CONTROL,
                    "Source &control..." + chr(9) + "Alt+Ctrl+Shift+S",
                    "Mute, solo, rename or remove a source while you are on "
@@ -1622,8 +1724,10 @@ class DropDeckFrame(wx.Frame):
                    "Your brand: the background everything sits on, the "
                    "colour of the words, and the accent. Every choice says "
                    "how well it will read")
+        # Alt+X since 3.9.0, when the microphone came onto this menu and
+        # Microphone settings kept the T it has always had.
         air.Append(ID_SCREEN_TEXT,
-                   "Screen &text..." + chr(9) + "Alt+Shift+T",
+                   "Screen te&xt..." + chr(9) + "Alt+Shift+T",
                    "Your station name, what is playing, a clock or your own "
                    "words, in named places on the picture")
         air.Append(ID_VIDEO_SOURCES,
@@ -1686,6 +1790,8 @@ class DropDeckFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self._on_save_as, id=ID_SAVE_AS)
         self.Bind(wx.EVT_MENU, self._on_open, id=wx.ID_OPEN)
         self.Bind(wx.EVT_MENU, self._on_import, id=ID_IMPORT)
+        self.Bind(wx.EVT_MENU, self._on_export, id=ID_EXPORT)
+        self.Bind(wx.EVT_MENU_CLOSE, self._on_menu_close)
         self.Bind(wx.EVT_MENU, self._on_load_demo, id=ID_DEMO)
         self.Bind(wx.EVT_MENU, self._on_relink, id=ID_RELINK)
         self.Bind(wx.EVT_MENU, self._on_assign_global_hotkey, id=ID_GLOBAL_HOTKEY)
@@ -1768,6 +1874,8 @@ class DropDeckFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.describe_shot, id=ID_SHOT)
         self.Bind(wx.EVT_MENU, self._on_stream_help, id=ID_STREAM_HELP)
         self.Bind(wx.EVT_MENU, lambda _e: self.toggle_recording(), id=ID_RECORD)
+        self.Bind(wx.EVT_MENU, lambda _e: self.toggle_record_pause(),
+                  id=ID_RECORD_PAUSE)
         self.Bind(wx.EVT_MENU, lambda _e: self._open_recordings(),
                   id=ID_RECORD_FOLDER)
         self.Bind(wx.EVT_MENU, self._on_sources, id=ID_SOURCES)
@@ -1895,6 +2003,8 @@ class DropDeckFrame(wx.Frame):
             wx.AcceleratorEntry(wx.ACCEL_CTRL | wx.ACCEL_SHIFT, ord("F"),
                                 ID_SHOT),
             wx.AcceleratorEntry(wx.ACCEL_CTRL, ord("R"), ID_RECORD),
+            wx.AcceleratorEntry(wx.ACCEL_ALT | wx.ACCEL_SHIFT, ord("R"),
+                                ID_RECORD_PAUSE),
             wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_SPACE, ID_STOP_LATEST),
             # Alt+Shift+S manages sources, whatever kind they are: a sound
             # card, a cable, or a program.
@@ -2376,6 +2486,17 @@ class DropDeckFrame(wx.Frame):
         self.status.SetStatusText(text, 1)
 
     def _say(self, text, interrupt=True):
+        # Straight after a menu closes, the screen reader reads where focus
+        # landed, and a sentence spoken at that moment is cut off by it. So
+        # it waits, and then QUEUES behind that reading rather than cutting
+        # it short. Jessica, 16 October 2026: this was in the recording keys
+        # alone, and Microphone on and Go live sit on the same menu.
+        closed = getattr(self, "_menu_closed_at", None)
+        if (closed is not None
+                and time.monotonic() - closed < C.AFTER_MENU_SECONDS):
+            wx.CallLater(C.AFTER_MENU_SPEECH_MS, self.speaker.say, text,
+                         interrupt=False)
+            return
         # Only passed on when it is False, so a stand-in speaker that takes
         # one argument, as the older tests' do, still works.
         if interrupt:
@@ -2397,6 +2518,40 @@ class DropDeckFrame(wx.Frame):
                 and getattr(self.board, "announce_playback", True)):
             self.speaker.say(text)
         self.status.SetStatusText(text, 1)
+
+    def announce_recording(self, short, detail=""):
+        """A recording starting, stopping, pausing or resuming.
+
+        Siena, October 2026, on Windows and the Mac alike: starting or
+        stopping a recording "doesn't actually announce whether the recording
+        has started or stopped". Three things stood between her and the
+        sentence, and each has an answer here.
+
+        **The words.** It opened with "Recording to Drop Deck Stream 004", a
+        file name, so the one fact asked about was never said in as many
+        words. It now opens with ``short``, "Recording started", and the
+        detail follows.
+
+        **The level.** It went through `announce`, which is silent at speech
+        level none. Nothing else in the app says whether a recording is
+        running: a file being written makes no sound, so this is a state that
+        cannot be heard and is answered at every level, the way Ctrl+L is.
+        At none only ``short`` is spoken.
+
+        **The menu.** Chosen from On air rather than by its key, the menu
+        closes, the screen reader reads the focus it lands back on, and that
+        reading cuts this sentence off. So speech straight after a menu
+        closes waits `C.AFTER_MENU_SPEECH_MS`, in `_say`, and queues.
+        """
+        full = "%s. %s" % (short, detail) if detail else short
+        text = short if self._speech_level() == C.SPEECH_NONE else full
+        self._say(text)
+        self.note(full)
+
+    def _on_menu_close(self, event):
+        """Remember when a menu last closed. See `announce_recording`."""
+        self._menu_closed_at = time.monotonic()
+        event.Skip()
 
     def announce(self, text, interrupt=True):
         if self._speech_level() != C.SPEECH_NONE:
@@ -2449,7 +2604,9 @@ class DropDeckFrame(wx.Frame):
             f"Ducking {'on' if self.mixer.ducking else 'off'} (Ctrl+D)   "
             f"Mic {'ON' if self._mic_open() else 'off'} (Ctrl+M)   "
             f"{self._air_label()} (Ctrl+B)"
-            + ("   RECORDING (Ctrl+R)" if self.recording() else "")
+            + (("   RECORDING PAUSED (Alt+Shift+R)"
+                if self.recording_paused() else "   RECORDING (Ctrl+R)")
+               if self.recording() else "")
             + ("   RECORDING PICTURE (Ctrl+Shift+R)"
                if self.recording_video() else "")
             + self._send_label(), 0)
@@ -4465,6 +4622,109 @@ class DropDeckFrame(wx.Frame):
             return
         self._load_into(path, keep_path=False)
 
+    def _export_name(self):
+        """What an exported board and its folder are called."""
+        stem = os.path.splitext(os.path.basename(self.board.path or ""))[0]
+        # The settings folder's own board is board.json, and a folder called
+        # "board" in somebody's Google Drive says nothing about what is in it.
+        if not stem or stem.lower() == "board":
+            stem = "Drop Deck board"
+        return stem
+
+    def _on_export(self, _event=None):
+        """File, Export board with its sounds.
+
+        One folder holding the board and a copy of every sound it plays,
+        written so it opens as it is on any computer. Ali Moosa, 14 October
+        2026: "I exported my soundboard to Google Drive ... It does not import
+        the board with the original files." A board only ever held where its
+        sounds were on the computer it was made on.
+        """
+        if getattr(self, "_exporting", False):
+            self.announce("An export is already going")
+            return
+        paths = self.board.sound_paths()
+        if not paths:
+            self.announce("This board has no sounds to export")
+            return
+        name = self._export_name()
+        with wx.DirDialog(self, "Where should the board and its sounds go? "
+                          "A folder called %s is made there." % name,
+                          style=wx.DD_DEFAULT_STYLE) as dialog:
+            if dialog.ShowModal() != wx.ID_OK:
+                return
+            chosen = dialog.GetPath()
+        target = os.path.join(chosen, name)
+        count = 2
+        while not _empty_or_absent(target):
+            target = os.path.join(chosen, "%s (%d)" % (name, count))
+            count += 1
+        self._run_export(target, name)
+
+    def _run_export(self, target, name):
+        """The copy itself, off the window's thread, with progress spoken."""
+        self._exporting = True
+        self._export_stop = threading.Event()
+        stop = self._export_stop
+        # The board as it is NOW, read here on the window's thread. Read on
+        # the worker at the end of a long copy, a pad added in the meantime
+        # went into the exported board without its sound (Mark).
+        data = self.board.to_dict()
+        paths = self.board.sound_paths()
+        self.announce("Exporting %s" % name)
+        said = {"at": time.monotonic() + C.EXPORT_FIRST_PROGRESS_SECONDS}
+
+        def progress(done, total):
+            # Closing the app mid export stops it cleanly rather than killing
+            # the thread with a half written file on the disk.
+            if stop.is_set():
+                raise board_module.ExportStopped("the app is closing")
+            # Spoken by the CLOCK, not by the byte. A gauge nobody is looking
+            # at is silence and silence is a hang, but Jessica measured the
+            # ten per cent version on a fast disk: nine interrupting lines in
+            # a fifth of a second, cutting off the sentence that said it had
+            # started. Nothing is said in the first few seconds, then no more
+            # often than every few.
+            now = time.monotonic()
+            if total and done < total and now >= said["at"]:
+                said["at"] = now + C.EXPORT_PROGRESS_EVERY_SECONDS
+                wx.CallAfter(self.announce, "Export %d percent"
+                             % int(done * 100 / total))
+
+        def work():
+            try:
+                result = self.board.export_with_sounds(
+                    target, name=name, progress=progress, data=data,
+                    paths=paths)
+            except Exception as exc:
+                wx.CallAfter(self._export_finished, None, target, exc)
+                return
+            wx.CallAfter(self._export_finished, result, target, None)
+
+        threading.Thread(target=work, daemon=True,
+                         name="dropdeck-export").start()
+
+    def _export_finished(self, result, target, error):
+        self._exporting = False
+        if error is not None:
+            # The reason, never a path: an OSError's own text carries the
+            # whole file name, which is a run of backslashes read aloud.
+            reason = (getattr(error, "strerror", None) or str(error)
+                      if not isinstance(error, board_module.ExportStopped)
+                      else "The app is closing")
+            self.announce("The export stopped. %s. Nothing in your board was "
+                          "changed" % reason)
+            return
+        said = ("Export finished: %s, %s, in %s. It opens on any computer"
+                % (_count(result["copied"], "sound"),
+                   _size(result["bytes"]), _short_place(target)))
+        missing = len(result["missing"])
+        if missing:
+            said += (". %d %s could not be found and %s left out"
+                     % (missing, "sound" if missing == 1 else "sounds",
+                        "was" if missing == 1 else "were"))
+        self.announce(said)
+
     def _adopt(self, board):
         """Make ``board`` the live one: rewire every button and every hotkey."""
         self.board = board
@@ -4719,17 +4979,27 @@ class DropDeckFrame(wx.Frame):
             self._pinned_board = None
             remember_board_path(path)
 
-        missing = len(board.missing_slots)
-        tail = f", {missing} files missing" if missing else ""
-        self.announce(f"Loaded {os.path.basename(path)}, "
-                      f"{board.assigned_count} sounds{tail}")
+        # Every kind of sound counts, the running order and the drops too.
+        # This used to count the pads alone, so a board whose whole playlist
+        # was missing opened with "Loaded, 20 sounds" and nothing else.
+        found = getattr(board, "found_beside", 0)
+        tail = ""
+        if found:
+            tail += ". " + _found_beside_sentence(found)
+        missing = board.missing_count
+        if missing:
+            tail += (". %s still missing: File, Relink missing sounds"
+                     % _count(missing, "sound"))
+        # The name without ".json", which is read aloud as "dot json".
+        self.announce("Loaded %s, %s%s"
+                      % (os.path.splitext(os.path.basename(path))[0],
+                         _count(board.assigned_count, "sound"), tail))
 
     def _on_relink(self, _event):
         # The playlist counts too: one walk of the folder repairs both, so a
         # board whose pads are fine but whose running order is not still has
         # something to relink.
-        missing = self.board.missing_slots
-        asked = len(missing) + len(self.board.playlist.missing)
+        asked = self.board.missing_count
         if not asked:
             self.announce_help("Nothing is missing")
             wx.MessageBox("Every sound on this board was found.", "Nothing to relink",
@@ -4776,11 +5046,11 @@ class DropDeckFrame(wx.Frame):
                 self._sync_button(item)
         if any(not isinstance(item, Slot) for item in repaired):
             self.playlist_panel.refresh()
-        still = len(self.board.missing_slots) + len(self.board.playlist.missing)
-        self.announce(f"Relinked {len(repaired)} of {asked}. "
+        still = self.board.missing_count
+        self.announce(f"Relinked {asked - still} of {asked}. "
                       f"{still} still missing" if still
-                      else f"Relinked all {len(repaired)}")
-        if repaired:
+                      else f"Relinked all {asked}")
+        if still < asked:
             self._touch()
 
     # ----------------------------------------------------------- on air --
@@ -4971,9 +5241,11 @@ class DropDeckFrame(wx.Frame):
         # of the show is missing from its own tracklist.
         self._note_current_track()
         self._set_record_label(True)
-        self.announce("Recording to %s. %s"
-                      % (os.path.basename(self.recorder.path or ""),
-                         self.what_is_in_the_recording()))
+        self.announce_recording(
+            "Recording started",
+            "%s. %s" % (os.path.splitext(
+                os.path.basename(self.recorder.path or ""))[0],
+                self.what_is_in_the_recording()))
         self._update_status()
         return True
 
@@ -5050,10 +5322,12 @@ class DropDeckFrame(wx.Frame):
             self.watcher = health.Watcher(on_say=self._on_picture_trouble)
         self._start_framing()
         self._set_video_record_label(True)
-        self.announce("Recording picture and sound to %s. %s%s"
-                      % (os.path.basename(self.video_recorder.path or ""),
-                         self.what_is_in_the_recording(picture=True),
-                         self._picture_warnings()))
+        self.announce_recording(
+            "Recording started",
+            "Picture and sound, to %s. %s%s"
+            % (os.path.basename(self.video_recorder.path or ""),
+               self.what_is_in_the_recording(picture=True),
+               self._picture_warnings()))
         self._update_status()
         return True
 
@@ -5105,7 +5379,9 @@ class DropDeckFrame(wx.Frame):
         self._sync_air_taps()
         self._set_video_record_label(False)
         if rec is not None and not quiet:
-            self.announce(said)
+            self.announce_recording(
+                "Recording stopped",
+                said.replace("Recording saved as", "Picture and sound saved as", 1))
         self._update_status()
         return rec.path if rec is not None else None
 
@@ -5329,10 +5605,11 @@ class DropDeckFrame(wx.Frame):
         item = getattr(self, "video_record_item", None)
         if item is not None:
             # Alt+E, because this menu has spent every other letter. On air
-            # now holds A C D F G H I K L M N O P R S T U V W and Y.
+            # now holds A C D F G H I K L M N O P R S T U V W X and Y.
             item.SetItemLabel(("Stop r&ecording picture" if on
                                else "R&ecord picture and sound")
                               + chr(9) + "Ctrl+Shift+R")
+        self._set_pause_label()
 
     def stop_recording(self, quiet=False):
         """Finish the file and say where it is."""
@@ -5346,9 +5623,9 @@ class DropDeckFrame(wx.Frame):
         if rec is not None and not quiet:
             minutes, seconds = divmod(int(rec.elapsed), 60)
             size = rec.bytes_written / (1024.0 * 1024.0)
-            said = ("Recording saved as %s, %d minutes %d seconds, "
-                    "%.1f megabytes"
-                    % (os.path.basename(path or ""), minutes, seconds, size))
+            said = ("Saved as %s, %s, %s"
+                    % (os.path.splitext(os.path.basename(path or ""))[0],
+                       _duration(rec.elapsed), _size(rec.bytes_written)))
             lost = getattr(rec, "losing_audio", 0)
             if lost:
                 # Said, at last. A sound recording whose ring overflowed
@@ -5358,7 +5635,7 @@ class DropDeckFrame(wx.Frame):
                          % lost)
             if cue is not None and cue.describe():
                 said += ". %s" % cue.describe()
-            self.announce(said)
+            self.announce_recording("Recording stopped", said)
         self._update_status()
         return path
 
@@ -5367,6 +5644,65 @@ class DropDeckFrame(wx.Frame):
         if item is not None:
             item.SetItemLabel(("Stop &recording\tCtrl+R" if on
                                else "Start &recording\tCtrl+R"))
+        self._set_pause_label()
+
+    # ------------------------------------------------------ pause / resume --
+    def _running_recorders(self):
+        """The sound and picture recorders that are writing a file now."""
+        return [rec for rec in (getattr(self, "recorder", None),
+                                getattr(self, "video_recorder", None))
+                if rec is not None and getattr(rec, "running", False)]
+
+    def recording_paused(self):
+        """True when anything being recorded is paused.
+
+        ANY, because that is what the key does: if either is paused it
+        resumes both. With the sound paused and the picture started after it,
+        the menu said Pause while the key resumed (Mark).
+        """
+        recs = self._running_recorders()
+        return any(getattr(r, "paused", False) for r in recs)
+
+    def toggle_record_pause(self):
+        """Alt+Shift+R. Hold the recording and carry on into the same file.
+
+        Siena, October 2026: "it would be helpful to have the option to pause
+        and resume a recording without having to stop it and make a new
+        recording." One key for both recordings, because a show recorded as
+        sound and as picture is one show: pausing one and not the other is a
+        pair of files that no longer line up. If either is paused, the key
+        resumes both.
+        """
+        recs = self._running_recorders()
+        if not recs:
+            self.announce_recording("Nothing is recording",
+                                    "Ctrl+R starts a recording")
+            return
+        if any(getattr(r, "paused", False) for r in recs):
+            for rec in recs:
+                rec.resume()
+            # Whatever went on air during the pause starts here in the file,
+            # so the tracklist hears about it now. The cue file drops an
+            # entry identical to the one before it, so a track that was
+            # playing before the pause is not listed twice at one moment.
+            self._note_current_track()
+            self.announce_recording("Recording resumed")
+        else:
+            for rec in recs:
+                rec.pause()
+            elapsed = max(float(getattr(r, "elapsed", 0.0)) for r in recs)
+            self.announce_recording(
+                "Recording paused",
+                "%s so far. Alt+Shift+R carries on" % _duration(elapsed))
+        self._set_pause_label()
+        self._update_status()
+
+    def _set_pause_label(self):
+        item = getattr(self, "record_pause_item", None)
+        if item is not None:
+            item.SetItemLabel(("Re&sume recording" if self.recording_paused()
+                               else "Pau&se recording") + chr(9)
+                              + "Alt+Shift+R")
 
     # ------------------------------------------------------- track list --
     def _cue_files(self):
@@ -5400,6 +5736,10 @@ class DropDeckFrame(wx.Frame):
                           getattr(self, "video_recorder", None))):
             if cue is None or rec is None:
                 continue
+            # A paused file is not hearing it. `toggle_record_pause` notes
+            # whatever is on air at the moment it carries on.
+            if getattr(rec, "paused", False):
+                continue
             # The RECORDING's own clock, never a wall clock. Both recorders
             # count frames written, so a machine that stalled reports where
             # the audio really is rather than how long we waited.
@@ -5432,7 +5772,16 @@ class DropDeckFrame(wx.Frame):
             # fix it while the show can still be saved; said at the end, it
             # is an epitaph. `_check_backlog` only fires on a change, so
             # this cannot chatter.
-            if detail:
+            #
+            # **But a start and a stop report too, and their detail is the
+            # FILE'S PATH.** From 3.8.1 to 3.9.0 that path was read out
+            # straight after "Recording to ..." and straight after "Recording
+            # saved as ...", and `announce` interrupts, so the sentence that
+            # said what had happened was cut off by a drive letter and a run
+            # of backslashes, every time. That is Siena's "it doesn't
+            # actually announce whether the recording has started or
+            # stopped". Only a sentence is said here, never a path.
+            if detail and not _is_a_file_name(detail):
                 wx.CallAfter(self.announce, detail)
             return
         wx.CallAfter(self._record_failed, detail)
@@ -7478,6 +7827,9 @@ class DropDeckFrame(wx.Frame):
         # the process simply goes. _on_close stops the refresh timer, but
         # Destroy does not raise EVT_CLOSE, so a frame torn down
         # programmatically kept a 250 ms timer pointed at nothing.
+        stop = getattr(self, "_export_stop", None)
+        if stop is not None:
+            stop.set()
         for name in ("_player_timer", "_refresh_timer", "_save_timer"):
             timer = getattr(self, name, None)
             if timer is not None:

@@ -56,6 +56,14 @@ RECORDING = "recording"
 FAILED = "failed"
 
 
+
+def _reason(exc):
+    """Why, as a sentence. Never a path: an OSError's own text carries the
+    whole file name with doubled backslashes, and it is read aloud (Jessica,
+    16 October 2026)."""
+    reason = getattr(exc, "strerror", None)
+    return reason if reason else exc.__class__.__name__
+
 def documents_folder():
     """Where Windows keeps Documents, whatever the user has moved it to.
 
@@ -136,8 +144,67 @@ class Recorder:
         self._encoder = None
         self._resampler = None
         self._handle = None
+        self._paused = threading.Event()
+        self._take_lock = threading.Lock()
+        self._taken = 0
+        self._edge = 0
 
     # ------------------------------------------------------------- state --
+    @property
+    def paused(self):
+        return self._paused.is_set()
+
+    def pause(self):
+        """Stop writing without ending the file. Siena, October 2026.
+
+        The mix goes on arriving and is read and thrown away, so the ring
+        never fills and nothing is counted as lost. The file's own clock is
+        the frames written, so `elapsed` stands still with it.
+
+        **The cut is at the sample waiting when the key was pressed**, not
+        wherever the recording thread happens to be: `_edge` marks it, as a
+        count of frames ever taken off the bus, and `_run` keeps exactly up
+        to it going in and drops exactly up to it coming out.
+        """
+        self._mark_edge()
+        self._paused.set()
+
+    def resume(self):
+        self._mark_edge()
+        self._paused.clear()
+
+    def _mark_edge(self):
+        with self._take_lock:
+            try:
+                waiting = self.bus.available()
+            except Exception:
+                waiting = 0
+            self._edge = self._taken + waiting
+
+    def _take(self, frames):
+        """Read off the bus and count it, under the lock `_mark_edge` uses."""
+        with self._take_lock:
+            block = self.bus.read(frames)
+            self._taken += len(block)
+            return block
+
+    def _cross_edge(self, going_in, feed):
+        """Empty the ring up to the press: into the file going into a pause,
+        onto the floor coming out of one."""
+        due = max(0, self._edge - self._taken)
+        while due > 0:
+            # Only what is really there. A ring that overflowed has fewer
+            # frames than were marked, and asking for more reads silence.
+            avail = self.bus.available()
+            if avail <= 0:
+                break
+            block = self._take(min(due, avail))
+            if not len(block):
+                break
+            due -= len(block)
+            if going_in:
+                feed(block)
+
     @property
     def running(self):
         return self._thread is not None and self._thread.is_alive()
@@ -161,8 +228,9 @@ class Recorder:
         length = ("%d:%02d:%02d" % (hours, minutes, seconds) if hours
                   else "%d:%02d" % (minutes, seconds))
         size = self.bytes_written / (1024.0 * 1024.0)
-        return ("Recording %s, %s, %.1f MB"
-                % (os.path.basename(self.path or ""), length, size))
+        return ("Recording%s %s, %s, %.1f MB"
+                % (" paused," if self.paused else "",
+                   os.path.basename(self.path or ""), length, size))
 
     def _set_state(self, state, detail=""):
         self.state, self.detail = state, detail
@@ -184,7 +252,7 @@ class Recorder:
         try:
             os.makedirs(self.folder, exist_ok=True)
         except OSError as exc:
-            self._set_state(FAILED, "Could not make %s. %s" % (self.folder, exc))
+            self._set_state(FAILED, "Could not make the recordings folder. %s" % _reason(exc))
             return False
         if self.path is None:
             self.path = next_path(self.folder, self.fmt)
@@ -192,7 +260,7 @@ class Recorder:
             self._open()
         except Exception as exc:
             self._close()
-            self._set_state(FAILED, "Could not start recording. %s" % exc)
+            self._set_state(FAILED, "Could not start recording. %s" % _reason(exc))
             return False
         # THE RING STARTS EMPTY, and what it had thrown away before now is
         # not this recording's business. Same as VideoRecorder.start and
@@ -205,6 +273,7 @@ class Recorder:
             pass
         self._dropped_at_start = getattr(self.bus, "dropped", 0)
         self._stop.clear()
+        self._paused.clear()
         self.started_at = time.monotonic()
         self.frames_written = 0
         self.bytes_written = 0
@@ -237,20 +306,38 @@ class Recorder:
 
     def _run(self):
         chunk = max(256, int(self.bus.samplerate * C.STREAM_CHUNK_SECONDS))
+        paused = False
         try:
             while not self._stop.is_set():
+                # A pause takes effect HERE, at the edge, and not by
+                # filtering whole chunks. Mark measured the chunk version on
+                # 16 October 2026: up to a quarter second before the press
+                # was thrown away and up to a quarter second of the pause
+                # went into the file, which is whatever was said just before
+                # resuming. So at each edge the ring is emptied first: into
+                # the file going in, onto the floor coming out. The edge is
+                # then as sharp as one poll, twenty milliseconds.
+                wanted = self._paused.is_set()
+                if wanted != paused:
+                    self._cross_edge(not paused, self._feed)
+                    paused = wanted
+                    continue
                 if self.bus.available() < chunk:
                     if self._stop.wait(C.STREAM_POLL_SECONDS):
                         break
                     continue
-                self._feed(self.bus.read(chunk))
+                if self._paused.is_set() != paused:
+                    continue
+                block = self._take(chunk)
+                if not paused:
+                    self._feed(block)
             # Whatever is still in the ring belongs in the file. Stopping a
             # recording should not cost the last quarter second of it.
             left = self.bus.available()
-            if left:
+            if left and not paused and not self._paused.is_set():
                 self._feed(self.bus.read(left))
         except Exception as exc:                       # pragma: no cover
-            self._set_state(FAILED, "Recording stopped. %s" % exc)
+            self._set_state(FAILED, "Recording stopped. %s" % _reason(exc))
         finally:
             self._close()
 

@@ -93,7 +93,10 @@ check("the shipped version accepts it",
 # channel live and the new microphone checks working. The 3.6.0 note that
 # used to sit here (built, never published, so every installed copy answered
 # "you have the newest one" for ever) was cleared by the 3.7.0 release.
-newest_build = "3.8.3"
+# 3.9.0 is built, 16 October 2026: installer 86.0 MB and zip 115.8 MB, and
+# the FROZEN build's selftest reports 3.9.0 with the update channel live.
+# (3.8.4 shipped without this line being raised, so it had been failing.)
+newest_build = "3.9.0"
 
 check("and the Windows app is not ahead of the newest Windows build",
       not appupdate.parse_version(C.APP_VERSION)

@@ -188,11 +188,11 @@ check("keys Windows keeps for itself are not reported",
 
 line = micdiag.keys_sentence(["Ctrl+M"])
 check("a taken Ctrl+M says so and names the second key",
-      "Ctrl+M" in line and "Alt+Shift+M" in line and "Playlist menu" in line,
+      "Ctrl+M" in line and "Alt+Shift+M" in line and "On air menu" in line,
       line)
 line = micdiag.keys_sentence(["Ctrl+M", "Alt+Shift+M"])
 check("with both taken it offers only the menu",
-      "Alt+Shift+M turns" not in line and "Playlist menu" in line, line)
+      "Alt+Shift+M turns" not in line and "On air menu" in line, line)
 check("nothing taken says nothing", micdiag.keys_sentence([]) == "")
 line = micdiag.keys_sentence(["Ctrl+B", "Ctrl+R"])
 check("two keys read as a list", "Ctrl+B and Ctrl+R" in line

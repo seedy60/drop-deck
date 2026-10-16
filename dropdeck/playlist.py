@@ -282,6 +282,14 @@ class Track:
         )
 
 
+
+def _is_relative(path):
+    """Relative to its board. A path starting with a slash of either kind is
+    somebody's absolute path, a Mac one included, even where Windows' own
+    `isabs` says otherwise. The same rule as `board._is_relative`."""
+    return bool(path) and not os.path.isabs(path) and path[0] not in "/" + chr(92)
+
+
 class Playlist:
     """The running order, and the arithmetic of where each item lands."""
 
@@ -685,7 +693,7 @@ class Playlist:
             track = Track.from_dict(entry)
             if not track.filepath:
                 continue
-            if base_dir and not os.path.isabs(track.filepath):
+            if base_dir and _is_relative(track.filepath):
                 track.filepath = os.path.normpath(
                     os.path.join(base_dir, track.filepath))
             playlist.tracks.append(track)
@@ -1058,7 +1066,7 @@ class DropLibrary:
         for path in (data or {}).get("paths") or []:
             if not isinstance(path, str) or not path.strip():
                 continue
-            if base_dir and not os.path.isabs(path):
+            if base_dir and _is_relative(path):
                 path = os.path.normpath(os.path.join(base_dir, path))
             library.paths.append(path)
         return library

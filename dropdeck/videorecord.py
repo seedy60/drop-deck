@@ -100,6 +100,14 @@ RECORDING = audiorecord.RECORDING
 FAILED = audiorecord.FAILED
 
 
+
+def _reason(exc):
+    """Why, as a sentence. Never a path: an OSError's own text carries the
+    whole file name with doubled backslashes, and it is read aloud (Jessica,
+    16 October 2026)."""
+    reason = getattr(exc, "strerror", None)
+    return reason if reason else exc.__class__.__name__
+
 class FrameTap:
     """One picture, put down by whoever has it and picked up by the recorder.
 
@@ -225,6 +233,10 @@ class VideoRecorder:
 
         self._thread = None
         self._stop = threading.Event()
+        self._paused = threading.Event()
+        self._take_lock = threading.Lock()
+        self._taken = 0
+        self._edge = 0
         self._container = None
         self._handle = None
         self._audio = None
@@ -261,6 +273,60 @@ class VideoRecorder:
         """Has the bus had to throw sound away since this started."""
         return max(0, self.bus.dropped - self.dropped_audio_at_start)
 
+    @property
+    def paused(self):
+        return self._paused.is_set()
+
+    def pause(self):
+        """Stop writing without ending the file. See `Recorder.pause`,
+        which this mirrors, cut at the sample waiting at the press."""
+        self._mark_edge()
+        self._paused.set()
+
+    def resume(self):
+        self._mark_edge()
+        self._paused.clear()
+
+    def _mark_edge(self):
+        with self._take_lock:
+            try:
+                waiting = self.bus.available()
+            except Exception:
+                waiting = 0
+            self._edge = self._taken + waiting
+
+    def _take(self, frames):
+        with self._take_lock:
+            block = self.bus.read(frames)
+            self._taken += len(block)
+            return block
+
+    def _cross_edge(self, going_in):
+        due = max(0, self._edge - self._taken)
+        while due > 0:
+            # Only what is really there. A ring that overflowed has fewer
+            # frames than were marked, and asking for more reads silence.
+            avail = self.bus.available()
+            if avail <= 0:
+                break
+            block = self._take(min(due, avail))
+            if not len(block):
+                break
+            due -= len(block)
+            if going_in:
+                self._feed_audio(block)
+        if going_in:
+            self._pump_video()
+            self._drain_tap()
+
+    def _drain_tap(self):
+        tap = self.tap
+        if tap is None:
+            return
+        for _ in range(8):
+            if tap.take()[1] is None:
+                break
+
     def describe(self):
         if self.state != RECORDING:
             return "Not recording"
@@ -269,8 +335,9 @@ class VideoRecorder:
         length = ("%d:%02d:%02d" % (hours, minutes, seconds) if hours
                   else "%d:%02d" % (minutes, seconds))
         size = self.bytes_written / (1024.0 * 1024.0)
-        said = ("Recording picture and sound, %s, %s, %.0f MB"
-                % (os.path.basename(self.path or ""), length, size))
+        said = ("Recording picture and sound%s, %s, %s, %.0f MB"
+                % (", paused" if self.paused else "",
+                   os.path.basename(self.path or ""), length, size))
         if self.losing_audio:
             said += ". It is losing audio"
         return said
@@ -291,7 +358,7 @@ class VideoRecorder:
         try:
             os.makedirs(self.folder, exist_ok=True)
         except OSError as exc:
-            self._set_state(FAILED, "Could not make %s. %s" % (self.folder, exc))
+            self._set_state(FAILED, "Could not make the recordings folder. %s" % _reason(exc))
             return False
         if self.path is None:
             self.path = audiorecord.next_path(self.folder, DEFAULT_FORMAT)
@@ -299,7 +366,7 @@ class VideoRecorder:
             self._open()
         except Exception as exc:
             self._close()
-            self._set_state(FAILED, "Could not start recording. %s" % exc)
+            self._set_state(FAILED, "Could not start recording. %s" % _reason(exc))
             return False
         # THE RING STARTS EMPTY. The bus is created and attached to every
         # mixer before this is called, and `import av` inside `_open` is 266
@@ -314,6 +381,7 @@ class VideoRecorder:
         except Exception:
             pass
         self._stop.clear()
+        self._paused.clear()
         self.started_at = time.monotonic()
         self.frames_written = 0
         self.frames_sent = 0
@@ -456,21 +524,40 @@ class VideoRecorder:
         chunk = max(256, int(self.bus.samplerate
                              * C.RECORD_DRAIN_FRAMES_PER_PICTURE
                              / float(self.fps or 30)))
+        paused = False
         try:
             while not self._stop.is_set():
+                # The pause edge, emptied the way `Recorder._run` does it so
+                # neither side of the press leaks across it. Paused, the
+                # sound is read and dropped so the ring never fills and the
+                # pictures waiting are dropped so the first frame after
+                # resuming is a fresh one. Neither clock moves, because both
+                # count what was WRITTEN, so the two stay in step.
+                wanted = self._paused.is_set()
+                if wanted != paused:
+                    self._cross_edge(not paused)
+                    paused = wanted
+                    continue
                 if self.bus.available() < chunk:
                     if self._stop.wait(C.STREAM_POLL_SECONDS):
                         break
                     continue
-                self._feed_audio(self.bus.read(chunk))
+                if self._paused.is_set() != paused:
+                    continue
+                block = self._take(chunk)
+                if paused:
+                    self._drain_tap()
+                    continue
+                self._feed_audio(block)
                 self._pump_video()
                 self._check_backlog()
             left = self.bus.available()
-            if left:
+            if left and not paused and not self._paused.is_set():
                 self._feed_audio(self.bus.read(left))
-            self._pump_video()
+            if not paused:
+                self._pump_video()
         except Exception as exc:
-            self._set_state(FAILED, "Recording stopped. %s" % exc)
+            self._set_state(FAILED, "Recording stopped. %s" % _reason(exc))
         finally:
             self._close()
 

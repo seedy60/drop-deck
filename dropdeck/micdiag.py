@@ -303,8 +303,8 @@ def keys_sentence(labels, mic_key="Ctrl+M", spare="Alt+Shift+M"):
             "pressing %s never reaches Drop Deck"
             % (join(shown), "it" if one else "them"))
     if mic_key in labels and spare in labels:
-        line += ". Microphone on, in the Playlist menu, still works"
+        line += ". Microphone on, in the On air menu, still works"
     elif mic_key in labels:
         line += (". %s turns the microphone on and off as well, and so does "
-                 "Microphone on in the Playlist menu" % spare)
+                 "Microphone on in the On air menu" % spare)
     return line
